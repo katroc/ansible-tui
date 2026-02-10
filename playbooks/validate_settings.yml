@@ -1,0 +1,28 @@
+---
+- name: Validate ansible-tui playbook settings behavior
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    provided_message: "{{ message | default('default-from-validate-settings') }}"
+    provided_toggle: "{{ toggle | default('false') }}"
+  tasks:
+    - name: Baseline info
+      ansible.builtin.debug:
+        msg:
+          - "Playbook=validate_settings"
+          - "Host={{ inventory_hostname }}"
+          - "Check mode={{ ansible_check_mode }}"
+      tags: [baseline]
+
+    - name: Validate extra-vars mapping
+      ansible.builtin.debug:
+        msg:
+          - "message={{ provided_message }}"
+          - "toggle={{ provided_toggle }}"
+      tags: [vars]
+
+    - name: Command task for diagnostics
+      ansible.builtin.command: /bin/echo "diagnostic-run"
+      changed_when: false
+      tags: [diagnostics]

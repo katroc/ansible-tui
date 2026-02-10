@@ -1,0 +1,56 @@
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum Action {
+    Tick,
+    Quit,
+    NextView,
+    PrevView,
+    MoveUp,
+    MoveDown,
+    SettingsIncrease,
+    SettingsDecrease,
+    ToggleLogSelectMode,
+    MarkLogSelection,
+    CopyLogSelection,
+    CharInput(char),
+    Backspace,
+    LogMouseDown {
+        row: u16,
+        viewport_height: u16,
+    },
+    LogMouseDrag {
+        row: u16,
+        viewport_height: u16,
+    },
+    LogMouseUp,
+    ToggleCheckMode,
+    ToggleDiffMode,
+    SaveInventoryEditor,
+    OpenRuntimePrompt,
+    CloseRuntimePrompt,
+    SelectRuntimeCandidate,
+    BootstrapManagedRuntime,
+    RuntimeBootstrapLog(String),
+    RuntimeBootstrapFinished {
+        success: bool,
+        ansible_bin: Option<String>,
+        message: String,
+    },
+    RefreshProject,
+    StartRun,
+    RunStarted {
+        run_id: u64,
+        playbook: String,
+        inventory: String,
+    },
+    RunLog {
+        run_id: u64,
+        line: String,
+    },
+    RunFinished {
+        run_id: u64,
+        success: bool,
+        exit_code: Option<i32>,
+    },
+    Error(String),
+}

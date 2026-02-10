@@ -1,0 +1,5 @@
+all:
+  children:
+    linux:
+      hosts:
+        localhost: {}
