@@ -36,6 +36,11 @@ pub enum Action {
         ansible_bin: Option<String>,
         message: String,
     },
+    ProjectSyncLog(String),
+    ProjectSyncFinished {
+        success: bool,
+        message: String,
+    },
     RefreshProject,
     StartRun,
     RunStarted {

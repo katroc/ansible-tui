@@ -5,6 +5,7 @@ mod config;
 mod history;
 mod input;
 mod playbook_settings;
+mod projects;
 mod run;
 mod run_store;
 mod theme;

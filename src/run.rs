@@ -444,6 +444,258 @@ pub fn spawn_bootstrap_managed_runtime(cwd: PathBuf, tx: UnboundedSender<Action>
     });
 }
 
+pub fn spawn_project_sync(
+    cwd: PathBuf,
+    command_line: String,
+    label: String,
+    tx: UnboundedSender<Action>,
+) {
+    tokio::spawn(async move {
+        if tx
+            .send(Action::ProjectSyncLog(format!("$ {}", command_line)))
+            .is_err()
+        {
+            return;
+        }
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-lc")
+            .arg(&command_line)
+            .current_dir(&cwd)
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped());
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let message = format!("Failed to start {label} sync: {err}");
+                let _ = tx.send(Action::ProjectSyncLog(message.clone()));
+                let _ = tx.send(Action::ProjectSyncFinished {
+                    success: false,
+                    message,
+                });
+                return;
+            }
+        };
+
+        let stdout_task = child.stdout.take().map(|stdout| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => {
+                            let line = strip_ansi(&line);
+                            if tx.send(Action::ProjectSyncLog(line)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            let _ = tx.send(Action::ProjectSyncLog(format!(
+                                "sync stdout read error: {err}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+
+        let stderr_task = child.stderr.take().map(|stderr| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => {
+                            let line = strip_ansi(&line);
+                            if tx
+                                .send(Action::ProjectSyncLog(format!("[stderr] {line}")))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            let _ = tx.send(Action::ProjectSyncLog(format!(
+                                "sync stderr read error: {err}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+
+        let status = match child.wait().await {
+            Ok(status) => status,
+            Err(err) => {
+                let message = format!("Failed waiting for {label} sync: {err}");
+                let _ = tx.send(Action::ProjectSyncFinished {
+                    success: false,
+                    message,
+                });
+                return;
+            }
+        };
+
+        if let Some(task) = stdout_task {
+            let _ = task.await;
+        }
+        if let Some(task) = stderr_task {
+            let _ = task.await;
+        }
+
+        let message = match status.code() {
+            Some(code) => {
+                if status.success() {
+                    format!("{label} sync completed (exit {code})")
+                } else {
+                    format!("{label} sync failed (exit {code})")
+                }
+            }
+            None => {
+                if status.success() {
+                    format!("{label} sync completed")
+                } else {
+                    format!("{label} sync failed")
+                }
+            }
+        };
+        let _ = tx.send(Action::ProjectSyncFinished {
+            success: status.success(),
+            message,
+        });
+    });
+}
+
+pub fn spawn_git_clone(git_url: String, destination: PathBuf, tx: UnboundedSender<Action>) {
+    tokio::spawn(async move {
+        let command_line = format!("git clone {} {}", git_url, destination.display());
+        if tx
+            .send(Action::ProjectSyncLog(format!("$ {}", command_line)))
+            .is_err()
+        {
+            return;
+        }
+
+        let mut command = Command::new("git");
+        command
+            .arg("clone")
+            .arg(&git_url)
+            .arg(&destination)
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped());
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let message = format!("Failed to start git clone: {err}");
+                let _ = tx.send(Action::ProjectSyncLog(message.clone()));
+                let _ = tx.send(Action::ProjectSyncFinished {
+                    success: false,
+                    message,
+                });
+                return;
+            }
+        };
+
+        let stdout_task = child.stdout.take().map(|stdout| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => {
+                            let line = strip_ansi(&line);
+                            if tx.send(Action::ProjectSyncLog(line)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            let _ = tx.send(Action::ProjectSyncLog(format!(
+                                "git clone stdout read error: {err}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+
+        let stderr_task = child.stderr.take().map(|stderr| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => {
+                            let line = strip_ansi(&line);
+                            if tx
+                                .send(Action::ProjectSyncLog(format!("[stderr] {line}")))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            let _ = tx.send(Action::ProjectSyncLog(format!(
+                                "git clone stderr read error: {err}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+
+        let status = match child.wait().await {
+            Ok(status) => status,
+            Err(err) => {
+                let message = format!("Failed waiting for git clone: {err}");
+                let _ = tx.send(Action::ProjectSyncFinished {
+                    success: false,
+                    message,
+                });
+                return;
+            }
+        };
+
+        if let Some(task) = stdout_task {
+            let _ = task.await;
+        }
+        if let Some(task) = stderr_task {
+            let _ = task.await;
+        }
+
+        let message = match status.code() {
+            Some(code) => {
+                if status.success() {
+                    format!("git clone completed (exit {code})")
+                } else {
+                    format!("git clone failed (exit {code})")
+                }
+            }
+            None => {
+                if status.success() {
+                    String::from("git clone completed")
+                } else {
+                    String::from("git clone failed")
+                }
+            }
+        };
+        let _ = tx.send(Action::ProjectSyncFinished {
+            success: status.success(),
+            message,
+        });
+    });
+}
+
 fn push_candidate(
     out: &mut Vec<RuntimeCandidate>,
     seen: &mut BTreeSet<String>,

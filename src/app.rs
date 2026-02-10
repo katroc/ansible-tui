@@ -23,9 +23,13 @@ use crate::input::set_input_paused;
 use crate::playbook_settings::{
     cycle_u16, load_playbook_settings, save_playbook_settings, PlaybookSettings,
 };
+use crate::projects::{
+    default_project, load_projects, save_projects, ProjectDefinition, ProjectRegistry,
+};
 use crate::run::{
     discover_runtime_candidates, playbook_bin_available, spawn_ansible_run,
-    spawn_bootstrap_managed_runtime, RunOptions, RunRequest, RuntimeCandidate,
+    spawn_bootstrap_managed_runtime, spawn_git_clone, spawn_project_sync, RunOptions, RunRequest,
+    RuntimeCandidate,
 };
 use crate::run_store::{load_runs, save_run};
 
@@ -35,19 +39,22 @@ const AUTO_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const PLAYBOOK_SETTINGS_FIELD_COUNT: usize = 10;
 const PLAYBOOK_SETTINGS_TEXT_FIELD_START: usize = 6;
 const GLOBAL_SETTINGS_FIELD_COUNT: usize = 12;
+const MAX_PROJECT_SYNC_LOG_LINES: usize = 400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Dashboard,
+    Projects,
     Inventory,
     Playbooks,
     Settings,
 }
 
 impl View {
-    pub fn all() -> [View; 4] {
+    pub fn all() -> [View; 5] {
         [
             View::Dashboard,
+            View::Projects,
             View::Inventory,
             View::Playbooks,
             View::Settings,
@@ -57,11 +64,52 @@ impl View {
     pub fn title(self) -> &'static str {
         match self {
             View::Dashboard => "Dashboard",
+            View::Projects => "Projects",
             View::Inventory => "Inventory",
             View::Playbooks => "Playbooks",
             View::Settings => "Settings",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectSyncKind {
+    Inventory,
+    Vars,
+}
+
+impl ProjectSyncKind {
+    fn title(self) -> &'static str {
+        match self {
+            ProjectSyncKind::Inventory => "Inventory",
+            ProjectSyncKind::Vars => "Vars",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectCreateMode {
+    New,
+    ExistingFs,
+    Git,
+}
+
+impl ProjectCreateMode {
+    pub fn title(self) -> &'static str {
+        match self {
+            ProjectCreateMode::New => "New Project",
+            ProjectCreateMode::ExistingFs => "Import Existing Project",
+            ProjectCreateMode::Git => "Clone Git Project",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingGitProject {
+    name: String,
+    root: PathBuf,
+    inventory_sync_cmd: Option<String>,
+    vars_sync_cmd: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +157,9 @@ pub struct RunRecord {
 
 pub struct App {
     pub cwd: PathBuf,
+    pub projects: Vec<ProjectDefinition>,
+    pub project_idx: usize,
+    pub active_project_idx: usize,
     pub inventories: Vec<PathBuf>,
     pub playbooks: Vec<PathBuf>,
     pub runs: Vec<RunRecord>,
@@ -148,6 +199,17 @@ pub struct App {
     pub inventory_wizard_group_idx: usize,
     inventory_wizard_input_mode: Option<InventoryWizardInputMode>,
     pub inventory_wizard_input_buffer: String,
+    pub project_create_open: bool,
+    pub project_create_mode: ProjectCreateMode,
+    pub project_create_field_idx: usize,
+    pub project_create_buffer_name: String,
+    pub project_create_buffer_git_url: String,
+    pub project_create_buffer_root: String,
+    pub project_create_buffer_inventory_sync: String,
+    pub project_create_buffer_vars_sync: String,
+    pub project_sync_running: bool,
+    pub project_sync_logs: Vec<String>,
+    pending_git_project: Option<PendingGitProject>,
     pub runtime_prompt_open: bool,
     pub runtime_candidates: Vec<RuntimeCandidate>,
     pub runtime_candidate_idx: usize,
@@ -180,6 +242,9 @@ impl App {
 
         let mut app = Self {
             cwd,
+            projects: Vec::new(),
+            project_idx: 0,
+            active_project_idx: 0,
             inventories: Vec::new(),
             playbooks: Vec::new(),
             runs: Vec::new(),
@@ -219,6 +284,17 @@ impl App {
             inventory_wizard_group_idx: 0,
             inventory_wizard_input_mode: None,
             inventory_wizard_input_buffer: String::new(),
+            project_create_open: false,
+            project_create_mode: ProjectCreateMode::New,
+            project_create_field_idx: 0,
+            project_create_buffer_name: String::new(),
+            project_create_buffer_git_url: String::new(),
+            project_create_buffer_root: String::new(),
+            project_create_buffer_inventory_sync: String::new(),
+            project_create_buffer_vars_sync: String::new(),
+            project_sync_running: false,
+            project_sync_logs: Vec::new(),
+            pending_git_project: None,
             runtime_prompt_open: false,
             runtime_candidates: Vec::new(),
             runtime_candidate_idx: 0,
@@ -237,10 +313,8 @@ impl App {
             last_auto_discovery_at: Instant::now(),
             next_run_id: 1,
         };
-        app.refresh_project();
-        app.restore_playbook_settings();
-        app.restore_ansible_cfg_settings();
-        app.restore_history();
+        app.restore_projects();
+        app.load_active_project_state();
         app.refresh_runtime_candidates();
         app.warn_if_playbook_bin_missing();
         app
@@ -296,6 +370,91 @@ impl App {
         }
     }
 
+    pub fn active_project_root(&self) -> &Path {
+        self.projects
+            .get(self.active_project_idx)
+            .map(|project| project.root.as_path())
+            .unwrap_or(self.cwd.as_path())
+    }
+
+    pub fn active_project_name(&self) -> String {
+        self.projects
+            .get(self.active_project_idx)
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| String::from("Local"))
+    }
+
+    pub fn selected_project(&self) -> Option<&ProjectDefinition> {
+        self.projects.get(self.project_idx)
+    }
+
+    fn restore_projects(&mut self) {
+        match load_projects(&self.cwd) {
+            Ok(registry) => {
+                self.projects = registry.projects;
+                self.active_project_idx = registry
+                    .active_idx
+                    .min(self.projects.len().saturating_sub(1));
+                self.project_idx = self.active_project_idx;
+            }
+            Err(err) => {
+                self.projects = vec![default_project(&self.cwd)];
+                self.active_project_idx = 0;
+                self.project_idx = 0;
+                self.status_line = format!("projects load failed: {err}");
+            }
+        }
+    }
+
+    fn persist_projects(&mut self) {
+        let registry = ProjectRegistry {
+            projects: self.projects.clone(),
+            active_idx: self
+                .active_project_idx
+                .min(self.projects.len().saturating_sub(1)),
+        };
+        if let Err(err) = save_projects(&self.cwd, &registry) {
+            self.status_line = format!("projects save failed: {err}");
+        }
+    }
+
+    fn load_active_project_state(&mut self) {
+        self.playbooks_focus_runs = false;
+        self.log_select_mode = false;
+        self.log_anchor = None;
+        self.log_cursor = 0;
+        self.pending_inventory_delete = None;
+        self.inventory_idx = 0;
+        self.playbook_idx = 0;
+        self.run_idx = 0;
+        self.project_sync_running = false;
+        self.pending_git_project = None;
+        self.selected_run_by_playbook.clear();
+        self.selected_inventory_by_playbook.clear();
+        self.project_sync_logs.clear();
+        self.refresh_project();
+        self.restore_playbook_settings();
+        self.restore_ansible_cfg_settings();
+        self.restore_history();
+        self.refresh_runtime_candidates();
+    }
+
+    fn activate_project_idx(&mut self, idx: usize) {
+        if idx >= self.projects.len() {
+            return;
+        }
+        self.active_project_idx = idx;
+        self.project_idx = idx;
+        self.load_active_project_state();
+        self.persist_projects();
+        let root = display_path(&self.cwd, self.active_project_root());
+        self.status_line = format!(
+            "Active project: {} ({})",
+            self.active_project_name(),
+            if root.is_empty() { "." } else { &root }
+        );
+    }
+
     pub fn update(&mut self, action: Action, tx: &UnboundedSender<Action>) {
         match action {
             Action::Tick => self.auto_refresh_project(),
@@ -309,6 +468,7 @@ impl App {
                     self.move_inventory_edit_mode_selection(1);
                 } else if !self.settings_editor_open
                     && !self.inventory_create_open
+                    && !self.project_create_open
                     && !self.inventory_editor_open
                     && !self.inventory_edit_mode_open
                     && !self.runtime_prompt_open
@@ -328,6 +488,7 @@ impl App {
                     self.move_inventory_edit_mode_selection(-1);
                 } else if !self.settings_editor_open
                     && !self.inventory_create_open
+                    && !self.project_create_open
                     && !self.inventory_editor_open
                     && !self.inventory_edit_mode_open
                     && !self.runtime_prompt_open
@@ -372,6 +533,8 @@ impl App {
                         self.settings_editor_field_idx =
                             self.settings_editor_field_idx.saturating_sub(1);
                     }
+                } else if self.project_create_open {
+                    self.project_create_field_idx = self.project_create_field_idx.saturating_sub(1);
                 } else if self.inventory_create_open {
                 } else if self.inventory_editor_open {
                 } else if self.inventory_edit_mode_open {
@@ -399,6 +562,11 @@ impl App {
                             PLAYBOOK_SETTINGS_FIELD_COUNT - 1,
                         );
                     }
+                } else if self.project_create_open {
+                    self.project_create_field_idx = min(
+                        self.project_create_field_idx + 1,
+                        self.project_create_last_field_idx(),
+                    );
                 } else if self.inventory_create_open {
                 } else if self.inventory_editor_open {
                 } else if self.inventory_edit_mode_open {
@@ -458,6 +626,8 @@ impl App {
                     self.close_playbook_settings();
                 } else if self.inventory_create_open {
                     self.cancel_inventory_create_prompt();
+                } else if self.project_create_open {
+                    self.cancel_project_create_prompt();
                 } else if self.inventory_editor_open {
                     self.close_inventory_editor(false);
                 } else if self.inventory_edit_mode_open {
@@ -477,12 +647,16 @@ impl App {
                     self.insert_inventory_editor_newline();
                 } else if self.inventory_create_open {
                     self.confirm_inventory_create();
+                } else if self.project_create_open {
+                    self.confirm_project_create(tx);
                 } else if self.inventory_edit_mode_open {
                     self.confirm_inventory_edit_mode_selection();
                 } else if self.inventory_wizard_open {
                     self.submit_inventory_wizard();
                 } else if self.runtime_prompt_open {
                     self.select_runtime_candidate();
+                } else if self.current_view() == View::Projects {
+                    self.activate_selected_project();
                 } else if self.current_view() == View::Settings {
                     self.confirm_global_settings_editor();
                 }
@@ -508,6 +682,46 @@ impl App {
                 } else {
                     self.status_line = format!("Runtime bootstrap failed: {message}");
                     self.open_runtime_prompt();
+                }
+            }
+            Action::ProjectSyncLog(line) => self.record_project_sync_log(line),
+            Action::ProjectSyncFinished { success, message } => {
+                self.project_sync_running = false;
+                self.record_project_sync_log(message.clone());
+                if let Some(pending) = self.pending_git_project.take() {
+                    if success {
+                        if !pending.root.is_dir() {
+                            self.status_line = String::from(
+                                "Git clone reported success, but destination directory is missing",
+                            );
+                        } else if self
+                            .projects
+                            .iter()
+                            .any(|project| project.root == pending.root)
+                        {
+                            self.status_line = String::from(
+                                "Git clone succeeded, but project root is already registered",
+                            );
+                        } else {
+                            self.projects.push(ProjectDefinition {
+                                name: pending.name.clone(),
+                                root: pending.root.clone(),
+                                inventory_sync_cmd: pending.inventory_sync_cmd,
+                                vars_sync_cmd: pending.vars_sync_cmd,
+                            });
+                            self.project_idx = self.projects.len().saturating_sub(1);
+                            self.persist_projects();
+                            self.status_line =
+                                format!("Imported git project: {}", pending.name.clone());
+                        }
+                    } else {
+                        self.status_line = format!("Git clone failed: {message}");
+                    }
+                } else {
+                    self.status_line = message;
+                    if success && self.project_idx == self.active_project_idx {
+                        self.refresh_project();
+                    }
                 }
             }
             Action::RefreshProject => self.refresh_project(),
@@ -584,6 +798,10 @@ impl App {
     fn handle_char_input(&mut self, ch: char, tx: &UnboundedSender<Action>) {
         if self.settings_editor_open && self.settings_editor_text_mode {
             self.push_settings_text_char(ch);
+            return;
+        }
+        if self.project_create_open {
+            self.push_project_create_char(ch);
             return;
         }
         if self.inventory_create_open {
@@ -686,6 +904,36 @@ impl App {
             }
         }
 
+        if self.current_view() == View::Projects {
+            match ch {
+                'n' => {
+                    self.open_project_create_prompt(ProjectCreateMode::New);
+                    return;
+                }
+                'f' => {
+                    self.open_project_create_prompt(ProjectCreateMode::ExistingFs);
+                    return;
+                }
+                'g' => {
+                    self.open_project_create_prompt(ProjectCreateMode::Git);
+                    return;
+                }
+                'a' => {
+                    self.activate_selected_project();
+                    return;
+                }
+                'i' => {
+                    self.start_project_sync(ProjectSyncKind::Inventory, tx);
+                    return;
+                }
+                'v' => {
+                    self.start_project_sync(ProjectSyncKind::Vars, tx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if self.current_view() == View::Playbooks {
             match ch {
                 'i' => {
@@ -754,8 +1002,18 @@ impl App {
             }
             'J' => self.select_playbook_run_offset(1),
             'K' => self.select_playbook_run_offset(-1),
-            'r' => self.start_run(tx),
-            'v' => self.toggle_log_select_mode(),
+            'r' => {
+                if self.current_view() == View::Projects {
+                    self.refresh_project();
+                } else {
+                    self.start_run(tx);
+                }
+            }
+            'v' => {
+                if self.current_view() == View::Playbooks {
+                    self.toggle_log_select_mode();
+                }
+            }
             'y' => self.copy_log_selection(),
             ' ' => self.mark_log_selection(),
             't' => self.open_playbook_settings(),
@@ -771,6 +1029,10 @@ impl App {
     fn handle_backspace(&mut self) {
         if self.settings_editor_open && self.settings_editor_text_mode {
             self.settings_editor_text_buffer.pop();
+            return;
+        }
+        if self.project_create_open {
+            self.backspace_project_create();
             return;
         }
         if self.inventory_create_open {
@@ -1033,6 +1295,9 @@ impl App {
 
     fn move_selection_up(&mut self) {
         match self.current_view() {
+            View::Projects => {
+                self.project_idx = self.project_idx.saturating_sub(1);
+            }
             View::Inventory => {
                 self.inventory_idx = self.inventory_idx.saturating_sub(1);
                 self.pending_inventory_delete = None;
@@ -1051,6 +1316,11 @@ impl App {
 
     fn move_selection_down(&mut self) {
         match self.current_view() {
+            View::Projects => {
+                if !self.projects.is_empty() {
+                    self.project_idx = min(self.project_idx + 1, self.projects.len() - 1);
+                }
+            }
             View::Inventory => {
                 if !self.inventories.is_empty() {
                     self.inventory_idx = min(self.inventory_idx + 1, self.inventories.len() - 1);
@@ -1145,7 +1415,11 @@ impl App {
     }
 
     fn log_mouse_down(&mut self, row: u16, viewport_height: u16) {
-        if self.runtime_prompt_open || self.settings_editor_open || self.runs.is_empty() {
+        if self.current_view() != View::Playbooks
+            || self.runtime_prompt_open
+            || self.settings_editor_open
+            || self.runs.is_empty()
+        {
             return;
         }
         let Some(idx) = self.log_index_from_view_row(row, viewport_height) else {
@@ -1158,7 +1432,7 @@ impl App {
     }
 
     fn log_mouse_drag(&mut self, row: u16, viewport_height: u16) {
-        if !self.log_select_mode || self.runs.is_empty() {
+        if self.current_view() != View::Playbooks || !self.log_select_mode || self.runs.is_empty() {
             return;
         }
         let Some(idx) = self.log_index_from_view_row(row, viewport_height) else {
@@ -1168,7 +1442,10 @@ impl App {
     }
 
     fn log_mouse_up(&mut self) {
-        if !self.log_select_mode || self.log_anchor.is_none() {
+        if self.current_view() != View::Playbooks
+            || !self.log_select_mode
+            || self.log_anchor.is_none()
+        {
             return;
         }
         self.copy_log_selection();
@@ -1198,6 +1475,333 @@ impl App {
                 "disabled"
             }
         );
+    }
+
+    fn project_create_last_field_idx(&self) -> usize {
+        match self.project_create_mode {
+            ProjectCreateMode::Git => 4,
+            ProjectCreateMode::New | ProjectCreateMode::ExistingFs => 3,
+        }
+    }
+
+    fn open_project_create_prompt(&mut self, mode: ProjectCreateMode) {
+        if self.current_view() != View::Projects {
+            self.status_line = String::from("Project create is available in Projects tab");
+            return;
+        }
+        if self.project_sync_running {
+            self.status_line = String::from("Wait for current project sync/clone to finish");
+            return;
+        }
+        self.project_create_open = true;
+        self.project_create_mode = mode;
+        self.project_create_field_idx = 0;
+        self.project_create_buffer_name.clear();
+        self.project_create_buffer_git_url.clear();
+        self.project_create_buffer_root = match mode {
+            ProjectCreateMode::New => {
+                let suggested = self.cwd.join("projects").join("project-name");
+                display_path(&self.cwd, &suggested)
+            }
+            ProjectCreateMode::ExistingFs | ProjectCreateMode::Git => String::new(),
+        };
+        self.project_create_buffer_inventory_sync.clear();
+        self.project_create_buffer_vars_sync.clear();
+        self.status_line = format!(
+            "{}: fill all fields and press Enter to continue",
+            mode.title()
+        );
+    }
+
+    fn cancel_project_create_prompt(&mut self) {
+        self.project_create_open = false;
+        self.project_create_field_idx = 0;
+        self.project_create_mode = ProjectCreateMode::New;
+        self.project_create_buffer_name.clear();
+        self.project_create_buffer_git_url.clear();
+        self.project_create_buffer_root.clear();
+        self.project_create_buffer_inventory_sync.clear();
+        self.project_create_buffer_vars_sync.clear();
+        self.status_line = String::from("Project create cancelled");
+    }
+
+    fn active_project_create_buffer_mut(&mut self) -> &mut String {
+        match self.project_create_mode {
+            ProjectCreateMode::Git => match self.project_create_field_idx {
+                0 => &mut self.project_create_buffer_name,
+                1 => &mut self.project_create_buffer_git_url,
+                2 => &mut self.project_create_buffer_root,
+                3 => &mut self.project_create_buffer_inventory_sync,
+                _ => &mut self.project_create_buffer_vars_sync,
+            },
+            ProjectCreateMode::New | ProjectCreateMode::ExistingFs => {
+                match self.project_create_field_idx {
+                    0 => &mut self.project_create_buffer_name,
+                    1 => &mut self.project_create_buffer_root,
+                    2 => &mut self.project_create_buffer_inventory_sync,
+                    _ => &mut self.project_create_buffer_vars_sync,
+                }
+            }
+        }
+    }
+
+    fn push_project_create_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        self.active_project_create_buffer_mut().push(ch);
+    }
+
+    fn backspace_project_create(&mut self) {
+        self.active_project_create_buffer_mut().pop();
+    }
+
+    fn confirm_project_create(&mut self, tx: &UnboundedSender<Action>) {
+        if !self.project_create_open {
+            return;
+        }
+        if self.project_create_field_idx < self.project_create_last_field_idx() {
+            self.project_create_field_idx += 1;
+            return;
+        }
+
+        match self.project_create_mode {
+            ProjectCreateMode::New => self.submit_new_project(),
+            ProjectCreateMode::ExistingFs => self.submit_existing_project(),
+            ProjectCreateMode::Git => self.submit_git_project(tx),
+        }
+    }
+
+    fn parsed_project_root(&self) -> Result<PathBuf, String> {
+        let root_input = self.project_create_buffer_root.trim();
+        if root_input.is_empty() {
+            return Err(String::from("Project root path is required"));
+        }
+        let root = if Path::new(root_input).is_absolute() {
+            PathBuf::from(root_input)
+        } else {
+            self.cwd.join(root_input)
+        };
+        Ok(root)
+    }
+
+    fn parsed_project_name(&self, root: &Path) -> String {
+        if self.project_create_buffer_name.trim().is_empty() {
+            root.file_name()
+                .and_then(|v| v.to_str())
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or("Project")
+                .to_string()
+        } else {
+            self.project_create_buffer_name.trim().to_string()
+        }
+    }
+
+    fn parsed_project_sync_commands(&self) -> (Option<String>, Option<String>) {
+        let inventory_sync_cmd =
+            normalize_optional_text(self.project_create_buffer_inventory_sync.trim().to_string());
+        let vars_sync_cmd =
+            normalize_optional_text(self.project_create_buffer_vars_sync.trim().to_string());
+        (inventory_sync_cmd, vars_sync_cmd)
+    }
+
+    fn submit_new_project(&mut self) {
+        let root = match self.parsed_project_root() {
+            Ok(root) => root,
+            Err(err) => {
+                self.status_line = err;
+                self.project_create_field_idx = 1;
+                return;
+            }
+        };
+        if self.projects.iter().any(|project| project.root == root) {
+            self.status_line = String::from("A project with this root already exists");
+            self.project_create_field_idx = 1;
+            return;
+        }
+        if root.exists() {
+            if !root.is_dir() {
+                self.status_line = String::from("Project root must be a directory");
+                self.project_create_field_idx = 1;
+                return;
+            }
+        } else if let Err(err) = fs::create_dir_all(&root) {
+            self.status_line = format!("Failed to create project root: {err}");
+            self.project_create_field_idx = 1;
+            return;
+        }
+        if let Err(err) = ensure_ansible_project_layout(&root) {
+            self.status_line = format!("Failed to create Ansible project structure: {err}");
+            self.project_create_field_idx = 1;
+            return;
+        }
+
+        let name = self.parsed_project_name(&root);
+        let (inventory_sync_cmd, vars_sync_cmd) = self.parsed_project_sync_commands();
+        self.projects.push(ProjectDefinition {
+            name: name.clone(),
+            root,
+            inventory_sync_cmd,
+            vars_sync_cmd,
+        });
+        self.project_idx = self.projects.len().saturating_sub(1);
+        self.cancel_project_create_prompt();
+        self.persist_projects();
+        self.status_line = format!("Created project with standard layout: {name}");
+    }
+
+    fn submit_existing_project(&mut self) {
+        let root = match self.parsed_project_root() {
+            Ok(root) => root,
+            Err(err) => {
+                self.status_line = err;
+                self.project_create_field_idx = 1;
+                return;
+            }
+        };
+        if self.projects.iter().any(|project| project.root == root) {
+            self.status_line = String::from("A project with this root already exists");
+            self.project_create_field_idx = 1;
+            return;
+        }
+        if !root.exists() {
+            self.status_line = String::from("Project root does not exist");
+            self.project_create_field_idx = 1;
+            return;
+        }
+        if !root.is_dir() {
+            self.status_line = String::from("Project root must be a directory");
+            self.project_create_field_idx = 1;
+            return;
+        }
+
+        let name = self.parsed_project_name(&root);
+        let (inventory_sync_cmd, vars_sync_cmd) = self.parsed_project_sync_commands();
+        self.projects.push(ProjectDefinition {
+            name: name.clone(),
+            root,
+            inventory_sync_cmd,
+            vars_sync_cmd,
+        });
+        self.project_idx = self.projects.len().saturating_sub(1);
+        self.cancel_project_create_prompt();
+        self.persist_projects();
+        self.status_line = format!("Imported existing project: {name}");
+    }
+
+    fn submit_git_project(&mut self, tx: &UnboundedSender<Action>) {
+        let git_url = self.project_create_buffer_git_url.trim().to_string();
+        if git_url.is_empty() {
+            self.status_line = String::from("Git URL is required");
+            self.project_create_field_idx = 1;
+            return;
+        }
+        let root = match self.parsed_project_root() {
+            Ok(root) => root,
+            Err(err) => {
+                self.status_line = err;
+                self.project_create_field_idx = 2;
+                return;
+            }
+        };
+        if self.projects.iter().any(|project| project.root == root) {
+            self.status_line = String::from("A project with this root already exists");
+            self.project_create_field_idx = 2;
+            return;
+        }
+        if root.exists() {
+            self.status_line =
+                String::from("Destination already exists; choose an empty/non-existent path");
+            self.project_create_field_idx = 2;
+            return;
+        }
+        if let Some(parent) = root.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                self.status_line = format!("Failed to create parent directory: {err}");
+                self.project_create_field_idx = 2;
+                return;
+            }
+        }
+
+        let name = self.parsed_project_name(&root);
+        let (inventory_sync_cmd, vars_sync_cmd) = self.parsed_project_sync_commands();
+        self.pending_git_project = Some(PendingGitProject {
+            name: name.clone(),
+            root: root.clone(),
+            inventory_sync_cmd,
+            vars_sync_cmd,
+        });
+        self.project_sync_running = true;
+        self.record_project_sync_log(format!("Cloning {git_url} -> {}", root.display()));
+        self.cancel_project_create_prompt();
+        spawn_git_clone(git_url, root, tx.clone());
+        self.status_line = format!("Started cloning git project: {name}");
+    }
+
+    fn activate_selected_project(&mut self) {
+        if self.current_view() != View::Projects {
+            return;
+        }
+        if self.project_sync_running {
+            self.status_line = String::from("Wait for current project sync/clone to finish");
+            return;
+        }
+        if self.project_idx >= self.projects.len() {
+            self.status_line = String::from("No project selected");
+            return;
+        }
+        if self.project_idx == self.active_project_idx {
+            self.status_line = format!("Project already active: {}", self.active_project_name());
+            return;
+        }
+        self.activate_project_idx(self.project_idx);
+    }
+
+    fn start_project_sync(&mut self, kind: ProjectSyncKind, tx: &UnboundedSender<Action>) {
+        if self.current_view() != View::Projects {
+            self.status_line = String::from("Project sync is available in Projects tab");
+            return;
+        }
+        if self.project_sync_running {
+            self.status_line = String::from("A project sync is already running");
+            return;
+        }
+        let Some(project) = self.projects.get(self.project_idx).cloned() else {
+            self.status_line = String::from("No project selected");
+            return;
+        };
+        let command_line = match kind {
+            ProjectSyncKind::Inventory => project.inventory_sync_cmd.clone(),
+            ProjectSyncKind::Vars => project.vars_sync_cmd.clone(),
+        };
+        let Some(command_line) = command_line else {
+            self.status_line = format!("No {} sync command configured", kind.title());
+            return;
+        };
+
+        self.project_sync_running = true;
+        self.record_project_sync_log(format!(
+            "Starting {} sync for project {}",
+            kind.title(),
+            project.name
+        ));
+        spawn_project_sync(
+            project.root,
+            command_line,
+            kind.title().to_string(),
+            tx.clone(),
+        );
+    }
+
+    fn record_project_sync_log(&mut self, line: String) {
+        self.project_sync_logs.push(line);
+        if self.project_sync_logs.len() > MAX_PROJECT_SYNC_LOG_LINES {
+            let over = self
+                .project_sync_logs
+                .len()
+                .saturating_sub(MAX_PROJECT_SYNC_LOG_LINES);
+            self.project_sync_logs.drain(0..over);
+        }
     }
 
     fn start_run(&mut self, tx: &UnboundedSender<Action>) {
@@ -1240,8 +1844,9 @@ impl App {
         let run_id = self.next_run_id;
         self.next_run_id += 1;
 
-        let playbook = display_path(&self.cwd, playbook_path);
-        let inventory = display_path(&self.cwd, &inventory_path);
+        let project_root = self.active_project_root().to_path_buf();
+        let playbook = display_path(&project_root, playbook_path);
+        let inventory = display_path(&project_root, &inventory_path);
         let settings = self
             .playbook_settings
             .get(&playbook)
@@ -1264,7 +1869,7 @@ impl App {
         spawn_ansible_run(
             RunRequest {
                 run_id,
-                cwd: self.cwd.clone(),
+                cwd: project_root,
                 playbook,
                 inventory,
                 options,
@@ -1274,12 +1879,14 @@ impl App {
     }
 
     fn refresh_project(&mut self) {
-        let (inventories, playbooks) = discover_project(&self.cwd);
+        let project_root = self.active_project_root().to_path_buf();
+        let (inventories, playbooks) = discover_project(&project_root);
         self.apply_discovered_project(inventories, playbooks);
         self.status_line = format!(
-            "Loaded {} playbooks and {} inventories",
+            "Loaded {} playbooks and {} inventories ({})",
             self.playbooks.len(),
-            self.inventories.len()
+            self.inventories.len(),
+            self.active_project_name()
         );
     }
 
@@ -1288,19 +1895,22 @@ impl App {
             return;
         }
         self.last_auto_discovery_at = Instant::now();
-        let (inventories, playbooks) = discover_project(&self.cwd);
+        let project_root = self.active_project_root().to_path_buf();
+        let (inventories, playbooks) = discover_project(&project_root);
         if inventories == self.inventories && playbooks == self.playbooks {
             return;
         }
         self.apply_discovered_project(inventories, playbooks);
         self.status_line = format!(
-            "Project updated: {} playbooks, {} inventories",
+            "Project updated: {} playbooks, {} inventories ({})",
             self.playbooks.len(),
-            self.inventories.len()
+            self.inventories.len(),
+            self.active_project_name()
         );
     }
 
     fn apply_discovered_project(&mut self, inventories: Vec<PathBuf>, playbooks: Vec<PathBuf>) {
+        let project_root = self.active_project_root().to_path_buf();
         self.inventories = inventories;
         self.playbooks = playbooks;
         if self.inventory_idx >= self.inventories.len() {
@@ -1317,7 +1927,7 @@ impl App {
         let known_playbooks = self
             .playbooks
             .iter()
-            .map(|p| display_path(&self.cwd, p))
+            .map(|p| display_path(&project_root, p))
             .collect::<HashSet<_>>();
         self.selected_run_by_playbook
             .retain(|playbook, _| known_playbooks.contains(playbook));
@@ -1327,7 +1937,7 @@ impl App {
                     && self
                         .inventories
                         .iter()
-                        .any(|path| display_path(&self.cwd, path) == *inventory)
+                        .any(|path| display_path(&project_root, path) == *inventory)
             });
         self.ensure_settings_for_playbooks();
         self.sync_run_selection_to_selected_playbook();
@@ -1351,7 +1961,7 @@ impl App {
                 self.pending_inventory_delete = None;
                 self.status_line = format!(
                     "Editing inventory {} (Ctrl+S save, Esc close)",
-                    display_path(&self.cwd, &path)
+                    display_path(self.active_project_root(), &path)
                 );
             }
             Err(err) => {
@@ -1388,7 +1998,10 @@ impl App {
             Ok(_) => {
                 self.inventory_editor_dirty = false;
                 self.refresh_project();
-                self.status_line = format!("Saved inventory {}", display_path(&self.cwd, &path));
+                self.status_line = format!(
+                    "Saved inventory {}",
+                    display_path(self.active_project_root(), &path)
+                );
             }
             Err(err) => {
                 self.status_line = format!("Failed to save inventory: {err}");
@@ -1546,7 +2159,7 @@ impl App {
                 self.refresh_project();
                 self.status_line = format!(
                     "External editor finished: {}",
-                    display_path(&self.cwd, &path)
+                    display_path(self.active_project_root(), &path)
                 );
             }
             Ok(status) => {
@@ -1611,7 +2224,7 @@ impl App {
         if !matches!(ext.as_str(), "yml" | "yaml") {
             self.status_line = format!(
                 "Guided editor supports YAML inventories only: {}",
-                display_path(&self.cwd, &path)
+                display_path(self.active_project_root(), &path)
             );
             return;
         }
@@ -1654,7 +2267,10 @@ impl App {
         self.pending_inventory_delete = None;
         self.sync_inventory_wizard_tree_selection();
         self.sync_inventory_wizard_selection_bounds();
-        self.status_line = format!("Guided editing {}", display_path(&self.cwd, &path));
+        self.status_line = format!(
+            "Guided editing {}",
+            display_path(self.active_project_root(), &path)
+        );
     }
 
     fn close_inventory_wizard(&mut self) {
@@ -2456,7 +3072,7 @@ impl App {
             return;
         };
 
-        let inventories_dir = self.cwd.join("inventories");
+        let inventories_dir = self.active_project_root().join("inventories");
         if let Err(err) = fs::create_dir_all(&inventories_dir) {
             self.status_line = format!("Builder: failed to create inventories directory: {err}");
             return;
@@ -2471,7 +3087,7 @@ impl App {
             } else if requested_path.exists() {
                 self.status_line = format!(
                     "Builder: inventory already exists: {}",
-                    display_path(&self.cwd, &requested_path)
+                    display_path(self.active_project_root(), &requested_path)
                 );
                 return;
             } else {
@@ -2480,7 +3096,7 @@ impl App {
         } else if requested_path.exists() {
             self.status_line = format!(
                 "Builder: inventory already exists: {}",
-                display_path(&self.cwd, &requested_path)
+                display_path(self.active_project_root(), &requested_path)
             );
             return;
         } else {
@@ -2514,12 +3130,12 @@ impl App {
         if updated_existing {
             self.status_line = format!(
                 "Builder: updated inventory {}",
-                display_path(&self.cwd, &output_path)
+                display_path(self.active_project_root(), &output_path)
             );
         } else {
             self.status_line = format!(
                 "Builder: created inventory {}",
-                display_path(&self.cwd, &output_path)
+                display_path(self.active_project_root(), &output_path)
             );
         }
     }
@@ -2574,7 +3190,7 @@ impl App {
             return;
         }
 
-        let inventories_dir = self.cwd.join("inventories");
+        let inventories_dir = self.active_project_root().join("inventories");
         if let Err(err) = fs::create_dir_all(&inventories_dir) {
             self.status_line = format!("Failed to create inventories directory: {err}");
             return;
@@ -2583,7 +3199,7 @@ impl App {
         if new_path.exists() {
             self.status_line = format!(
                 "Inventory already exists: {}",
-                display_path(&self.cwd, &new_path)
+                display_path(self.active_project_root(), &new_path)
             );
             return;
         }
@@ -2605,7 +3221,10 @@ impl App {
         if let Some(idx) = self.inventories.iter().position(|p| p == &new_path) {
             self.inventory_idx = idx;
         }
-        self.status_line = format!("Created inventory {}", display_path(&self.cwd, &new_path));
+        self.status_line = format!(
+            "Created inventory {}",
+            display_path(self.active_project_root(), &new_path)
+        );
     }
 
     fn request_inventory_delete(&mut self) {
@@ -2625,13 +3244,13 @@ impl App {
             return;
         }
 
-        let display = display_path(&self.cwd, &path);
+        let display = display_path(self.active_project_root(), &path);
         self.pending_inventory_delete = Some(path);
         self.status_line = format!("Press Shift+D again to delete {display}");
     }
 
     fn delete_inventory_file(&mut self, path: PathBuf) {
-        let inventories_root = self.cwd.join("inventories");
+        let inventories_root = self.active_project_root().join("inventories");
         if path.strip_prefix(&inventories_root).is_err() {
             self.status_line = String::from("Refusing to delete outside ./inventories");
             return;
@@ -2639,7 +3258,7 @@ impl App {
 
         match fs::remove_file(&path) {
             Ok(_) => {
-                let display = display_path(&self.cwd, &path);
+                let display = display_path(self.active_project_root(), &path);
                 self.refresh_project();
                 self.status_line = format!("Deleted inventory {display}");
             }
@@ -2650,9 +3269,12 @@ impl App {
     }
 
     fn restore_history(&mut self) {
-        match load_runs(&self.cwd) {
+        match load_runs(self.active_project_root()) {
             Ok(runs) => {
                 if runs.is_empty() {
+                    self.runs.clear();
+                    self.run_idx = 0;
+                    self.next_run_id = 1;
                     return;
                 }
                 self.next_run_id = runs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
@@ -2671,7 +3293,7 @@ impl App {
         let Some(run) = self.runs.iter().find(|r| r.id == run_id) else {
             return;
         };
-        if let Err(err) = save_run(&self.cwd, run) {
+        if let Err(err) = save_run(self.active_project_root(), run) {
             self.status_line = format!("history save failed: {err}");
         }
     }
@@ -2717,8 +3339,10 @@ impl App {
     }
 
     fn refresh_runtime_candidates(&mut self) {
-        self.runtime_candidates =
-            discover_runtime_candidates(&self.cwd, Some(&self.run_options.ansible_bin));
+        self.runtime_candidates = discover_runtime_candidates(
+            self.active_project_root(),
+            Some(&self.run_options.ansible_bin),
+        );
         if self.runtime_candidate_idx >= self.runtime_candidates.len() {
             self.runtime_candidate_idx = self.runtime_candidates.len().saturating_sub(1);
         }
@@ -2732,7 +3356,7 @@ impl App {
         self.runtime_bootstrapping = true;
         self.runtime_prompt_open = true;
         self.record_runtime_log(String::from("Starting managed runtime bootstrap"));
-        spawn_bootstrap_managed_runtime(self.cwd.clone(), tx.clone());
+        spawn_bootstrap_managed_runtime(self.active_project_root().to_path_buf(), tx.clone());
     }
 
     fn record_runtime_log(&mut self, line: String) {
@@ -2775,7 +3399,7 @@ impl App {
     }
 
     fn restore_playbook_settings(&mut self) {
-        match load_playbook_settings(&self.cwd) {
+        match load_playbook_settings(self.active_project_root()) {
             Ok(settings) => {
                 self.playbook_settings = settings;
                 self.ensure_settings_for_playbooks();
@@ -2787,13 +3411,15 @@ impl App {
     }
 
     fn persist_playbook_settings(&mut self) {
-        if let Err(err) = save_playbook_settings(&self.cwd, &self.playbook_settings) {
+        if let Err(err) =
+            save_playbook_settings(self.active_project_root(), &self.playbook_settings)
+        {
             self.status_line = format!("playbook settings save failed: {err}");
         }
     }
 
     fn restore_ansible_cfg_settings(&mut self) {
-        match load_ansible_cfg_settings(&self.cwd) {
+        match load_ansible_cfg_settings(self.active_project_root()) {
             Ok(settings) => {
                 self.ansible_cfg = settings;
                 if std::env::var("ANSIBLE_TUI_VERBOSITY").is_err() {
@@ -2813,16 +3439,17 @@ impl App {
     }
 
     fn persist_ansible_cfg_settings(&mut self) {
-        if let Err(err) = save_ansible_cfg_settings(&self.cwd, &self.ansible_cfg) {
+        if let Err(err) = save_ansible_cfg_settings(self.active_project_root(), &self.ansible_cfg) {
             self.status_line = format!("ansible.cfg save failed: {err}");
         }
     }
 
     fn ensure_settings_for_playbooks(&mut self) {
+        let project_root = self.active_project_root().to_path_buf();
         let keys = self
             .playbooks
             .iter()
-            .map(|p| display_path(&self.cwd, p))
+            .map(|p| display_path(&project_root, p))
             .collect::<Vec<_>>();
         for key in &keys {
             if !self.playbook_settings.contains_key(key) {
@@ -2853,9 +3480,10 @@ impl App {
     }
 
     fn selected_playbook_key(&self) -> Option<String> {
+        let project_root = self.active_project_root();
         self.playbooks
             .get(self.playbook_idx)
-            .map(|p| display_path(&self.cwd, p))
+            .map(|p| display_path(project_root, p))
     }
 
     fn open_playbook_settings(&mut self) {
@@ -2960,9 +3588,10 @@ impl App {
     }
 
     fn inventory_path_for_display(&self, inventory: &str) -> Option<PathBuf> {
+        let project_root = self.active_project_root();
         self.inventories
             .iter()
-            .find(|path| display_path(&self.cwd, path) == inventory)
+            .find(|path| display_path(project_root, path) == inventory)
             .cloned()
     }
 
@@ -2975,7 +3604,7 @@ impl App {
         }
         self.inventories
             .get(self.inventory_idx)
-            .map(|path| display_path(&self.cwd, path))
+            .map(|path| display_path(self.active_project_root(), path))
     }
 
     fn selected_inventory_path_for_current_playbook(&self) -> Option<PathBuf> {
@@ -2998,11 +3627,11 @@ impl App {
 
         let current_display = self
             .selected_inventory_display_for_current_playbook()
-            .unwrap_or_else(|| display_path(&self.cwd, &self.inventories[0]));
+            .unwrap_or_else(|| display_path(self.active_project_root(), &self.inventories[0]));
         let current_idx = self
             .inventories
             .iter()
-            .position(|path| display_path(&self.cwd, path) == current_display)
+            .position(|path| display_path(self.active_project_root(), path) == current_display)
             .unwrap_or(self.inventory_idx.min(self.inventories.len() - 1));
 
         let next_idx = if delta.is_positive() {
@@ -3010,7 +3639,7 @@ impl App {
         } else {
             current_idx.saturating_sub(1)
         };
-        let next_inventory = display_path(&self.cwd, &self.inventories[next_idx]);
+        let next_inventory = display_path(self.active_project_root(), &self.inventories[next_idx]);
         self.selected_inventory_by_playbook
             .insert(playbook, next_inventory.clone());
         self.status_line = format!("Playbook inventory target: {next_inventory}");
@@ -3184,6 +3813,44 @@ fn normalize_optional_text(value: String) -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+fn ensure_ansible_project_layout(root: &Path) -> std::io::Result<()> {
+    for dir in [
+        "inventories",
+        "playbooks",
+        "group_vars",
+        "host_vars",
+        "roles",
+        "collections",
+        "files",
+        "templates",
+    ] {
+        fs::create_dir_all(root.join(dir))?;
+    }
+
+    let ansible_cfg = root.join("ansible.cfg");
+    if !ansible_cfg.exists() {
+        fs::write(
+            ansible_cfg,
+            "[defaults]\ninventory = inventories/hosts.ini\nstdout_callback = yaml\n",
+        )?;
+    }
+
+    let inventory = root.join("inventories").join("hosts.ini");
+    if !inventory.exists() {
+        fs::write(inventory, "[local]\nlocalhost ansible_connection=local\n")?;
+    }
+
+    let playbook = root.join("playbooks").join("site.yml");
+    if !playbook.exists() {
+        fs::write(
+            playbook,
+            "---\n- name: Bootstrap project\n  hosts: all\n  gather_facts: false\n  tasks:\n    - name: Verify project scaffolding\n      ansible.builtin.debug:\n        msg: \"Ansible project is ready\"\n",
+        )?;
+    }
+
+    Ok(())
 }
 
 pub fn display_path(cwd: &Path, path: &Path) -> String {
@@ -3376,16 +4043,17 @@ fn discover_project(cwd: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_ascii_lowercase();
 
-        if parent == Some("inventories") && is_inventory_ext(ext) {
+        if is_inventory_file(cwd, path, &ext) {
             inventories.push(path.to_path_buf());
             continue;
         }
 
         let in_playbooks_dir = parent == Some("playbooks");
         let in_project_root = path.parent().map(|p| p == cwd).unwrap_or(false);
-        if (in_playbooks_dir || in_project_root) && is_playbook_ext(ext) {
+        if (in_playbooks_dir || in_project_root) && is_playbook_ext(&ext) {
             playbooks.push(path.to_path_buf());
         }
     }
@@ -3404,6 +4072,45 @@ fn is_inventory_ext(ext: &str) -> bool {
 
 fn is_playbook_ext(ext: &str) -> bool {
     matches!(ext, "yml" | "yaml")
+}
+
+fn is_inventory_file(cwd: &Path, path: &Path, ext: &str) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let in_group_vars = path_contains_dir_under(path, cwd, "group_vars");
+    let in_host_vars = path_contains_dir_under(path, cwd, "host_vars");
+    if in_group_vars || in_host_vars {
+        return false;
+    }
+    let in_project_root = path.parent().map(|p| p == cwd).unwrap_or(false);
+    let in_inventories_tree = path_contains_dir_under(path, cwd, "inventories");
+    let in_hosts_tree = path_contains_dir_under(path, cwd, "hosts");
+
+    if in_inventories_tree || in_hosts_tree {
+        return is_inventory_ext(ext) || (ext.is_empty() && file_name == "hosts");
+    }
+
+    if in_project_root {
+        let looks_like_inventory_name = file_name == "hosts"
+            || file_name.starts_with("hosts.")
+            || file_name.starts_with("inventory.");
+        if !looks_like_inventory_name {
+            return false;
+        }
+        return is_inventory_ext(ext) || (ext.is_empty() && file_name == "hosts");
+    }
+
+    false
+}
+
+fn path_contains_dir_under(path: &Path, cwd: &Path, dir_name: &str) -> bool {
+    let Ok(rel) = path.strip_prefix(cwd) else {
+        return false;
+    };
+    rel.components()
+        .any(|component| component.as_os_str() == dir_name)
 }
 
 fn normalize_inventory_filename(value: &str) -> Option<String> {

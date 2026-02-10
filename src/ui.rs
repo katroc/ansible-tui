@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{display_path, App, InventoryWizardFocus, RunStatus, View};
+use crate::app::{display_path, App, InventoryWizardFocus, ProjectCreateMode, RunStatus, View};
 use crate::playbook_settings::PlaybookSettings;
 use crate::run::playbook_bin_available;
 use crate::theme as th;
@@ -41,6 +41,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.inventory_create_open {
         render_inventory_create_prompt(frame, app);
     }
+    if app.project_create_open {
+        render_project_create_prompt(frame, app);
+    }
     if app.inventory_edit_mode_open {
         render_inventory_edit_mode_prompt(frame, app);
     }
@@ -57,8 +60,8 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_body(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    if app.current_view() == View::Dashboard {
-        render_dashboard(frame, app, area);
+    if app.current_view() == View::Dashboard || app.current_view() == View::Projects {
+        render_main(frame, app, area);
         return;
     }
 
@@ -94,6 +97,7 @@ fn render_tabs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 fn render_main(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     match app.current_view() {
         View::Dashboard => render_dashboard(frame, app, area),
+        View::Projects => render_projects(frame, app, area),
         View::Inventory => render_inventory(frame, app, area),
         View::Playbooks => render_playbooks(frame, app, area),
         View::Settings => render_settings(frame, app, area),
@@ -363,6 +367,165 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
+fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .split(area);
+
+    let items = if app.projects.is_empty() {
+        vec![ListItem::new("No projects configured.")]
+    } else {
+        app.projects
+            .iter()
+            .enumerate()
+            .map(|(idx, project)| {
+                let active = if idx == app.active_project_idx {
+                    "*"
+                } else {
+                    " "
+                };
+                ListItem::new(format!("[{active}] {}", project.name))
+            })
+            .collect::<Vec<_>>()
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th::SURFACE1))
+                .title("Projects"),
+        )
+        .highlight_style(Style::default().fg(th::YELLOW))
+        .highlight_symbol(">> ");
+    let mut state = ListState::default().with_selected(if app.projects.is_empty() {
+        None
+    } else {
+        Some(app.project_idx)
+    });
+    frame.render_stateful_widget(list, chunks[0], &mut state);
+
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(10),
+            Constraint::Min(6),
+            Constraint::Length(2),
+        ])
+        .split(chunks[1]);
+
+    let rows = if let Some(project) = app.selected_project() {
+        let root = display_path(&app.cwd, &project.root);
+        let selected_active = app.project_idx == app.active_project_idx;
+        vec![
+            (String::from("name"), project.name.clone()),
+            (
+                String::from("root"),
+                if root.is_empty() {
+                    String::from(".")
+                } else {
+                    root
+                },
+            ),
+            (String::from("active"), selected_active.to_string()),
+            (
+                String::from("inventory_sync"),
+                project
+                    .inventory_sync_cmd
+                    .clone()
+                    .unwrap_or_else(|| String::from("unset")),
+            ),
+            (
+                String::from("vars_sync"),
+                project
+                    .vars_sync_cmd
+                    .clone()
+                    .unwrap_or_else(|| String::from("unset")),
+            ),
+            (
+                String::from("playbooks"),
+                if selected_active {
+                    app.playbooks.len().to_string()
+                } else {
+                    String::from("(activate to load)")
+                },
+            ),
+            (
+                String::from("inventories"),
+                if selected_active {
+                    app.inventories.len().to_string()
+                } else {
+                    String::from("(activate to load)")
+                },
+            ),
+        ]
+    } else {
+        vec![
+            (String::from("name"), String::from("none")),
+            (String::from("root"), String::from("unset")),
+            (String::from("active"), String::from("false")),
+            (String::from("inventory_sync"), String::from("unset")),
+            (String::from("vars_sync"), String::from("unset")),
+            (String::from("playbooks"), String::from("0")),
+            (String::from("inventories"), String::from("0")),
+        ]
+    };
+    let table_rows = rows
+        .into_iter()
+        .map(|(property, value)| Row::new(vec![Cell::from(property), Cell::from(value)]))
+        .collect::<Vec<_>>();
+    let details = Table::new(table_rows, [Constraint::Length(18), Constraint::Min(10)])
+        .header(
+            Row::new(vec!["Property", "Value"]).style(
+                Style::default()
+                    .fg(th::SUBTEXT1)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .column_spacing(1)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th::SURFACE1))
+                .title("Project Details"),
+        );
+    frame.render_widget(details, right[0]);
+
+    let log_lines = if app.project_sync_logs.is_empty() {
+        vec![Line::styled(
+            "No project sync logs yet.",
+            Style::default().fg(th::SUBTEXT0),
+        )]
+    } else {
+        app.project_sync_logs
+            .iter()
+            .rev()
+            .take(right[1].height.saturating_sub(2) as usize)
+            .rev()
+            .map(|line| Line::raw(line.clone()))
+            .collect::<Vec<_>>()
+    };
+    let logs = Paragraph::new(log_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if app.project_sync_running {
+                    Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th::SURFACE1)
+                })
+                .title("Project Sync Logs"),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(logs, right[1]);
+
+    let hint = Paragraph::new(
+        "n new | f import path | g clone git | a/Enter activate | i inventory sync | v vars sync | j/k select",
+    )
+    .style(Style::default().fg(th::SUBTEXT0));
+    frame.render_widget(hint, right[2]);
+}
+
 fn render_inventory(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -374,7 +537,7 @@ fn render_inventory(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         app.inventories
             .iter()
-            .map(|p| ListItem::new(display_path(&app.cwd, p)))
+            .map(|p| ListItem::new(display_path(app.active_project_root(), p)))
             .collect::<Vec<_>>()
     };
     let list = List::new(items)
@@ -461,7 +624,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         app.playbooks
             .iter()
-            .map(|p| ListItem::new(display_path(&app.cwd, p)))
+            .map(|p| ListItem::new(display_path(app.active_project_root(), p)))
             .collect::<Vec<_>>()
     };
     let playbooks_border_style = if app.playbooks_focus_runs {
@@ -961,6 +1124,126 @@ fn render_runtime_prompt(frame: &mut Frame, app: &App) {
     frame.render_widget(logs, chunks[4]);
 }
 
+fn render_project_create_prompt(frame: &mut Frame, app: &App) {
+    let is_git = app.project_create_mode == ProjectCreateMode::Git;
+    let area = centered_rect(72, if is_git { 62 } else { 56 }, frame.area());
+    frame.render_widget(Clear, area);
+
+    let wrapper = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th::MAUVE))
+        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+        .title(app.project_create_mode.title());
+    frame.render_widget(wrapper, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if is_git {
+            vec![
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ]
+        } else {
+            vec![
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ]
+        })
+        .split(inner);
+
+    let intro = match app.project_create_mode {
+        ProjectCreateMode::New => {
+            "Creates a project root and standard Ansible layout (inventories/playbooks/roles/etc)."
+        }
+        ProjectCreateMode::ExistingFs => "Registers an existing local project path.",
+        ProjectCreateMode::Git => "Clones a git repository and registers it as a project.",
+    };
+    frame.render_widget(
+        Paragraph::new(intro).style(Style::default().fg(th::SUBTEXT1)),
+        chunks[0],
+    );
+
+    let field_rows = match app.project_create_mode {
+        ProjectCreateMode::New => vec![
+            ("Name", app.project_create_buffer_name.clone()),
+            ("Root", app.project_create_buffer_root.clone()),
+            (
+                "Inventory Sync",
+                app.project_create_buffer_inventory_sync.clone(),
+            ),
+            ("Vars Sync", app.project_create_buffer_vars_sync.clone()),
+        ],
+        ProjectCreateMode::ExistingFs => vec![
+            ("Name", app.project_create_buffer_name.clone()),
+            ("Existing Root", app.project_create_buffer_root.clone()),
+            (
+                "Inventory Sync",
+                app.project_create_buffer_inventory_sync.clone(),
+            ),
+            ("Vars Sync", app.project_create_buffer_vars_sync.clone()),
+        ],
+        ProjectCreateMode::Git => vec![
+            ("Name", app.project_create_buffer_name.clone()),
+            ("Git URL", app.project_create_buffer_git_url.clone()),
+            ("Destination Root", app.project_create_buffer_root.clone()),
+            (
+                "Inventory Sync",
+                app.project_create_buffer_inventory_sync.clone(),
+            ),
+            ("Vars Sync", app.project_create_buffer_vars_sync.clone()),
+        ],
+    };
+    for (idx, (label, value)) in field_rows.iter().enumerate() {
+        let focused = idx == app.project_create_field_idx;
+        let display = if focused {
+            if value.is_empty() {
+                String::from("|")
+            } else {
+                format!("{value}|")
+            }
+        } else if value.is_empty() {
+            String::from("(empty)")
+        } else {
+            value.clone()
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if focused {
+                Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th::SURFACE1)
+            })
+            .title(*label);
+        frame.render_widget(
+            Paragraph::new(display)
+                .block(block)
+                .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            chunks[idx + 1],
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(
+            "Type value | Up/Down field | Enter next/save | Backspace edit | Esc cancel",
+        )
+        .style(Style::default().fg(th::SUBTEXT0)),
+        chunks[chunks.len() - 1],
+    );
+}
+
 fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
     let area = centered_rect(54, 26, frame.area());
     frame.render_widget(Clear, area);
@@ -1324,7 +1607,7 @@ fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
     let selected = app
         .inventories
         .get(app.inventory_idx)
-        .map(|path| display_path(&app.cwd, path))
+        .map(|path| display_path(app.active_project_root(), path))
         .unwrap_or_else(|| String::from("(none)"));
     let intro =
         Paragraph::new(format!("Inventory: {selected}")).style(Style::default().fg(th::SUBTEXT1));
@@ -1390,7 +1673,7 @@ fn render_inventory_editor(frame: &mut Frame, app: &App) {
     let file_label = app
         .inventory_editor_path
         .as_ref()
-        .map(|p| display_path(&app.cwd, p))
+        .map(|p| display_path(app.active_project_root(), p))
         .unwrap_or_else(|| String::from("(none)"));
     let file_info = Paragraph::new(format!("File: {file_label}"))
         .block(
@@ -1590,7 +1873,7 @@ fn inventory_detail_rows(app: &App) -> Vec<(String, String)> {
         ];
     };
 
-    let display = display_path(&app.cwd, path);
+    let display = display_path(app.active_project_root(), path);
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -1666,6 +1949,11 @@ fn active_help_text(app: &App) -> String {
     if app.inventory_create_open {
         return String::from("Keys: Type filename | Enter create | Backspace edit | Esc cancel");
     }
+    if app.project_create_open {
+        return String::from(
+            "Keys: Type text | Up/Down field | Enter next/save | Backspace edit | Esc cancel (mode from n/f/g)",
+        );
+    }
     if app.inventory_edit_mode_open {
         return String::from(
             "Keys: j/k or Up/Down select mode | Enter confirm | 1/2/3 quick select | Esc cancel",
@@ -1699,6 +1987,9 @@ fn active_help_text(app: &App) -> String {
         View::Dashboard => {
             String::from("Keys: Tab/h/l views | r run selected playbook+inventory | u runtime picker | q quit")
         }
+        View::Projects => String::from(
+            "Keys: j/k or Up/Down select project | Enter/a activate | n new | f import path | g clone git | i inventory sync | v vars sync | Tab/h/l views | q quit",
+        ),
         View::Inventory => String::from(
             "Keys: j/k or Up/Down select inventory | n new | g new guided inventory | e edit selected (choose mode) | Shift+D delete selected | Tab/h/l views | q quit",
         ),
