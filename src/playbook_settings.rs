@@ -15,6 +15,8 @@ pub struct PlaybookSettings {
     pub tags: Option<String>,
     pub extra_vars: Option<String>,
     pub extra_args: Option<String>,
+    pub ssh_private_key_file: Option<String>,
+    pub ssh_private_key_inline: Option<String>,
 }
 
 impl Default for PlaybookSettings {
@@ -30,6 +32,8 @@ impl Default for PlaybookSettings {
             tags: None,
             extra_vars: None,
             extra_args: None,
+            ssh_private_key_file: None,
+            ssh_private_key_inline: None,
         }
     }
 }
@@ -102,7 +106,7 @@ fn settings_file(cwd: &Path) -> PathBuf {
 
 fn format_line(playbook: &str, settings: &PlaybookSettings) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         escape(playbook),
         bool_to_u8(settings.check),
         bool_to_u8(settings.diff),
@@ -114,6 +118,8 @@ fn format_line(playbook: &str, settings: &PlaybookSettings) -> String {
         escape_opt(&settings.tags),
         escape_opt(&settings.extra_vars),
         escape_opt(&settings.extra_args),
+        escape_opt(&settings.ssh_private_key_file),
+        escape_opt(&settings.ssh_private_key_inline),
     )
 }
 
@@ -134,6 +140,8 @@ fn parse_line(line: &str) -> Option<(String, PlaybookSettings)> {
     let tags = parse_opt_string(fields.next().unwrap_or_default());
     let extra_vars = parse_opt_string(fields.next().unwrap_or_default());
     let extra_args = parse_opt_string(fields.next().unwrap_or_default());
+    let ssh_private_key_file = parse_opt_string(fields.next().unwrap_or_default());
+    let ssh_private_key_inline = parse_opt_string(fields.next().unwrap_or_default());
 
     Some((
         playbook,
@@ -148,6 +156,8 @@ fn parse_line(line: &str) -> Option<(String, PlaybookSettings)> {
             tags,
             extra_vars,
             extra_args,
+            ssh_private_key_file,
+            ssh_private_key_inline,
         },
     ))
 }

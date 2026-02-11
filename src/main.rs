@@ -53,6 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     terminal.clear()?;
                 }
                 if app.should_quit {
+                    while let Ok(pending) = rx.try_recv() {
+                        app.update(pending, &tx);
+                    }
                     break;
                 }
             }

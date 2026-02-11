@@ -36,7 +36,7 @@ use crate::run_store::{load_runs, save_run};
 const MAX_LOG_LINES: usize = 1_000;
 const MAX_RUNTIME_LOG_LINES: usize = 120;
 const AUTO_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
-const PLAYBOOK_SETTINGS_FIELD_COUNT: usize = 10;
+const PLAYBOOK_SETTINGS_FIELD_COUNT: usize = 12;
 const PLAYBOOK_SETTINGS_TEXT_FIELD_START: usize = 6;
 const GLOBAL_SETTINGS_FIELD_COUNT: usize = 12;
 const MAX_PROJECT_SYNC_LOG_LINES: usize = 400;
@@ -130,17 +130,78 @@ impl RunStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InventoryWizardFocus {
+pub enum GroupsFocus {
     Tree,
     Groups,
     Hosts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InventoryWizardInputMode {
-    Filename,
-    AddHost,
-    AddGroup,
+pub enum InventorySubTab {
+    Files,
+    Hosts,
+    Groups,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostDetailField {
+    AnsibleHost,
+    AnsibleUser,
+    AnsiblePort,
+    AnsibleConnection,
+    CustomVar(usize),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HostVars {
+    pub ansible_host: String,
+    pub ansible_user: String,
+    pub ansible_port: Option<u16>,
+    pub ansible_connection: String,
+    pub custom_vars: Vec<(String, String)>,
+}
+
+impl HostVars {
+    pub fn is_empty(&self) -> bool {
+        self.ansible_host.is_empty()
+            && self.ansible_user.is_empty()
+            && self.ansible_port.is_none()
+            && self.ansible_connection.is_empty()
+            && self.custom_vars.is_empty()
+    }
+
+    pub fn to_yaml_mapping(&self) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        if !self.ansible_host.is_empty() {
+            map.insert("ansible_host".to_string(), self.ansible_host.clone());
+        }
+        if !self.ansible_user.is_empty() {
+            map.insert("ansible_user".to_string(), self.ansible_user.clone());
+        }
+        if let Some(port) = self.ansible_port {
+            map.insert("ansible_port".to_string(), port.to_string());
+        }
+        if !self.ansible_connection.is_empty() {
+            map.insert(
+                "ansible_connection".to_string(),
+                self.ansible_connection.clone(),
+            );
+        }
+        for (key, value) in &self.custom_vars {
+            map.insert(key.clone(), value.clone());
+        }
+        map
+    }
+}
+
+pub struct InventoryEditState {
+    pub path: PathBuf,
+    pub hosts: Vec<String>,
+    pub host_vars: BTreeMap<String, HostVars>,
+    pub groups: Vec<String>,
+    pub assignments: BTreeMap<String, Vec<String>>,
+    pub group_children: BTreeMap<String, Vec<String>>,
+    pub dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -185,20 +246,22 @@ pub struct App {
     pub inventory_editor_dirty: bool,
     pub inventory_edit_mode_open: bool,
     pub inventory_edit_mode_idx: usize,
-    pub inventory_wizard_open: bool,
-    pub inventory_wizard_edit_path: Option<PathBuf>,
-    pub inventory_wizard_filename: String,
-    pub inventory_wizard_hosts: Vec<String>,
-    pub inventory_wizard_groups: Vec<String>,
-    pub inventory_wizard_assignments: BTreeMap<String, Vec<String>>,
-    pub inventory_wizard_group_children: BTreeMap<String, Vec<String>>,
-    pub inventory_wizard_focus: InventoryWizardFocus,
-    pub inventory_wizard_target_group: Option<String>,
-    pub inventory_wizard_tree_idx: usize,
-    pub inventory_wizard_host_idx: usize,
-    pub inventory_wizard_group_idx: usize,
-    inventory_wizard_input_mode: Option<InventoryWizardInputMode>,
-    pub inventory_wizard_input_buffer: String,
+    pub inventory_sub_tab: InventorySubTab,
+    pub inventory_edit_state: Option<InventoryEditState>,
+    pub hosts_subtab_idx: usize,
+    pub hosts_subtab_focus_detail: bool,
+    pub hosts_subtab_field_idx: usize,
+    pub hosts_subtab_editing: bool,
+    pub hosts_subtab_edit_buffer: String,
+    pub hosts_subtab_add_host_open: bool,
+    pub hosts_subtab_add_host_buffer: String,
+    pub hosts_subtab_add_var_open: bool,
+    pub hosts_subtab_add_var_buffer: String,
+    pub groups_subtab_focus: GroupsFocus,
+    pub groups_subtab_tree_idx: usize,
+    pub groups_subtab_group_idx: usize,
+    pub groups_subtab_host_idx: usize,
+    pub groups_subtab_target_group: Option<String>,
     pub project_create_open: bool,
     pub project_create_mode: ProjectCreateMode,
     pub project_create_field_idx: usize,
@@ -207,8 +270,13 @@ pub struct App {
     pub project_create_buffer_root: String,
     pub project_create_buffer_inventory_sync: String,
     pub project_create_buffer_vars_sync: String,
+    pub project_ssh_open: bool,
+    pub project_ssh_field_idx: usize,
+    pub project_ssh_buffer_file: String,
+    pub project_ssh_buffer_inline: String,
     pub project_sync_running: bool,
     pub project_sync_logs: Vec<String>,
+    project_ssh_target_root: Option<PathBuf>,
     pending_git_project: Option<PendingGitProject>,
     pub runtime_prompt_open: bool,
     pub runtime_candidates: Vec<RuntimeCandidate>,
@@ -224,6 +292,7 @@ pub struct App {
     pub global_settings_text_buffer: String,
     pub should_quit: bool,
     needs_full_redraw: bool,
+    pending_project_delete: Option<PathBuf>,
     pending_inventory_delete: Option<PathBuf>,
     last_auto_discovery_at: Instant,
     next_run_id: u64,
@@ -270,20 +339,22 @@ impl App {
             inventory_editor_dirty: false,
             inventory_edit_mode_open: false,
             inventory_edit_mode_idx: 0,
-            inventory_wizard_open: false,
-            inventory_wizard_edit_path: None,
-            inventory_wizard_filename: String::new(),
-            inventory_wizard_hosts: Vec::new(),
-            inventory_wizard_groups: Vec::new(),
-            inventory_wizard_assignments: BTreeMap::new(),
-            inventory_wizard_group_children: BTreeMap::new(),
-            inventory_wizard_focus: InventoryWizardFocus::Tree,
-            inventory_wizard_target_group: None,
-            inventory_wizard_tree_idx: 0,
-            inventory_wizard_host_idx: 0,
-            inventory_wizard_group_idx: 0,
-            inventory_wizard_input_mode: None,
-            inventory_wizard_input_buffer: String::new(),
+            inventory_sub_tab: InventorySubTab::Files,
+            inventory_edit_state: None,
+            hosts_subtab_idx: 0,
+            hosts_subtab_focus_detail: false,
+            hosts_subtab_field_idx: 0,
+            hosts_subtab_editing: false,
+            hosts_subtab_edit_buffer: String::new(),
+            hosts_subtab_add_host_open: false,
+            hosts_subtab_add_host_buffer: String::new(),
+            hosts_subtab_add_var_open: false,
+            hosts_subtab_add_var_buffer: String::new(),
+            groups_subtab_focus: GroupsFocus::Tree,
+            groups_subtab_tree_idx: 0,
+            groups_subtab_group_idx: 0,
+            groups_subtab_host_idx: 0,
+            groups_subtab_target_group: None,
             project_create_open: false,
             project_create_mode: ProjectCreateMode::New,
             project_create_field_idx: 0,
@@ -292,8 +363,13 @@ impl App {
             project_create_buffer_root: String::new(),
             project_create_buffer_inventory_sync: String::new(),
             project_create_buffer_vars_sync: String::new(),
+            project_ssh_open: false,
+            project_ssh_field_idx: 0,
+            project_ssh_buffer_file: String::new(),
+            project_ssh_buffer_inline: String::new(),
             project_sync_running: false,
             project_sync_logs: Vec::new(),
+            project_ssh_target_root: None,
             pending_git_project: None,
             runtime_prompt_open: false,
             runtime_candidates: Vec::new(),
@@ -309,6 +385,7 @@ impl App {
             global_settings_text_buffer: String::new(),
             should_quit: false,
             needs_full_redraw: false,
+            pending_project_delete: None,
             pending_inventory_delete: None,
             last_auto_discovery_at: Instant::now(),
             next_run_id: 1,
@@ -388,6 +465,18 @@ impl App {
         self.projects.get(self.project_idx)
     }
 
+    pub fn project_ssh_target_name(&self) -> Option<String> {
+        let target = self.project_ssh_target_root.as_ref()?;
+        self.projects
+            .iter()
+            .find(|project| &project.root == target)
+            .map(|project| project.name.clone())
+    }
+
+    pub fn settings_text_mode_is_multiline(&self) -> bool {
+        self.settings_editor_text_mode && self.settings_editor_field_idx == 11
+    }
+
     fn restore_projects(&mut self) {
         match load_projects(&self.cwd) {
             Ok(registry) => {
@@ -423,7 +512,13 @@ impl App {
         self.log_select_mode = false;
         self.log_anchor = None;
         self.log_cursor = 0;
+        self.pending_project_delete = None;
         self.pending_inventory_delete = None;
+        self.project_ssh_open = false;
+        self.project_ssh_field_idx = 0;
+        self.project_ssh_buffer_file.clear();
+        self.project_ssh_buffer_inline.clear();
+        self.project_ssh_target_root = None;
         self.inventory_idx = 0;
         self.playbook_idx = 0;
         self.run_idx = 0;
@@ -458,17 +553,16 @@ impl App {
     pub fn update(&mut self, action: Action, tx: &UnboundedSender<Action>) {
         match action {
             Action::Tick => self.auto_refresh_project(),
-            Action::Quit => self.should_quit = true,
+            Action::Quit => self.request_quit(),
             Action::CharInput(ch) => self.handle_char_input(ch, tx),
             Action::Backspace => self.handle_backspace(),
             Action::NextView => {
-                if self.inventory_wizard_open {
-                    self.cycle_inventory_wizard_focus(1);
-                } else if self.inventory_edit_mode_open {
+                if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(1);
                 } else if !self.settings_editor_open
                     && !self.inventory_create_open
                     && !self.project_create_open
+                    && !self.project_ssh_open
                     && !self.inventory_editor_open
                     && !self.inventory_edit_mode_open
                     && !self.runtime_prompt_open
@@ -482,13 +576,12 @@ impl App {
                 }
             }
             Action::PrevView => {
-                if self.inventory_wizard_open {
-                    self.cycle_inventory_wizard_focus(-1);
-                } else if self.inventory_edit_mode_open {
+                if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(-1);
                 } else if !self.settings_editor_open
                     && !self.inventory_create_open
                     && !self.project_create_open
+                    && !self.project_ssh_open
                     && !self.inventory_editor_open
                     && !self.inventory_edit_mode_open
                     && !self.runtime_prompt_open
@@ -504,10 +597,19 @@ impl App {
             Action::SettingsIncrease => {
                 if self.settings_editor_open {
                     self.adjust_settings_field(1);
-                } else if self.inventory_wizard_open {
-                    self.cycle_inventory_wizard_focus(1);
                 } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(1);
+                } else if self.current_view() == View::Inventory
+                    && matches!(
+                        self.inventory_sub_tab,
+                        InventorySubTab::Hosts | InventorySubTab::Groups
+                    )
+                {
+                    match self.inventory_sub_tab {
+                        InventorySubTab::Hosts => self.handle_hosts_subtab_char('l'),
+                        InventorySubTab::Groups => self.handle_groups_subtab_char('l'),
+                        _ => {}
+                    }
                 } else if self.current_view() == View::Playbooks && !self.runtime_prompt_open {
                     self.playbooks_focus_runs = true;
                 } else {
@@ -517,10 +619,19 @@ impl App {
             Action::SettingsDecrease => {
                 if self.settings_editor_open {
                     self.adjust_settings_field(-1);
-                } else if self.inventory_wizard_open {
-                    self.cycle_inventory_wizard_focus(-1);
                 } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(-1);
+                } else if self.current_view() == View::Inventory
+                    && matches!(
+                        self.inventory_sub_tab,
+                        InventorySubTab::Hosts | InventorySubTab::Groups
+                    )
+                {
+                    match self.inventory_sub_tab {
+                        InventorySubTab::Hosts => self.handle_hosts_subtab_char('h'),
+                        InventorySubTab::Groups => self.handle_groups_subtab_char('h'),
+                        _ => {}
+                    }
                 } else if self.current_view() == View::Playbooks && !self.runtime_prompt_open {
                     self.playbooks_focus_runs = false;
                 } else {
@@ -533,16 +644,27 @@ impl App {
                         self.settings_editor_field_idx =
                             self.settings_editor_field_idx.saturating_sub(1);
                     }
+                } else if self.project_ssh_open {
+                    self.project_ssh_field_idx = self.project_ssh_field_idx.saturating_sub(1);
                 } else if self.project_create_open {
                     self.project_create_field_idx = self.project_create_field_idx.saturating_sub(1);
                 } else if self.inventory_create_open {
                 } else if self.inventory_editor_open {
                 } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(-1);
-                } else if self.inventory_wizard_open {
-                    self.move_inventory_wizard_selection(-1);
                 } else if self.runtime_prompt_open {
                     self.runtime_candidate_idx = self.runtime_candidate_idx.saturating_sub(1);
+                } else if self.current_view() == View::Inventory
+                    && matches!(
+                        self.inventory_sub_tab,
+                        InventorySubTab::Hosts | InventorySubTab::Groups
+                    )
+                {
+                    match self.inventory_sub_tab {
+                        InventorySubTab::Hosts => self.handle_hosts_subtab_char('k'),
+                        InventorySubTab::Groups => self.handle_groups_subtab_char('k'),
+                        _ => {}
+                    }
                 } else if self.current_view() == View::Settings {
                     if !self.global_settings_text_mode {
                         self.global_settings_field_idx =
@@ -562,6 +684,8 @@ impl App {
                             PLAYBOOK_SETTINGS_FIELD_COUNT - 1,
                         );
                     }
+                } else if self.project_ssh_open {
+                    self.project_ssh_field_idx = min(self.project_ssh_field_idx + 1, 1);
                 } else if self.project_create_open {
                     self.project_create_field_idx = min(
                         self.project_create_field_idx + 1,
@@ -571,14 +695,23 @@ impl App {
                 } else if self.inventory_editor_open {
                 } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(1);
-                } else if self.inventory_wizard_open {
-                    self.move_inventory_wizard_selection(1);
                 } else if self.runtime_prompt_open {
                     if !self.runtime_candidates.is_empty() {
                         self.runtime_candidate_idx = min(
                             self.runtime_candidate_idx + 1,
                             self.runtime_candidates.len() - 1,
                         );
+                    }
+                } else if self.current_view() == View::Inventory
+                    && matches!(
+                        self.inventory_sub_tab,
+                        InventorySubTab::Hosts | InventorySubTab::Groups
+                    )
+                {
+                    match self.inventory_sub_tab {
+                        InventorySubTab::Hosts => self.handle_hosts_subtab_char('j'),
+                        InventorySubTab::Groups => self.handle_groups_subtab_char('j'),
+                        _ => {}
                     }
                 } else if self.current_view() == View::Settings {
                     if !self.global_settings_text_mode {
@@ -605,15 +738,25 @@ impl App {
                 viewport_height,
             } => self.log_mouse_drag(row, viewport_height),
             Action::LogMouseUp => self.log_mouse_up(),
+            Action::LogScrollUp => self.scroll_logs_by(-1),
+            Action::LogScrollDown => self.scroll_logs_by(1),
+            Action::LogScrollPageUp => self.scroll_logs_by(-20),
+            Action::LogScrollPageDown => self.scroll_logs_by(20),
+            Action::LogFollowLatest => self.follow_logs_latest(),
             Action::ToggleCheckMode => self.toggle_check_mode(),
             Action::ToggleDiffMode => self.toggle_diff_mode(),
             Action::SaveInventoryEditor => {
-                if self.inventory_wizard_open {
-                    if self.inventory_wizard_input_mode.is_some() {
-                        self.commit_inventory_wizard_input();
-                    } else {
-                        self.save_inventory_wizard();
-                    }
+                if self.project_ssh_open {
+                    self.save_project_ssh_prompt();
+                } else if self.settings_editor_open && self.settings_editor_text_mode {
+                    self.commit_settings_text_edit();
+                } else if self.current_view() == View::Inventory
+                    && matches!(
+                        self.inventory_sub_tab,
+                        InventorySubTab::Hosts | InventorySubTab::Groups
+                    )
+                {
+                    self.save_inventory_edit_state();
                 } else {
                     self.save_inventory_editor();
                 }
@@ -628,12 +771,30 @@ impl App {
                     self.cancel_inventory_create_prompt();
                 } else if self.project_create_open {
                     self.cancel_project_create_prompt();
+                } else if self.project_ssh_open {
+                    self.cancel_project_ssh_prompt();
                 } else if self.inventory_editor_open {
                     self.close_inventory_editor(false);
                 } else if self.inventory_edit_mode_open {
                     self.close_inventory_edit_mode_prompt();
-                } else if self.inventory_wizard_open {
-                    self.close_inventory_wizard();
+                } else if self.current_view() == View::Inventory
+                    && matches!(
+                        self.inventory_sub_tab,
+                        InventorySubTab::Hosts | InventorySubTab::Groups
+                    )
+                {
+                    if self.hosts_subtab_editing {
+                        self.hosts_subtab_editing = false;
+                        self.hosts_subtab_edit_buffer.clear();
+                    } else if self.hosts_subtab_add_host_open {
+                        self.hosts_subtab_add_host_open = false;
+                        self.hosts_subtab_add_host_buffer.clear();
+                    } else if self.hosts_subtab_add_var_open {
+                        self.hosts_subtab_add_var_open = false;
+                        self.hosts_subtab_add_var_buffer.clear();
+                    } else {
+                        self.inventory_sub_tab = InventorySubTab::Files;
+                    }
                 } else if self.current_view() == View::Settings && self.global_settings_text_mode {
                     self.cancel_global_settings_text_edit();
                 } else {
@@ -649,10 +810,17 @@ impl App {
                     self.confirm_inventory_create();
                 } else if self.project_create_open {
                     self.confirm_project_create(tx);
+                } else if self.project_ssh_open {
+                    self.confirm_project_ssh_prompt();
                 } else if self.inventory_edit_mode_open {
                     self.confirm_inventory_edit_mode_selection();
-                } else if self.inventory_wizard_open {
-                    self.submit_inventory_wizard();
+                } else if self.current_view() == View::Inventory
+                    && matches!(
+                        self.inventory_sub_tab,
+                        InventorySubTab::Hosts | InventorySubTab::Groups
+                    )
+                {
+                    self.handle_subtab_enter();
                 } else if self.runtime_prompt_open {
                     self.select_runtime_candidate();
                 } else if self.current_view() == View::Projects {
@@ -708,6 +876,8 @@ impl App {
                                 root: pending.root.clone(),
                                 inventory_sync_cmd: pending.inventory_sync_cmd,
                                 vars_sync_cmd: pending.vars_sync_cmd,
+                                ssh_private_key_file: None,
+                                ssh_private_key_inline: None,
                             });
                             self.project_idx = self.projects.len().saturating_sub(1);
                             self.persist_projects();
@@ -753,13 +923,23 @@ impl App {
             }
             Action::RunLog { run_id, line } => {
                 if let Some(idx) = self.runs.iter().position(|r| r.id == run_id) {
+                    let selected_run = self.run_idx == idx;
                     let run = &mut self.runs[idx];
+                    let previous_len = run.logs.len();
+                    let was_at_tail =
+                        selected_run && self.log_cursor >= previous_len.saturating_sub(1);
                     run.logs.push(line);
                     if run.logs.len() > MAX_LOG_LINES {
                         let over = run.logs.len().saturating_sub(MAX_LOG_LINES);
                         run.logs.drain(0..over);
+                        if selected_run {
+                            self.log_cursor = self.log_cursor.saturating_sub(over);
+                            if let Some(anchor) = self.log_anchor {
+                                self.log_anchor = Some(anchor.saturating_sub(over));
+                            }
+                        }
                     }
-                    if !self.log_select_mode && self.run_idx == idx {
+                    if selected_run && (!self.log_select_mode || was_at_tail) {
                         self.log_cursor = run.logs.len().saturating_sub(1);
                     }
                 }
@@ -800,6 +980,10 @@ impl App {
             self.push_settings_text_char(ch);
             return;
         }
+        if self.project_ssh_open {
+            self.push_project_ssh_char(ch);
+            return;
+        }
         if self.project_create_open {
             self.push_project_create_char(ch);
             return;
@@ -816,10 +1000,6 @@ impl App {
             self.handle_inventory_edit_mode_char(ch);
             return;
         }
-        if self.inventory_wizard_open {
-            self.handle_inventory_wizard_char(ch);
-            return;
-        }
         if self.current_view() == View::Settings && self.global_settings_text_mode {
             self.push_global_settings_text_char(ch);
             return;
@@ -831,9 +1011,15 @@ impl App {
         {
             self.pending_inventory_delete = None;
         }
+        if self.current_view() == View::Projects
+            && self.pending_project_delete.is_some()
+            && ch != 'D'
+        {
+            self.pending_project_delete = None;
+        }
 
         if ch == 'q' {
-            self.should_quit = true;
+            self.request_quit();
             return;
         }
 
@@ -879,6 +1065,108 @@ impl App {
         }
 
         if self.current_view() == View::Inventory {
+            // Handle groups sub-tab add-group input (reuses add_var prompt)
+            if self.inventory_sub_tab == InventorySubTab::Groups && self.hosts_subtab_add_var_open {
+                match ch {
+                    '\n' => {
+                        let name = self.hosts_subtab_add_var_buffer.trim().to_string();
+                        if !name.is_empty()
+                            && is_valid_inventory_key(&name)
+                            && !is_reserved_inventory_group(&name)
+                        {
+                            if let Some(ref mut state) = self.inventory_edit_state {
+                                if !state.groups.contains(&name) {
+                                    state.groups.push(name.clone());
+                                    state.assignments.entry(name.clone()).or_default();
+                                    state.group_children.entry(name).or_default();
+                                    state.dirty = true;
+                                }
+                            }
+                        }
+                        self.hosts_subtab_add_var_open = false;
+                        self.hosts_subtab_add_var_buffer.clear();
+                    }
+                    _ if ch == '\x08' || ch == '\x7f' => {
+                        self.hosts_subtab_add_var_buffer.pop();
+                    }
+                    _ if !ch.is_control() => {
+                        self.hosts_subtab_add_var_buffer.push(ch);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            // Handle groups sub-tab add-host input
+            if self.inventory_sub_tab == InventorySubTab::Groups && self.hosts_subtab_add_host_open
+            {
+                match ch {
+                    '\n' => {
+                        let name = self.hosts_subtab_add_host_buffer.trim().to_string();
+                        if !name.is_empty() && is_valid_inventory_key(&name) {
+                            if let Some(ref mut state) = self.inventory_edit_state {
+                                if !state.hosts.contains(&name) {
+                                    state.hosts.push(name.clone());
+                                    state.host_vars.entry(name).or_default();
+                                    state.dirty = true;
+                                }
+                            }
+                        }
+                        self.hosts_subtab_add_host_open = false;
+                        self.hosts_subtab_add_host_buffer.clear();
+                    }
+                    _ if ch == '\x08' || ch == '\x7f' => {
+                        self.hosts_subtab_add_host_buffer.pop();
+                    }
+                    _ if !ch.is_control() => {
+                        self.hosts_subtab_add_host_buffer.push(ch);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            // Sub-tab switching
+            match ch {
+                '1' => {
+                    self.inventory_sub_tab = InventorySubTab::Files;
+                    return;
+                }
+                '2' => {
+                    if self.selected_inventory_is_yaml() {
+                        self.inventory_sub_tab = InventorySubTab::Hosts;
+                        self.load_inventory_edit_state();
+                    } else {
+                        self.status_line =
+                            String::from("Hosts sub-tab is only available for YAML inventories");
+                    }
+                    return;
+                }
+                '3' => {
+                    if self.selected_inventory_is_yaml() {
+                        self.inventory_sub_tab = InventorySubTab::Groups;
+                        self.load_inventory_edit_state();
+                    } else {
+                        self.status_line =
+                            String::from("Groups sub-tab is only available for YAML inventories");
+                    }
+                    return;
+                }
+                _ => {}
+            }
+
+            // Dispatch to sub-tab handlers
+            match self.inventory_sub_tab {
+                InventorySubTab::Hosts => {
+                    self.handle_hosts_subtab_char(ch);
+                    return;
+                }
+                InventorySubTab::Groups => {
+                    self.handle_groups_subtab_char(ch);
+                    return;
+                }
+                InventorySubTab::Files => {}
+            }
+
             match ch {
                 'n' => {
                     self.open_inventory_create_prompt();
@@ -886,10 +1174,6 @@ impl App {
                 }
                 'e' => {
                     self.open_inventory_edit_mode_prompt();
-                    return;
-                }
-                'g' => {
-                    self.open_inventory_wizard();
                     return;
                 }
                 'D' => {
@@ -920,6 +1204,14 @@ impl App {
                 }
                 'a' => {
                     self.activate_selected_project();
+                    return;
+                }
+                'e' => {
+                    self.open_project_ssh_prompt();
+                    return;
+                }
+                'D' => {
+                    self.request_project_delete();
                     return;
                 }
                 'i' => {
@@ -1031,6 +1323,10 @@ impl App {
             self.settings_editor_text_buffer.pop();
             return;
         }
+        if self.project_ssh_open {
+            self.backspace_project_ssh();
+            return;
+        }
         if self.project_create_open {
             self.backspace_project_create();
             return;
@@ -1044,8 +1340,19 @@ impl App {
             self.inventory_editor_dirty = true;
             return;
         }
-        if self.inventory_wizard_open {
-            self.backspace_inventory_wizard();
+        if self.current_view() == View::Inventory
+            && matches!(
+                self.inventory_sub_tab,
+                InventorySubTab::Hosts | InventorySubTab::Groups
+            )
+        {
+            if self.hosts_subtab_editing {
+                self.hosts_subtab_edit_buffer.pop();
+            } else if self.hosts_subtab_add_host_open {
+                self.hosts_subtab_add_host_buffer.pop();
+            } else if self.hosts_subtab_add_var_open {
+                self.hosts_subtab_add_var_buffer.pop();
+            }
             return;
         }
         if self.current_view() == View::Settings && self.global_settings_text_mode {
@@ -1058,7 +1365,11 @@ impl App {
             return;
         }
         if self.settings_editor_text_mode {
-            self.commit_settings_text_edit();
+            if self.settings_field_accepts_multiline() {
+                self.insert_settings_text_newline();
+            } else {
+                self.commit_settings_text_edit();
+            }
             return;
         }
         if self.settings_field_is_text() {
@@ -1073,14 +1384,23 @@ impl App {
             && self.settings_editor_field_idx < PLAYBOOK_SETTINGS_FIELD_COUNT
     }
 
+    fn settings_field_accepts_multiline(&self) -> bool {
+        self.settings_editor_field_idx == 11
+    }
+
     fn begin_settings_text_edit(&mut self) {
         if !self.settings_editor_open || !self.settings_field_is_text() {
             return;
         }
         self.settings_editor_text_buffer = self.current_settings_text_value().unwrap_or_default();
         self.settings_editor_text_mode = true;
-        self.status_line =
-            String::from("Playbook settings: text edit mode ON (type, Backspace, Enter save)");
+        self.status_line = if self.settings_field_accepts_multiline() {
+            String::from(
+                "Playbook settings: inline SSH key edit mode ON (type, Enter newline, Ctrl+S save)",
+            )
+        } else {
+            String::from("Playbook settings: text edit mode ON (type, Backspace, Enter save)")
+        };
     }
 
     fn cancel_settings_text_edit(&mut self) {
@@ -1093,11 +1413,10 @@ impl App {
         if !self.settings_editor_text_mode {
             return;
         }
-        let raw = self.settings_editor_text_buffer.trim();
-        let value = if raw.is_empty() {
-            None
+        let value = if self.settings_field_accepts_multiline() {
+            normalize_optional_multiline_text(self.settings_editor_text_buffer.clone())
         } else {
-            Some(raw.to_string())
+            normalize_optional_text(self.settings_editor_text_buffer.clone())
         };
         self.set_current_settings_text_value(value);
         self.settings_editor_text_mode = false;
@@ -1115,6 +1434,13 @@ impl App {
         }
     }
 
+    fn insert_settings_text_newline(&mut self) {
+        if !self.settings_editor_text_mode || !self.settings_field_accepts_multiline() {
+            return;
+        }
+        self.settings_editor_text_buffer.push('\n');
+    }
+
     fn current_settings_text_value(&self) -> Option<String> {
         let settings = self.selected_playbook_settings()?;
         match self.settings_editor_field_idx {
@@ -1122,6 +1448,8 @@ impl App {
             7 => settings.tags,
             8 => settings.extra_vars,
             9 => settings.extra_args,
+            10 => settings.ssh_private_key_file,
+            11 => settings.ssh_private_key_inline,
             _ => None,
         }
     }
@@ -1138,6 +1466,8 @@ impl App {
             7 => settings.tags = value,
             8 => settings.extra_vars = value,
             9 => settings.extra_args = value,
+            10 => settings.ssh_private_key_file = value,
+            11 => settings.ssh_private_key_inline = value,
             _ => {}
         }
     }
@@ -1297,6 +1627,7 @@ impl App {
         match self.current_view() {
             View::Projects => {
                 self.project_idx = self.project_idx.saturating_sub(1);
+                self.pending_project_delete = None;
             }
             View::Inventory => {
                 self.inventory_idx = self.inventory_idx.saturating_sub(1);
@@ -1320,6 +1651,7 @@ impl App {
                 if !self.projects.is_empty() {
                     self.project_idx = min(self.project_idx + 1, self.projects.len() - 1);
                 }
+                self.pending_project_delete = None;
             }
             View::Inventory => {
                 if !self.inventories.is_empty() {
@@ -1351,6 +1683,44 @@ impl App {
                 self.log_cursor = min(self.log_cursor + 1, run.logs.len() - 1);
             }
         }
+    }
+
+    fn scroll_logs_by(&mut self, delta: isize) {
+        if matches!(self.current_view(), View::Dashboard | View::Projects) {
+            return;
+        }
+        let Some(run_len) = self.runs.get(self.run_idx).map(|run| run.logs.len()) else {
+            self.status_line = String::from("No run selected");
+            return;
+        };
+        if run_len == 0 {
+            self.status_line = String::from("No logs yet for this run.");
+            return;
+        }
+
+        if !self.log_select_mode {
+            self.log_select_mode = true;
+            self.log_anchor = None;
+            self.sync_log_cursor_to_selected_run();
+        }
+
+        let max_idx = run_len.saturating_sub(1);
+        let step = delta.unsigned_abs();
+        if delta.is_negative() {
+            self.log_cursor = self.log_cursor.saturating_sub(step);
+        } else {
+            self.log_cursor = min(self.log_cursor.saturating_add(step), max_idx);
+        }
+    }
+
+    fn follow_logs_latest(&mut self) {
+        if matches!(self.current_view(), View::Dashboard | View::Projects) {
+            return;
+        }
+        self.log_select_mode = false;
+        self.log_anchor = None;
+        self.sync_log_cursor_to_selected_run();
+        self.status_line = String::from("Live log follow mode ON");
     }
 
     fn toggle_log_select_mode(&mut self) {
@@ -1493,6 +1863,7 @@ impl App {
             self.status_line = String::from("Wait for current project sync/clone to finish");
             return;
         }
+        self.pending_project_delete = None;
         self.project_create_open = true;
         self.project_create_mode = mode;
         self.project_create_field_idx = 0;
@@ -1523,6 +1894,103 @@ impl App {
         self.project_create_buffer_inventory_sync.clear();
         self.project_create_buffer_vars_sync.clear();
         self.status_line = String::from("Project create cancelled");
+    }
+
+    fn open_project_ssh_prompt(&mut self) {
+        if self.current_view() != View::Projects {
+            self.status_line =
+                String::from("Project SSH key settings are available in Projects tab");
+            return;
+        }
+        let Some(project) = self.projects.get(self.project_idx).cloned() else {
+            self.status_line = String::from("No project selected");
+            return;
+        };
+        self.pending_project_delete = None;
+        self.project_ssh_open = true;
+        self.project_ssh_field_idx = 0;
+        self.project_ssh_buffer_file = project.ssh_private_key_file.unwrap_or_default();
+        self.project_ssh_buffer_inline = project.ssh_private_key_inline.unwrap_or_default();
+        self.project_ssh_target_root = Some(project.root);
+        self.status_line = format!(
+            "Project SSH key settings: {} (Ctrl+S save, Esc cancel)",
+            project.name
+        );
+    }
+
+    fn cancel_project_ssh_prompt(&mut self) {
+        self.project_ssh_open = false;
+        self.project_ssh_field_idx = 0;
+        self.project_ssh_buffer_file.clear();
+        self.project_ssh_buffer_inline.clear();
+        self.project_ssh_target_root = None;
+        self.status_line = String::from("Project SSH key settings cancelled");
+    }
+
+    fn save_project_ssh_prompt(&mut self) {
+        if !self.project_ssh_open {
+            return;
+        }
+        let Some(target_root) = self.project_ssh_target_root.clone() else {
+            self.cancel_project_ssh_prompt();
+            return;
+        };
+        let Some(idx) = self.projects.iter().position(|p| p.root == target_root) else {
+            self.cancel_project_ssh_prompt();
+            self.status_line = String::from("Project no longer exists");
+            return;
+        };
+
+        let file = normalize_optional_text(self.project_ssh_buffer_file.clone());
+        let inline = normalize_optional_multiline_text(self.project_ssh_buffer_inline.clone());
+        self.projects[idx].ssh_private_key_file = file;
+        self.projects[idx].ssh_private_key_inline = inline;
+        let name = self.projects[idx].name.clone();
+        self.persist_projects();
+
+        self.project_ssh_open = false;
+        self.project_ssh_field_idx = 0;
+        self.project_ssh_buffer_file.clear();
+        self.project_ssh_buffer_inline.clear();
+        self.project_ssh_target_root = None;
+        self.status_line = format!("Project SSH key settings updated: {name}");
+    }
+
+    fn confirm_project_ssh_prompt(&mut self) {
+        if !self.project_ssh_open {
+            return;
+        }
+        if self.project_ssh_field_idx == 0 {
+            self.project_ssh_field_idx = 1;
+            return;
+        }
+        self.insert_project_ssh_newline();
+    }
+
+    fn active_project_ssh_buffer_mut(&mut self) -> &mut String {
+        if self.project_ssh_field_idx == 0 {
+            &mut self.project_ssh_buffer_file
+        } else {
+            &mut self.project_ssh_buffer_inline
+        }
+    }
+
+    fn push_project_ssh_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        self.active_project_ssh_buffer_mut().push(ch);
+    }
+
+    fn backspace_project_ssh(&mut self) {
+        self.active_project_ssh_buffer_mut().pop();
+    }
+
+    fn insert_project_ssh_newline(&mut self) {
+        if self.project_ssh_field_idx != 1 {
+            return;
+        }
+        self.project_ssh_buffer_inline.push('\n');
     }
 
     fn active_project_create_buffer_mut(&mut self) -> &mut String {
@@ -1643,6 +2111,8 @@ impl App {
             root,
             inventory_sync_cmd,
             vars_sync_cmd,
+            ssh_private_key_file: None,
+            ssh_private_key_inline: None,
         });
         self.project_idx = self.projects.len().saturating_sub(1);
         self.cancel_project_create_prompt();
@@ -1682,6 +2152,8 @@ impl App {
             root,
             inventory_sync_cmd,
             vars_sync_cmd,
+            ssh_private_key_file: None,
+            ssh_private_key_inline: None,
         });
         self.project_idx = self.projects.len().saturating_sub(1);
         self.cancel_project_create_prompt();
@@ -1750,11 +2222,86 @@ impl App {
             self.status_line = String::from("No project selected");
             return;
         }
+        self.pending_project_delete = None;
         if self.project_idx == self.active_project_idx {
             self.status_line = format!("Project already active: {}", self.active_project_name());
             return;
         }
         self.activate_project_idx(self.project_idx);
+    }
+
+    fn request_project_delete(&mut self) {
+        if self.current_view() != View::Projects {
+            self.status_line = String::from("Project delete is available in Projects tab");
+            return;
+        }
+        if self.project_sync_running {
+            self.status_line = String::from("Wait for current project sync/clone to finish");
+            return;
+        }
+        if self.projects.len() <= 1 {
+            self.status_line = String::from("Refusing to delete the last project");
+            return;
+        }
+        let Some(project) = self.projects.get(self.project_idx).cloned() else {
+            self.status_line = String::from("No project selected");
+            return;
+        };
+
+        if self
+            .pending_project_delete
+            .as_ref()
+            .map(|root| root == &project.root)
+            .unwrap_or(false)
+        {
+            self.pending_project_delete = None;
+            self.delete_project(project.root);
+            return;
+        }
+
+        self.pending_project_delete = Some(project.root.clone());
+        self.status_line = format!("Press Shift+D again to delete project {}", project.name);
+    }
+
+    fn delete_project(&mut self, project_root: PathBuf) {
+        let Some(idx) = self
+            .projects
+            .iter()
+            .position(|project| project.root == project_root)
+        else {
+            self.status_line = String::from("Selected project is no longer available");
+            return;
+        };
+        if self.projects.len() <= 1 {
+            self.status_line = String::from("Refusing to delete the last project");
+            return;
+        }
+
+        let removed = self.projects.remove(idx);
+        let removed_was_active = idx == self.active_project_idx;
+        self.pending_project_delete = None;
+
+        if removed_was_active {
+            self.active_project_idx = min(idx, self.projects.len().saturating_sub(1));
+            self.project_idx = self.active_project_idx;
+            self.load_active_project_state();
+            self.persist_projects();
+            self.status_line = format!(
+                "Deleted project {}. Active project: {}",
+                removed.name,
+                self.active_project_name()
+            );
+            return;
+        }
+
+        if idx < self.active_project_idx {
+            self.active_project_idx = self.active_project_idx.saturating_sub(1);
+        }
+        if self.project_idx >= self.projects.len() {
+            self.project_idx = self.projects.len().saturating_sub(1);
+        }
+        self.persist_projects();
+        self.status_line = format!("Deleted project {}", removed.name);
     }
 
     fn start_project_sync(&mut self, kind: ProjectSyncKind, tx: &UnboundedSender<Action>) {
@@ -1828,7 +2375,7 @@ impl App {
         }
         if self.inventories.is_empty() {
             self.status_line =
-                String::from("No inventories found. Add inventory files under ./inventories.");
+                String::from("No inventories found. Add inventory files under ./inventory.");
             return;
         }
 
@@ -1852,6 +2399,8 @@ impl App {
             .get(&playbook)
             .cloned()
             .unwrap_or_else(|| self.default_settings());
+        let (ssh_private_key_file, ssh_private_key_inline) =
+            self.effective_ssh_private_key_settings(&settings);
 
         let mut options = self.run_options.clone();
         options.check = settings.check;
@@ -1864,6 +2413,8 @@ impl App {
         options.tags = settings.tags;
         options.extra_vars = settings.extra_vars;
         options.extra_args = settings.extra_args;
+        options.ssh_private_key_file = ssh_private_key_file;
+        options.ssh_private_key_inline = ssh_private_key_inline;
 
         self.status_line = format!("Starting run #{run_id}...");
         spawn_ansible_run(
@@ -1876,6 +2427,27 @@ impl App {
             },
             tx.clone(),
         );
+    }
+
+    fn effective_ssh_private_key_settings(
+        &self,
+        settings: &PlaybookSettings,
+    ) -> (Option<String>, Option<String>) {
+        if settings.ssh_private_key_file.is_some() || settings.ssh_private_key_inline.is_some() {
+            return (
+                settings.ssh_private_key_file.clone(),
+                settings.ssh_private_key_inline.clone(),
+            );
+        }
+        self.projects
+            .get(self.active_project_idx)
+            .map(|project| {
+                (
+                    project.ssh_private_key_file.clone(),
+                    project.ssh_private_key_inline.clone(),
+                )
+            })
+            .unwrap_or((None, None))
     }
 
     fn refresh_project(&mut self) {
@@ -2052,7 +2624,7 @@ impl App {
         if !self.inventory_edit_mode_open {
             return;
         }
-        const MODE_COUNT: usize = 3;
+        const MODE_COUNT: usize = 2;
         if delta.is_positive() {
             self.inventory_edit_mode_idx = min(self.inventory_edit_mode_idx + 1, MODE_COUNT - 1);
         } else {
@@ -2066,17 +2638,12 @@ impl App {
             'k' => self.move_inventory_edit_mode_selection(-1),
             '1' => self.inventory_edit_mode_idx = 0,
             '2' => self.inventory_edit_mode_idx = 1,
-            '3' => self.inventory_edit_mode_idx = 2,
-            'g' => {
+            'e' => {
                 self.inventory_edit_mode_idx = 0;
                 self.confirm_inventory_edit_mode_selection();
             }
-            'e' => {
-                self.inventory_edit_mode_idx = 1;
-                self.confirm_inventory_edit_mode_selection();
-            }
             't' => {
-                self.inventory_edit_mode_idx = 2;
+                self.inventory_edit_mode_idx = 1;
                 self.confirm_inventory_edit_mode_selection();
             }
             _ => {}
@@ -2090,13 +2657,6 @@ impl App {
 
         match self.inventory_edit_mode_idx {
             0 => {
-                self.open_inventory_wizard_for_selected_inventory();
-                if self.inventory_wizard_open {
-                    self.inventory_edit_mode_open = false;
-                    self.inventory_edit_mode_idx = 0;
-                }
-            }
-            1 => {
                 self.inventory_edit_mode_open = false;
                 self.inventory_edit_mode_idx = 0;
                 self.open_inventory_external_editor();
@@ -2175,969 +2735,699 @@ impl App {
         }
     }
 
-    fn open_inventory_wizard(&mut self) {
-        if self.current_view() != View::Inventory {
-            self.status_line = String::from("Inventory builder is available in Inventory tab");
-            return;
-        }
-        self.inventory_wizard_edit_path = None;
-        self.inventory_wizard_open = true;
-        self.inventory_wizard_filename = String::from("inventory.yml");
-        self.inventory_wizard_hosts = vec![String::from("localhost")];
-        self.inventory_wizard_groups = vec![String::from("web"), String::from("db")];
-        self.inventory_wizard_assignments = BTreeMap::from([
-            (String::from("web"), vec![String::from("localhost")]),
-            (String::from("db"), Vec::new()),
-        ]);
-        self.inventory_wizard_group_children = BTreeMap::from([
-            (String::from("web"), Vec::new()),
-            (String::from("db"), Vec::new()),
-        ]);
-        self.inventory_wizard_focus = InventoryWizardFocus::Tree;
-        self.inventory_wizard_target_group = None;
-        self.inventory_wizard_tree_idx = 0;
-        self.inventory_wizard_host_idx = 0;
-        self.inventory_wizard_group_idx = 0;
-        self.inventory_wizard_input_mode = None;
-        self.inventory_wizard_input_buffer.clear();
-        self.pending_inventory_delete = None;
-        self.sync_inventory_wizard_tree_selection();
-        self.status_line = String::from(
-            "Builder: pick target in Group Tree, then attach groups/hosts from right pane (Space).",
-        );
+
+    pub fn selected_inventory_is_yaml(&self) -> bool {
+        self.inventories
+            .get(self.inventory_idx)
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(|e| matches!(e.to_ascii_lowercase().as_str(), "yml" | "yaml"))
+            .unwrap_or(false)
     }
 
-    fn open_inventory_wizard_for_selected_inventory(&mut self) {
-        if self.current_view() != View::Inventory {
-            self.status_line = String::from("Guided editor is available in Inventory tab");
-            return;
-        }
+    fn selected_inventory_path(&self) -> Option<&Path> {
+        self.inventories.get(self.inventory_idx).map(|p| p.as_path())
+    }
+
+    fn load_inventory_edit_state(&mut self) {
         let Some(path) = self.inventories.get(self.inventory_idx).cloned() else {
-            self.status_line = String::from("No inventory selected");
+            self.inventory_edit_state = None;
             return;
         };
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !matches!(ext.as_str(), "yml" | "yaml") {
-            self.status_line = format!(
-                "Guided editor supports YAML inventories only: {}",
-                display_path(self.active_project_root(), &path)
-            );
-            return;
+        if let Some(ref state) = self.inventory_edit_state {
+            if state.path == path {
+                return;
+            }
         }
-
         let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
+            Ok(c) => c,
             Err(err) => {
-                self.status_line = format!("Failed to open inventory for guided edit: {err}");
+                self.status_line = format!("Failed to read inventory: {err}");
+                self.inventory_edit_state = None;
                 return;
             }
         };
         let parsed = match parse_inventory_yaml_for_builder(&content) {
-            Ok(parsed) => parsed,
+            Ok(p) => p,
             Err(err) => {
-                self.status_line = format!(
-                    "Guided edit parse failed ({err}). Use text editor mode for this file."
-                );
+                self.status_line = format!("Parse failed ({err}). Use text editor for this file.");
+                self.inventory_edit_state = None;
                 return;
             }
         };
-
-        self.inventory_wizard_edit_path = Some(path.clone());
-        self.inventory_wizard_open = true;
-        self.inventory_wizard_filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.to_string())
-            .unwrap_or_else(|| String::from("inventory.yml"));
-        self.inventory_wizard_hosts = parsed.hosts;
-        self.inventory_wizard_groups = parsed.groups;
-        self.inventory_wizard_assignments = parsed.assignments;
-        self.inventory_wizard_group_children = parsed.group_children;
-        self.inventory_wizard_focus = InventoryWizardFocus::Tree;
-        self.inventory_wizard_target_group = None;
-        self.inventory_wizard_tree_idx = 0;
-        self.inventory_wizard_host_idx = 0;
-        self.inventory_wizard_group_idx = 0;
-        self.inventory_wizard_input_mode = None;
-        self.inventory_wizard_input_buffer.clear();
-        self.pending_inventory_delete = None;
-        self.sync_inventory_wizard_tree_selection();
-        self.sync_inventory_wizard_selection_bounds();
-        self.status_line = format!(
-            "Guided editing {}",
-            display_path(self.active_project_root(), &path)
-        );
+        self.inventory_edit_state = Some(InventoryEditState {
+            path,
+            hosts: parsed.hosts,
+            host_vars: parsed.host_vars,
+            groups: parsed.groups,
+            assignments: parsed.assignments,
+            group_children: parsed.group_children,
+            dirty: false,
+        });
+        self.hosts_subtab_idx = 0;
+        self.hosts_subtab_focus_detail = false;
+        self.hosts_subtab_field_idx = 0;
+        self.hosts_subtab_editing = false;
+        self.hosts_subtab_edit_buffer.clear();
+        self.hosts_subtab_add_host_open = false;
+        self.hosts_subtab_add_host_buffer.clear();
+        self.hosts_subtab_add_var_open = false;
+        self.hosts_subtab_add_var_buffer.clear();
+        self.groups_subtab_focus = GroupsFocus::Tree;
+        self.groups_subtab_tree_idx = 0;
+        self.groups_subtab_group_idx = 0;
+        self.groups_subtab_host_idx = 0;
+        self.groups_subtab_target_group = None;
     }
 
-    fn close_inventory_wizard(&mut self) {
-        if !self.inventory_wizard_open {
+    fn handle_subtab_enter(&mut self) {
+        // Handle Enter in input modes
+        if self.hosts_subtab_add_host_open {
+            self.handle_hosts_subtab_char('\n');
             return;
         }
-        if self.inventory_wizard_input_mode.is_some() {
-            self.inventory_wizard_input_mode = None;
-            self.inventory_wizard_input_buffer.clear();
-            self.status_line = String::from("Builder input cancelled");
-            return;
-        }
-        self.inventory_wizard_open = false;
-        self.inventory_wizard_filename.clear();
-        self.inventory_wizard_edit_path = None;
-        self.inventory_wizard_hosts.clear();
-        self.inventory_wizard_groups.clear();
-        self.inventory_wizard_assignments.clear();
-        self.inventory_wizard_group_children.clear();
-        self.inventory_wizard_focus = InventoryWizardFocus::Tree;
-        self.inventory_wizard_target_group = None;
-        self.inventory_wizard_tree_idx = 0;
-        self.inventory_wizard_host_idx = 0;
-        self.inventory_wizard_group_idx = 0;
-        self.inventory_wizard_input_mode = None;
-        self.inventory_wizard_input_buffer.clear();
-        self.status_line = String::from("Closed guided inventory builder");
-    }
-
-    fn cycle_inventory_wizard_focus(&mut self, delta: i8) {
-        if self.inventory_wizard_input_mode.is_some() {
-            return;
-        }
-        self.inventory_wizard_focus = match (self.inventory_wizard_focus, delta.is_positive()) {
-            (InventoryWizardFocus::Tree, true) => InventoryWizardFocus::Groups,
-            (InventoryWizardFocus::Groups, true) => InventoryWizardFocus::Hosts,
-            (InventoryWizardFocus::Hosts, true) => InventoryWizardFocus::Tree,
-            (InventoryWizardFocus::Tree, false) => InventoryWizardFocus::Hosts,
-            (InventoryWizardFocus::Groups, false) => InventoryWizardFocus::Tree,
-            (InventoryWizardFocus::Hosts, false) => InventoryWizardFocus::Groups,
-        };
-        self.sync_inventory_wizard_selection_bounds();
-    }
-
-    fn move_inventory_wizard_selection(&mut self, delta: i8) {
-        if self.inventory_wizard_input_mode.is_some() {
-            return;
-        }
-        match self.inventory_wizard_focus {
-            InventoryWizardFocus::Tree => {
-                let entries = self.inventory_wizard_tree_nodes();
-                if entries.is_empty() {
-                    self.inventory_wizard_tree_idx = 0;
-                    self.inventory_wizard_target_group = None;
-                    return;
+        if self.hosts_subtab_add_var_open {
+            if self.inventory_sub_tab == InventorySubTab::Groups {
+                // Add group in groups sub-tab
+                let name = self.hosts_subtab_add_var_buffer.trim().to_string();
+                if !name.is_empty()
+                    && is_valid_inventory_key(&name)
+                    && !is_reserved_inventory_group(&name)
+                {
+                    if let Some(ref mut state) = self.inventory_edit_state {
+                        if !state.groups.contains(&name) {
+                            state.groups.push(name.clone());
+                            state.assignments.entry(name.clone()).or_default();
+                            state.group_children.entry(name).or_default();
+                            state.dirty = true;
+                        }
+                    }
                 }
-                if delta.is_positive() {
-                    self.inventory_wizard_tree_idx =
-                        min(self.inventory_wizard_tree_idx + 1, entries.len() - 1);
-                } else {
-                    self.inventory_wizard_tree_idx =
-                        self.inventory_wizard_tree_idx.saturating_sub(1);
-                }
-                self.inventory_wizard_target_group =
-                    entries[self.inventory_wizard_tree_idx].0.clone();
-                self.sync_inventory_wizard_selection_bounds();
+                self.hosts_subtab_add_var_open = false;
+                self.hosts_subtab_add_var_buffer.clear();
+            } else {
+                self.handle_hosts_subtab_char('\n');
             }
-            InventoryWizardFocus::Groups => {
-                let groups = self.inventory_wizard_candidate_groups();
-                if groups.is_empty() {
-                    self.inventory_wizard_group_idx = 0;
-                    return;
-                }
-                if delta.is_positive() {
-                    self.inventory_wizard_group_idx =
-                        min(self.inventory_wizard_group_idx + 1, groups.len() - 1);
-                } else {
-                    self.inventory_wizard_group_idx =
-                        self.inventory_wizard_group_idx.saturating_sub(1);
+            return;
+        }
+        if self.hosts_subtab_editing {
+            self.handle_hosts_subtab_char('\n');
+            return;
+        }
+
+        // Non-editing Enter: begin editing in hosts, or toggle in groups
+        match self.inventory_sub_tab {
+            InventorySubTab::Hosts => {
+                if self.hosts_subtab_focus_detail {
+                    self.handle_hosts_subtab_char('e');
                 }
             }
-            InventoryWizardFocus::Hosts => {
-                let hosts = self.inventory_wizard_candidate_hosts();
-                if hosts.is_empty() {
-                    self.inventory_wizard_host_idx = 0;
-                    return;
-                }
-                if delta.is_positive() {
-                    self.inventory_wizard_host_idx =
-                        min(self.inventory_wizard_host_idx + 1, hosts.len() - 1);
-                } else {
-                    self.inventory_wizard_host_idx =
-                        self.inventory_wizard_host_idx.saturating_sub(1);
-                }
+            InventorySubTab::Groups => {
+                self.handle_groups_subtab_char(' ');
             }
+            InventorySubTab::Files => {}
         }
     }
 
-    fn handle_inventory_wizard_char(&mut self, ch: char) {
-        if self.inventory_wizard_input_mode.is_some() {
-            if !ch.is_control() {
-                self.inventory_wizard_input_buffer.push(ch);
+    fn handle_hosts_subtab_char(&mut self, ch: char) {
+        if self.hosts_subtab_add_host_open {
+            match ch {
+                '\n' => {
+                    let name = self.hosts_subtab_add_host_buffer.trim().to_string();
+                    if !name.is_empty() && is_valid_inventory_key(&name) {
+                        if let Some(ref mut state) = self.inventory_edit_state {
+                            if !state.hosts.contains(&name) {
+                                state.hosts.push(name.clone());
+                                state.host_vars.entry(name).or_default();
+                                state.dirty = true;
+                                self.hosts_subtab_idx = state.hosts.len() - 1;
+                            }
+                        }
+                    }
+                    self.hosts_subtab_add_host_open = false;
+                    self.hosts_subtab_add_host_buffer.clear();
+                }
+                _ if ch == '\x08' || ch == '\x7f' => {
+                    self.hosts_subtab_add_host_buffer.pop();
+                }
+                _ if !ch.is_control() => {
+                    self.hosts_subtab_add_host_buffer.push(ch);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.hosts_subtab_add_var_open {
+            match ch {
+                '\n' => {
+                    let key = self.hosts_subtab_add_var_buffer.trim().to_string();
+                    if !key.is_empty() {
+                        if let Some(ref mut state) = self.inventory_edit_state {
+                            if let Some(host) = state.hosts.get(self.hosts_subtab_idx).cloned() {
+                                let vars = state.host_vars.entry(host).or_default();
+                                if !vars.custom_vars.iter().any(|(k, _)| k == &key) {
+                                    vars.custom_vars.push((key, String::new()));
+                                    state.dirty = true;
+                                    self.hosts_subtab_field_idx = 3 + vars.custom_vars.len();
+                                }
+                            }
+                        }
+                    }
+                    self.hosts_subtab_add_var_open = false;
+                    self.hosts_subtab_add_var_buffer.clear();
+                }
+                _ if ch == '\x08' || ch == '\x7f' => {
+                    self.hosts_subtab_add_var_buffer.pop();
+                }
+                _ if !ch.is_control() => {
+                    self.hosts_subtab_add_var_buffer.push(ch);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.hosts_subtab_editing {
+            match ch {
+                '\n' => {
+                    if let Some(ref mut state) = self.inventory_edit_state {
+                        if let Some(host) = state.hosts.get(self.hosts_subtab_idx).cloned() {
+                            let vars = state.host_vars.entry(host).or_default();
+                            let buf = self.hosts_subtab_edit_buffer.clone();
+                            match self.hosts_subtab_field_idx {
+                                0 => vars.ansible_host = buf,
+                                1 => vars.ansible_user = buf,
+                                2 => vars.ansible_port = buf.parse::<u16>().ok(),
+                                3 => vars.ansible_connection = buf,
+                                n => {
+                                    let ci = n - 4;
+                                    if let Some(entry) = vars.custom_vars.get_mut(ci) {
+                                        entry.1 = buf;
+                                    }
+                                }
+                            }
+                            state.dirty = true;
+                        }
+                    }
+                    self.hosts_subtab_editing = false;
+                    self.hosts_subtab_edit_buffer.clear();
+                }
+                _ if ch == '\x08' || ch == '\x7f' => {
+                    self.hosts_subtab_edit_buffer.pop();
+                }
+                _ if !ch.is_control() => {
+                    self.hosts_subtab_edit_buffer.push(ch);
+                }
+                _ => {}
             }
             return;
         }
 
         match ch {
-            'n' | 'a' => self.begin_inventory_wizard_add(),
-            'f' => self.begin_inventory_wizard_filename_edit(),
-            'D' => self.delete_selected_inventory_wizard_item(),
-            ' ' | 'c' => self.toggle_inventory_wizard_attachment_for_focus(),
-            'd' => self.detach_inventory_wizard_attachment_for_focus(),
-            's' => self.save_inventory_wizard(),
-            'h' => self.cycle_inventory_wizard_focus(-1),
-            'l' => self.cycle_inventory_wizard_focus(1),
+            'h' => {
+                self.hosts_subtab_focus_detail = false;
+            }
+            'l' => {
+                self.hosts_subtab_focus_detail = true;
+            }
+            'j' => {
+                if self.hosts_subtab_focus_detail {
+                    let max_field = self.hosts_subtab_max_field_idx();
+                    if max_field > 0 {
+                        self.hosts_subtab_field_idx =
+                            min(self.hosts_subtab_field_idx + 1, max_field);
+                    }
+                } else if let Some(ref state) = self.inventory_edit_state {
+                    if !state.hosts.is_empty() {
+                        self.hosts_subtab_idx =
+                            min(self.hosts_subtab_idx + 1, state.hosts.len() - 1);
+                        self.hosts_subtab_field_idx = 0;
+                    }
+                }
+            }
+            'k' => {
+                if self.hosts_subtab_focus_detail {
+                    self.hosts_subtab_field_idx = self.hosts_subtab_field_idx.saturating_sub(1);
+                } else {
+                    self.hosts_subtab_idx = self.hosts_subtab_idx.saturating_sub(1);
+                    self.hosts_subtab_field_idx = 0;
+                }
+            }
+            'e' | '\n' => {
+                if self.hosts_subtab_focus_detail {
+                    if let Some(ref state) = self.inventory_edit_state {
+                        if let Some(host) = state.hosts.get(self.hosts_subtab_idx) {
+                            let vars = state.host_vars.get(host);
+                            self.hosts_subtab_edit_buffer = match self.hosts_subtab_field_idx {
+                                0 => vars.map(|v| v.ansible_host.clone()).unwrap_or_default(),
+                                1 => vars.map(|v| v.ansible_user.clone()).unwrap_or_default(),
+                                2 => vars
+                                    .and_then(|v| v.ansible_port)
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_default(),
+                                3 => vars
+                                    .map(|v| v.ansible_connection.clone())
+                                    .unwrap_or_default(),
+                                n => vars
+                                    .and_then(|v| v.custom_vars.get(n - 4))
+                                    .map(|(_, val)| val.clone())
+                                    .unwrap_or_default(),
+                            };
+                            self.hosts_subtab_editing = true;
+                        }
+                    }
+                }
+            }
+            'n' => {
+                if !self.hosts_subtab_focus_detail {
+                    self.hosts_subtab_add_host_open = true;
+                    self.hosts_subtab_add_host_buffer.clear();
+                }
+            }
+            'a' => {
+                if self.hosts_subtab_focus_detail {
+                    self.hosts_subtab_add_var_open = true;
+                    self.hosts_subtab_add_var_buffer.clear();
+                }
+            }
+            'D' => {
+                if let Some(ref mut state) = self.inventory_edit_state {
+                    if self.hosts_subtab_focus_detail {
+                        if self.hosts_subtab_field_idx >= 4 {
+                            let ci = self.hosts_subtab_field_idx - 4;
+                            if let Some(host) = state.hosts.get(self.hosts_subtab_idx).cloned() {
+                                if let Some(vars) = state.host_vars.get_mut(&host) {
+                                    if ci < vars.custom_vars.len() {
+                                        vars.custom_vars.remove(ci);
+                                        state.dirty = true;
+                                        let max = self.hosts_subtab_max_field_idx();
+                                        if self.hosts_subtab_field_idx > max {
+                                            self.hosts_subtab_field_idx = max;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if !state.hosts.is_empty() {
+                        let removed = state.hosts.remove(self.hosts_subtab_idx);
+                        state.host_vars.remove(&removed);
+                        for assigned in state.assignments.values_mut() {
+                            assigned.retain(|h| h != &removed);
+                        }
+                        state.dirty = true;
+                        if self.hosts_subtab_idx >= state.hosts.len() && !state.hosts.is_empty() {
+                            self.hosts_subtab_idx = state.hosts.len() - 1;
+                        }
+                        self.hosts_subtab_field_idx = 0;
+                    }
+                }
+            }
             _ => {}
         }
     }
 
-    fn backspace_inventory_wizard(&mut self) {
-        if self.inventory_wizard_input_mode.is_some() {
-            self.inventory_wizard_input_buffer.pop();
-        }
-    }
-
-    fn submit_inventory_wizard(&mut self) {
-        if !self.inventory_wizard_open {
-            return;
-        }
-        if self.inventory_wizard_input_mode.is_some() {
-            self.commit_inventory_wizard_input();
-            return;
-        }
-        self.toggle_inventory_wizard_attachment_for_focus();
-    }
-
-    fn begin_inventory_wizard_filename_edit(&mut self) {
-        self.inventory_wizard_input_mode = Some(InventoryWizardInputMode::Filename);
-        self.inventory_wizard_input_buffer = self.inventory_wizard_filename.clone();
-        self.status_line = String::from("Builder filename edit: type path and press Enter");
-    }
-
-    fn begin_inventory_wizard_add(&mut self) {
-        match self.inventory_wizard_focus {
-            InventoryWizardFocus::Hosts => {
-                self.inventory_wizard_input_mode = Some(InventoryWizardInputMode::AddHost);
-                self.inventory_wizard_input_buffer.clear();
-                self.status_line = String::from("Builder add host: type host and press Enter");
-            }
-            InventoryWizardFocus::Tree | InventoryWizardFocus::Groups => {
-                self.inventory_wizard_input_mode = Some(InventoryWizardInputMode::AddGroup);
-                self.inventory_wizard_input_buffer.clear();
-                self.status_line = String::from("Builder add group: type group and press Enter");
+    fn hosts_subtab_max_field_idx(&self) -> usize {
+        if let Some(ref state) = self.inventory_edit_state {
+            if let Some(host) = state.hosts.get(self.hosts_subtab_idx) {
+                let custom_len = state
+                    .host_vars
+                    .get(host)
+                    .map(|v| v.custom_vars.len())
+                    .unwrap_or(0);
+                return 3 + custom_len;
             }
         }
+        3
     }
 
-    fn commit_inventory_wizard_input(&mut self) {
-        let Some(mode) = self.inventory_wizard_input_mode else {
-            return;
-        };
-        let value = self.inventory_wizard_input_buffer.trim().to_string();
-        if value.is_empty() {
-            self.status_line = String::from("Builder: value cannot be empty");
-            return;
-        }
-
-        match mode {
-            InventoryWizardInputMode::Filename => {
-                let Some(filename) = normalize_inventory_filename(&value) else {
-                    self.status_line =
-                        String::from("Builder: filename must be plain and end with .yml/.yaml");
-                    return;
+    fn handle_groups_subtab_char(&mut self, ch: char) {
+        match ch {
+            'h' => {
+                self.groups_subtab_focus = match self.groups_subtab_focus {
+                    GroupsFocus::Tree => GroupsFocus::Hosts,
+                    GroupsFocus::Groups => GroupsFocus::Tree,
+                    GroupsFocus::Hosts => GroupsFocus::Groups,
                 };
-                self.inventory_wizard_filename = filename;
-                self.status_line = String::from("Builder filename updated");
             }
-            InventoryWizardInputMode::AddHost => {
-                if !is_valid_inventory_key(&value) {
-                    self.status_line = String::from(
-                        "Builder: host supports letters, numbers, '.', '-', '_' and ':'",
-                    );
-                    return;
-                }
-                if self.inventory_wizard_hosts.contains(&value) {
-                    self.status_line = String::from("Builder: host already exists");
-                    return;
-                }
-                self.inventory_wizard_hosts.push(value);
-                self.inventory_wizard_host_idx =
-                    self.inventory_wizard_hosts.len().saturating_sub(1);
-                self.status_line = String::from("Builder host added");
-            }
-            InventoryWizardInputMode::AddGroup => {
-                if is_reserved_inventory_group(&value) || !is_valid_inventory_key(&value) {
-                    self.status_line = String::from(
-                        "Builder: group must be valid and cannot be reserved (all, ungrouped)",
-                    );
-                    return;
-                }
-                if self.inventory_wizard_groups.contains(&value) {
-                    self.status_line = String::from("Builder: group already exists");
-                    return;
-                }
-                self.inventory_wizard_groups.push(value.clone());
-                self.inventory_wizard_target_group = Some(value.clone());
-                self.inventory_wizard_assignments
-                    .entry(value.clone())
-                    .or_default();
-                self.inventory_wizard_group_children
-                    .entry(value)
-                    .or_default();
-                self.status_line = String::from("Builder group added");
-                self.sync_inventory_wizard_tree_selection();
-            }
-        }
-        self.inventory_wizard_input_mode = None;
-        self.inventory_wizard_input_buffer.clear();
-        self.sync_inventory_wizard_selection_bounds();
-    }
-
-    fn delete_selected_inventory_wizard_item(&mut self) {
-        match self.inventory_wizard_focus {
-            InventoryWizardFocus::Hosts => {
-                let Some(removed) = self.selected_inventory_wizard_host() else {
-                    self.status_line = String::from("Builder: no host selected");
-                    return;
+            'l' => {
+                self.groups_subtab_focus = match self.groups_subtab_focus {
+                    GroupsFocus::Tree => GroupsFocus::Groups,
+                    GroupsFocus::Groups => GroupsFocus::Hosts,
+                    GroupsFocus::Hosts => GroupsFocus::Tree,
                 };
-                if let Some(idx) = self
-                    .inventory_wizard_hosts
-                    .iter()
-                    .position(|h| h == &removed)
-                {
-                    self.inventory_wizard_hosts.remove(idx);
-                }
-                for assigned in self.inventory_wizard_assignments.values_mut() {
-                    assigned.retain(|h| h != &removed);
-                }
-                self.status_line = format!("Builder host removed: {removed}");
             }
-            InventoryWizardFocus::Tree | InventoryWizardFocus::Groups => {
-                let group_to_remove = if self.inventory_wizard_focus == InventoryWizardFocus::Tree {
-                    self.inventory_wizard_target_group.clone()
-                } else {
-                    self.selected_inventory_wizard_group_candidate()
-                };
-                let Some(removed) = group_to_remove else {
-                    self.status_line = String::from("Builder: choose a group first");
-                    return;
-                };
-                if let Some(pos) = self
-                    .inventory_wizard_groups
-                    .iter()
-                    .position(|g| g == &removed)
-                {
-                    self.inventory_wizard_groups.remove(pos);
-                } else {
-                    self.status_line = String::from("Builder: selected group no longer exists");
-                    return;
+            'j' => {
+                match self.groups_subtab_focus {
+                    GroupsFocus::Tree => {
+                        let len = self.groups_subtab_tree_nodes().len();
+                        if len > 0 {
+                            self.groups_subtab_tree_idx =
+                                min(self.groups_subtab_tree_idx + 1, len - 1);
+                            self.sync_groups_subtab_tree_selection();
+                        }
+                    }
+                    GroupsFocus::Groups => {
+                        let len = self.groups_subtab_candidate_groups().len();
+                        if len > 0 {
+                            self.groups_subtab_group_idx =
+                                min(self.groups_subtab_group_idx + 1, len - 1);
+                        }
+                    }
+                    GroupsFocus::Hosts => {
+                        let len = self
+                            .inventory_edit_state
+                            .as_ref()
+                            .map(|s| s.hosts.len())
+                            .unwrap_or(0);
+                        if len > 0 {
+                            self.groups_subtab_host_idx =
+                                min(self.groups_subtab_host_idx + 1, len - 1);
+                        }
+                    }
                 }
-                self.inventory_wizard_assignments.remove(&removed);
-                self.inventory_wizard_group_children.remove(&removed);
-                for children in self.inventory_wizard_group_children.values_mut() {
-                    children.retain(|group| group != &removed);
-                }
-                if self.inventory_wizard_target_group.as_deref() == Some(removed.as_str()) {
-                    self.inventory_wizard_target_group = None;
-                }
-                self.status_line = format!("Builder group removed: {removed}");
             }
+            'k' => match self.groups_subtab_focus {
+                GroupsFocus::Tree => {
+                    self.groups_subtab_tree_idx = self.groups_subtab_tree_idx.saturating_sub(1);
+                    self.sync_groups_subtab_tree_selection();
+                }
+                GroupsFocus::Groups => {
+                    self.groups_subtab_group_idx = self.groups_subtab_group_idx.saturating_sub(1);
+                }
+                GroupsFocus::Hosts => {
+                    self.groups_subtab_host_idx = self.groups_subtab_host_idx.saturating_sub(1);
+                }
+            },
+            ' ' => {
+                self.toggle_groups_subtab_attachment();
+            }
+            'n' => {
+                match self.groups_subtab_focus {
+                    GroupsFocus::Groups | GroupsFocus::Tree => {
+                        // Add group via prompt reuse - open the add_var prompt repurposed
+                        self.hosts_subtab_add_var_open = true;
+                        self.hosts_subtab_add_var_buffer.clear();
+                        self.status_line =
+                            String::from("Type new group name and press Enter");
+                    }
+                    GroupsFocus::Hosts => {
+                        self.hosts_subtab_add_host_open = true;
+                        self.hosts_subtab_add_host_buffer.clear();
+                        self.status_line = String::from("Type new host name and press Enter");
+                    }
+                }
+            }
+            'D' => {
+                self.delete_groups_subtab_item();
+            }
+            'd' => {
+                self.detach_groups_subtab_item();
+            }
+            _ => {}
         }
-        self.sync_inventory_wizard_tree_selection();
-        self.sync_inventory_wizard_selection_bounds();
     }
 
-    fn toggle_inventory_wizard_attachment_for_focus(&mut self) {
-        match self.inventory_wizard_focus {
-            InventoryWizardFocus::Tree => {
-                self.status_line =
-                    String::from("Builder: move focus to Available Groups/Hosts to attach");
-            }
-            InventoryWizardFocus::Groups => self.toggle_inventory_wizard_group_for_target(),
-            InventoryWizardFocus::Hosts => self.toggle_inventory_wizard_host_for_target(),
-        }
-    }
-
-    fn detach_inventory_wizard_attachment_for_focus(&mut self) {
-        match self.inventory_wizard_focus {
-            InventoryWizardFocus::Tree => {
-                self.status_line =
-                    String::from("Builder: move focus to Available Groups/Hosts to detach");
-            }
-            InventoryWizardFocus::Groups => self.detach_inventory_wizard_group_for_target(),
-            InventoryWizardFocus::Hosts => self.detach_inventory_wizard_host_for_target(),
-        }
-    }
-
-    fn toggle_inventory_wizard_host_for_target(&mut self) {
-        let Some(host) = self.selected_inventory_wizard_host() else {
-            self.status_line = String::from("Builder: select a host first");
-            return;
+    pub fn groups_subtab_tree_nodes(&self) -> Vec<(Option<String>, usize)> {
+        let Some(ref state) = self.inventory_edit_state else {
+            return vec![(None, 0)];
         };
-        if let Some(target_group) = self.inventory_wizard_target_group.clone() {
-            let entry = self
-                .inventory_wizard_assignments
-                .entry(target_group.clone())
-                .or_default();
-            if let Some(pos) = entry.iter().position(|h| h == &host) {
-                entry.remove(pos);
-                self.status_line = format!("Builder removed host {host} from {target_group}");
-            } else {
-                entry.push(host.clone());
-                self.status_line = format!("Builder added host {host} to {target_group}");
-            }
-            return;
-        }
-
-        let mut removed = false;
-        for assigned in self.inventory_wizard_assignments.values_mut() {
-            let before = assigned.len();
-            assigned.retain(|h| h != &host);
-            removed |= assigned.len() != before;
-        }
-        if removed {
-            self.status_line = format!("Builder moved host {host} to ungrouped (all)");
-        } else {
-            self.status_line = format!("Builder host {host} is already ungrouped");
-        }
+        compute_tree_nodes(&state.groups, &state.group_children)
     }
 
-    fn detach_inventory_wizard_host_for_target(&mut self) {
-        let Some(host) = self.selected_inventory_wizard_host() else {
-            self.status_line = String::from("Builder: select a host first");
-            return;
+    pub fn groups_subtab_candidate_groups(&self) -> Vec<String> {
+        let Some(ref state) = self.inventory_edit_state else {
+            return Vec::new();
         };
-        if let Some(target_group) = self.inventory_wizard_target_group.clone() {
-            let mut removed = false;
-            if let Some(entry) = self.inventory_wizard_assignments.get_mut(&target_group) {
-                let before = entry.len();
-                entry.retain(|h| h != &host);
-                removed = entry.len() != before;
-            }
-            self.status_line = if removed {
-                format!("Builder removed host {host} from {target_group}")
-            } else {
-                format!("Builder host {host} is not in {target_group}")
-            };
-            return;
-        }
-        let mut removed = false;
-        for assigned in self.inventory_wizard_assignments.values_mut() {
-            let before = assigned.len();
-            assigned.retain(|h| h != &host);
-            removed |= assigned.len() != before;
-        }
-        self.status_line = if removed {
-            format!("Builder moved host {host} to ungrouped (all)")
-        } else {
-            format!("Builder host {host} is already ungrouped")
-        };
-    }
-
-    fn toggle_inventory_wizard_group_for_target(&mut self) {
-        let Some(child) = self.selected_inventory_wizard_group_candidate() else {
-            self.status_line = String::from("Builder: select a group first");
-            return;
-        };
-
-        if let Some(parent) = self.inventory_wizard_target_group.clone() {
-            if child == parent {
-                self.status_line = String::from("Builder: group cannot be child of itself");
-                return;
-            }
-            let linked = self
-                .inventory_wizard_group_children
-                .get(&parent)
-                .map(|children| children.contains(&child))
-                .unwrap_or(false);
-            if linked {
-                if let Some(children) = self.inventory_wizard_group_children.get_mut(&parent) {
-                    children.retain(|group| group != &child);
-                }
-                self.status_line = format!("Builder unlinked {child} from {parent}");
-                self.sync_inventory_wizard_tree_selection();
-                return;
-            }
-
-            let mut prospective = self.inventory_wizard_group_children.clone();
-            for children in prospective.values_mut() {
-                children.retain(|group| group != &child);
-            }
-            prospective
-                .entry(parent.clone())
-                .or_default()
-                .push(child.clone());
-            if group_children_has_cycle(&prospective) {
-                self.status_line = String::from("Builder: link would create a cycle");
-                return;
-            }
-
-            self.remove_inventory_wizard_child_from_all_parents(&child);
-            self.inventory_wizard_group_children
-                .entry(parent.clone())
-                .or_default()
-                .push(child.clone());
-            self.status_line = format!("Builder linked {child} under {parent}");
-            self.sync_inventory_wizard_tree_selection();
-            return;
-        }
-
-        if self.remove_inventory_wizard_child_from_all_parents(&child) {
-            self.status_line = format!("Builder moved {child} to root under all");
-        } else {
-            self.status_line = format!("Builder group {child} is already at root");
-        }
-        self.sync_inventory_wizard_tree_selection();
-    }
-
-    fn detach_inventory_wizard_group_for_target(&mut self) {
-        let Some(child) = self.selected_inventory_wizard_group_candidate() else {
-            self.status_line = String::from("Builder: select a group first");
-            return;
-        };
-        if let Some(parent) = self.inventory_wizard_target_group.clone() {
-            let mut removed = false;
-            if let Some(children) = self.inventory_wizard_group_children.get_mut(&parent) {
-                let before = children.len();
-                children.retain(|group| group != &child);
-                removed = children.len() != before;
-            }
-            self.status_line = if removed {
-                format!("Builder unlinked {child} from {parent}")
-            } else {
-                format!("Builder group {child} is not under {parent}")
-            };
-            self.sync_inventory_wizard_tree_selection();
-            return;
-        }
-        if self.remove_inventory_wizard_child_from_all_parents(&child) {
-            self.status_line = format!("Builder moved {child} to root under all");
-        } else {
-            self.status_line = format!("Builder group {child} is already at root");
-        }
-        self.sync_inventory_wizard_tree_selection();
-    }
-
-    fn remove_inventory_wizard_child_from_all_parents(&mut self, child: &str) -> bool {
-        let mut removed = false;
-        for children in self.inventory_wizard_group_children.values_mut() {
-            let before = children.len();
-            children.retain(|group| group != child);
-            removed |= children.len() != before;
-        }
-        removed
-    }
-
-    fn selected_inventory_wizard_host(&self) -> Option<String> {
-        self.inventory_wizard_candidate_hosts()
-            .get(self.inventory_wizard_host_idx)
-            .cloned()
-    }
-
-    fn selected_inventory_wizard_group_candidate(&self) -> Option<String> {
-        self.inventory_wizard_candidate_groups()
-            .get(self.inventory_wizard_group_idx)
-            .cloned()
-    }
-
-    fn inventory_wizard_candidate_hosts(&self) -> Vec<String> {
-        self.inventory_wizard_hosts.clone()
-    }
-
-    pub fn inventory_wizard_candidate_groups(&self) -> Vec<String> {
-        self.inventory_wizard_groups
+        state
+            .groups
             .iter()
             .filter(|group| {
-                self.inventory_wizard_target_group
+                self.groups_subtab_target_group
                     .as_ref()
                     .map(|target| target != *group)
                     .unwrap_or(true)
             })
             .cloned()
-            .collect::<Vec<_>>()
+            .collect()
     }
 
-    fn sync_inventory_wizard_selection_bounds(&mut self) {
-        let groups_len = self.inventory_wizard_candidate_groups().len();
-        if groups_len == 0 {
-            self.inventory_wizard_group_idx = 0;
-        } else if self.inventory_wizard_group_idx >= groups_len {
-            self.inventory_wizard_group_idx = groups_len - 1;
-        }
-
-        let hosts_len = self.inventory_wizard_candidate_hosts().len();
-        if hosts_len == 0 {
-            self.inventory_wizard_host_idx = 0;
-        } else if self.inventory_wizard_host_idx >= hosts_len {
-            self.inventory_wizard_host_idx = hosts_len - 1;
-        }
-    }
-
-    fn sync_inventory_wizard_tree_selection(&mut self) {
-        let entries = self.inventory_wizard_tree_nodes();
+    fn sync_groups_subtab_tree_selection(&mut self) {
+        let entries = self.groups_subtab_tree_nodes();
         if entries.is_empty() {
-            self.inventory_wizard_tree_idx = 0;
-            self.inventory_wizard_target_group = None;
+            self.groups_subtab_tree_idx = 0;
+            self.groups_subtab_target_group = None;
             return;
         }
-        if let Some(pos) = entries
-            .iter()
-            .position(|(group, _)| *group == self.inventory_wizard_target_group)
-        {
-            self.inventory_wizard_tree_idx = pos;
-        } else {
-            self.inventory_wizard_tree_idx = 0;
-            self.inventory_wizard_target_group = entries[0].0.clone();
+        if self.groups_subtab_tree_idx >= entries.len() {
+            self.groups_subtab_tree_idx = entries.len() - 1;
         }
+        self.groups_subtab_target_group = entries[self.groups_subtab_tree_idx].0.clone();
     }
 
-    fn push_inventory_wizard_tree_node(
-        &self,
-        node: &str,
-        depth: usize,
-        known: &HashSet<String>,
-        visited: &mut HashSet<String>,
-        out: &mut Vec<(Option<String>, usize)>,
-    ) {
-        if !known.contains(node) || !visited.insert(node.to_string()) {
-            return;
-        }
-        out.push((Some(node.to_string()), depth));
-        if let Some(children) = self.inventory_wizard_group_children.get(node) {
-            for child in children {
-                self.push_inventory_wizard_tree_node(child, depth + 1, known, visited, out);
+    fn toggle_groups_subtab_attachment(&mut self) {
+        match self.groups_subtab_focus {
+            GroupsFocus::Tree => {
+                self.status_line =
+                    String::from("Move focus to Groups or Hosts to toggle attachment");
             }
-        }
-    }
-
-    pub fn inventory_wizard_tree_nodes(&self) -> Vec<(Option<String>, usize)> {
-        let mut out = vec![(None, 0)];
-        if self.inventory_wizard_groups.is_empty() {
-            return out;
-        }
-
-        let known = self
-            .inventory_wizard_groups
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let mut parent_of = BTreeMap::new();
-        for parent in &self.inventory_wizard_groups {
-            if let Some(children) = self.inventory_wizard_group_children.get(parent) {
-                for child in children {
-                    if known.contains(child) {
-                        parent_of
-                            .entry(child.clone())
-                            .or_insert_with(|| parent.clone());
+            GroupsFocus::Groups => {
+                let candidates = self.groups_subtab_candidate_groups();
+                let Some(child) = candidates.get(self.groups_subtab_group_idx).cloned() else {
+                    return;
+                };
+                let Some(ref mut state) = self.inventory_edit_state else {
+                    return;
+                };
+                if let Some(parent) = self.groups_subtab_target_group.clone() {
+                    if child == parent {
+                        self.status_line =
+                            String::from("Group cannot be child of itself");
+                        return;
+                    }
+                    let linked = state
+                        .group_children
+                        .get(&parent)
+                        .map(|c| c.contains(&child))
+                        .unwrap_or(false);
+                    if linked {
+                        if let Some(children) = state.group_children.get_mut(&parent) {
+                            children.retain(|g| g != &child);
+                        }
+                        state.dirty = true;
+                        self.status_line = format!("Unlinked {child} from {parent}");
+                    } else {
+                        let mut prospective = state.group_children.clone();
+                        for children in prospective.values_mut() {
+                            children.retain(|g| g != &child);
+                        }
+                        prospective.entry(parent.clone()).or_default().push(child.clone());
+                        if group_children_has_cycle(&prospective) {
+                            self.status_line =
+                                String::from("Link would create a cycle");
+                            return;
+                        }
+                        for children in state.group_children.values_mut() {
+                            children.retain(|g| g != &child);
+                        }
+                        state
+                            .group_children
+                            .entry(parent.clone())
+                            .or_default()
+                            .push(child.clone());
+                        state.dirty = true;
+                        self.status_line = format!("Linked {child} under {parent}");
+                    }
+                } else {
+                    let mut removed = false;
+                    for children in state.group_children.values_mut() {
+                        let before = children.len();
+                        children.retain(|g| g != &child);
+                        removed |= children.len() != before;
+                    }
+                    if removed {
+                        state.dirty = true;
+                        self.status_line = format!("Moved {child} to root under all");
+                    } else {
+                        self.status_line = format!("{child} is already at root");
+                    }
+                }
+            }
+            GroupsFocus::Hosts => {
+                let Some(ref mut state) = self.inventory_edit_state else {
+                    return;
+                };
+                let Some(host) = state.hosts.get(self.groups_subtab_host_idx).cloned() else {
+                    return;
+                };
+                if let Some(target) = self.groups_subtab_target_group.clone() {
+                    let entry = state.assignments.entry(target.clone()).or_default();
+                    if let Some(pos) = entry.iter().position(|h| h == &host) {
+                        entry.remove(pos);
+                        state.dirty = true;
+                        self.status_line = format!("Removed {host} from {target}");
+                    } else {
+                        entry.push(host.clone());
+                        state.dirty = true;
+                        self.status_line = format!("Added {host} to {target}");
+                    }
+                } else {
+                    let mut removed = false;
+                    for assigned in state.assignments.values_mut() {
+                        let before = assigned.len();
+                        assigned.retain(|h| h != &host);
+                        removed |= assigned.len() != before;
+                    }
+                    if removed {
+                        state.dirty = true;
+                        self.status_line = format!("Moved {host} to ungrouped (all)");
+                    } else {
+                        self.status_line = format!("{host} is already ungrouped");
                     }
                 }
             }
         }
+    }
 
-        let roots = self
-            .inventory_wizard_groups
-            .iter()
-            .filter(|group| !parent_of.contains_key(*group))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut visited = HashSet::new();
-        for root in roots {
-            self.push_inventory_wizard_tree_node(&root, 1, &known, &mut visited, &mut out);
-        }
-        for group in &self.inventory_wizard_groups {
-            if visited.insert(group.clone()) {
-                out.push((Some(group.clone()), 1));
+    fn detach_groups_subtab_item(&mut self) {
+        match self.groups_subtab_focus {
+            GroupsFocus::Tree => {
+                self.status_line =
+                    String::from("Move focus to Groups or Hosts to detach");
             }
-        }
-        out
-    }
-
-    pub fn inventory_wizard_input_prompt(&self) -> Option<&'static str> {
-        match self.inventory_wizard_input_mode {
-            Some(InventoryWizardInputMode::Filename) => Some("Filename"),
-            Some(InventoryWizardInputMode::AddHost) => Some("New Host"),
-            Some(InventoryWizardInputMode::AddGroup) => Some("New Group"),
-            None => None,
-        }
-    }
-
-    pub fn inventory_wizard_target_group_path(&self) -> String {
-        let Some(target) = self.inventory_wizard_target_group.clone() else {
-            return String::from("all");
-        };
-
-        let mut parent_of = BTreeMap::new();
-        for parent in &self.inventory_wizard_groups {
-            if let Some(children) = self.inventory_wizard_group_children.get(parent) {
-                for child in children {
-                    parent_of
-                        .entry(child.clone())
-                        .or_insert_with(|| parent.clone());
+            GroupsFocus::Groups => {
+                let candidates = self.groups_subtab_candidate_groups();
+                let Some(child) = candidates.get(self.groups_subtab_group_idx).cloned() else {
+                    return;
+                };
+                let Some(ref mut state) = self.inventory_edit_state else {
+                    return;
+                };
+                if let Some(parent) = self.groups_subtab_target_group.clone() {
+                    if let Some(children) = state.group_children.get_mut(&parent) {
+                        let before = children.len();
+                        children.retain(|g| g != &child);
+                        if children.len() != before {
+                            state.dirty = true;
+                            self.status_line = format!("Unlinked {child} from {parent}");
+                        }
+                    }
+                } else {
+                    let mut removed = false;
+                    for children in state.group_children.values_mut() {
+                        let before = children.len();
+                        children.retain(|g| g != &child);
+                        removed |= children.len() != before;
+                    }
+                    if removed {
+                        state.dirty = true;
+                        self.status_line = format!("Moved {child} to root");
+                    }
                 }
             }
-        }
-
-        let mut path = vec![target.clone()];
-        let mut cursor = target;
-        let mut guard = 0usize;
-        while let Some(parent) = parent_of.get(&cursor) {
-            path.push(parent.clone());
-            cursor = parent.clone();
-            guard += 1;
-            if guard > self.inventory_wizard_groups.len() {
-                break;
-            }
-        }
-        path.reverse();
-        format!("all > {}", path.join(" > "))
-    }
-
-    pub fn inventory_wizard_child_groups_for_target(&self) -> Vec<String> {
-        let known = self
-            .inventory_wizard_groups
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        if let Some(parent) = self.inventory_wizard_target_group.as_ref() {
-            return self
-                .inventory_wizard_group_children
-                .get(parent)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|group| known.contains(group))
-                .collect::<Vec<_>>();
-        }
-
-        let mut parent_of = BTreeMap::new();
-        for parent in &self.inventory_wizard_groups {
-            if let Some(children) = self.inventory_wizard_group_children.get(parent) {
-                for child in children {
-                    if known.contains(child) {
-                        parent_of
-                            .entry(child.clone())
-                            .or_insert_with(|| parent.clone());
+            GroupsFocus::Hosts => {
+                let Some(ref mut state) = self.inventory_edit_state else {
+                    return;
+                };
+                let Some(host) = state.hosts.get(self.groups_subtab_host_idx).cloned() else {
+                    return;
+                };
+                if let Some(target) = self.groups_subtab_target_group.clone() {
+                    if let Some(entry) = state.assignments.get_mut(&target) {
+                        let before = entry.len();
+                        entry.retain(|h| h != &host);
+                        if entry.len() != before {
+                            state.dirty = true;
+                            self.status_line = format!("Removed {host} from {target}");
+                        }
+                    }
+                } else {
+                    let mut removed = false;
+                    for assigned in state.assignments.values_mut() {
+                        let before = assigned.len();
+                        assigned.retain(|h| h != &host);
+                        removed |= assigned.len() != before;
+                    }
+                    if removed {
+                        state.dirty = true;
+                        self.status_line = format!("Moved {host} to ungrouped");
                     }
                 }
             }
         }
-        self.inventory_wizard_groups
-            .iter()
-            .filter(|group| !parent_of.contains_key(*group))
-            .cloned()
-            .collect::<Vec<_>>()
     }
 
-    pub fn inventory_wizard_hosts_for_target(&self) -> Vec<String> {
-        if let Some(group) = self.inventory_wizard_target_group.as_ref() {
-            return self
-                .inventory_wizard_assignments
-                .get(group)
-                .cloned()
-                .unwrap_or_default();
-        }
-
-        let mut assigned = HashSet::new();
-        for hosts in self.inventory_wizard_assignments.values() {
-            for host in hosts {
-                assigned.insert(host.clone());
+    fn delete_groups_subtab_item(&mut self) {
+        match self.groups_subtab_focus {
+            GroupsFocus::Tree => {}
+            GroupsFocus::Groups => {
+                let candidates = self.groups_subtab_candidate_groups();
+                let Some(group) = candidates.get(self.groups_subtab_group_idx).cloned() else {
+                    return;
+                };
+                let Some(ref mut state) = self.inventory_edit_state else {
+                    return;
+                };
+                state.groups.retain(|g| g != &group);
+                state.assignments.remove(&group);
+                state.group_children.remove(&group);
+                for children in state.group_children.values_mut() {
+                    children.retain(|g| g != &group);
+                }
+                state.dirty = true;
+                let len = self.groups_subtab_candidate_groups().len();
+                if self.groups_subtab_group_idx >= len && len > 0 {
+                    self.groups_subtab_group_idx = len - 1;
+                }
+                self.status_line = format!("Deleted group {group}");
+            }
+            GroupsFocus::Hosts => {
+                let Some(ref mut state) = self.inventory_edit_state else {
+                    return;
+                };
+                let Some(host) = state.hosts.get(self.groups_subtab_host_idx).cloned() else {
+                    return;
+                };
+                state.hosts.retain(|h| h != &host);
+                state.host_vars.remove(&host);
+                for assigned in state.assignments.values_mut() {
+                    assigned.retain(|h| h != &host);
+                }
+                state.dirty = true;
+                if self.groups_subtab_host_idx >= state.hosts.len() && !state.hosts.is_empty() {
+                    self.groups_subtab_host_idx = state.hosts.len() - 1;
+                }
+                self.status_line = format!("Deleted host {host}");
             }
         }
-        self.inventory_wizard_hosts
-            .iter()
-            .filter(|host| !assigned.contains(*host))
-            .cloned()
-            .collect::<Vec<_>>()
     }
 
-    pub fn inventory_wizard_selected_group_attached_to_target(&self) -> bool {
-        let Some(group) = self.selected_inventory_wizard_group_candidate() else {
-            return false;
-        };
-        if let Some(parent) = self.inventory_wizard_target_group.as_ref() {
-            return self
-                .inventory_wizard_group_children
-                .get(parent)
-                .map(|children| children.contains(&group))
-                .unwrap_or(false);
-        }
-
-        !self
-            .inventory_wizard_group_children
-            .values()
-            .any(|children| children.contains(&group))
-    }
-
-    pub fn inventory_wizard_selected_host_assigned_to_target(&self) -> bool {
-        let Some(host) = self.selected_inventory_wizard_host() else {
-            return false;
-        };
-        if let Some(group) = self.inventory_wizard_target_group.as_ref() {
-            return self
-                .inventory_wizard_assignments
-                .get(group)
-                .map(|hosts| hosts.contains(&host))
-                .unwrap_or(false);
-        }
-
-        !self
-            .inventory_wizard_assignments
-            .values()
-            .any(|hosts| hosts.contains(&host))
-    }
-
-    fn normalized_inventory_wizard_assignments(
-        &self,
-        groups: &[String],
-        hosts: &[String],
-    ) -> Option<BTreeMap<String, Vec<String>>> {
-        let mut out = BTreeMap::new();
-        for group in groups {
-            let list = self
-                .inventory_wizard_assignments
-                .get(group)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|host| hosts.contains(host))
-                .collect::<Vec<_>>();
-            out.insert(group.clone(), list);
-        }
-        Some(out)
-    }
-
-    fn normalized_inventory_wizard_group_children(
-        &self,
-        groups: &[String],
-    ) -> Option<BTreeMap<String, Vec<String>>> {
-        let mut out = BTreeMap::new();
-        for parent in groups {
-            let children = self
-                .inventory_wizard_group_children
-                .get(parent)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|child| child != parent && groups.contains(child))
-                .collect::<Vec<_>>();
-            out.insert(parent.clone(), children);
-        }
-        if group_children_has_cycle(&out) {
-            return None;
-        }
-        Some(out)
-    }
-
-    fn save_inventory_wizard(&mut self) {
-        if !self.inventory_wizard_open {
-            return;
-        }
-
-        let Some(filename) = normalize_inventory_filename(&self.inventory_wizard_filename) else {
-            self.status_line =
-                String::from("Builder: filename must be plain and end with .yml/.yaml");
+    fn save_inventory_edit_state(&mut self) {
+        let Some(ref state) = self.inventory_edit_state else {
+            self.status_line = String::from("No inventory loaded for editing");
             return;
         };
-        if self.inventory_wizard_hosts.is_empty() {
-            self.status_line = String::from("Builder: add at least one host");
+        let yaml = render_inventory_yaml_with_vars(
+            &state.hosts,
+            &state.groups,
+            &state.assignments,
+            &state.group_children,
+            &state.host_vars,
+        );
+        if let Err(err) = fs::write(&state.path, &yaml) {
+            self.status_line = format!("Failed to save inventory: {err}");
             return;
         }
-        if self
-            .inventory_wizard_hosts
-            .iter()
-            .any(|host| !is_valid_inventory_key(host))
-        {
-            self.status_line =
-                String::from("Builder: host supports letters, numbers, '.', '-', '_' and ':'");
-            return;
+        if let Some(ref mut state) = self.inventory_edit_state {
+            state.dirty = false;
         }
-        if self
-            .inventory_wizard_groups
-            .iter()
-            .any(|group| !is_valid_inventory_key(group) || is_reserved_inventory_group(group))
-        {
-            self.status_line = String::from(
-                "Builder: group names must be valid and cannot be reserved (all, ungrouped)",
-            );
-            return;
-        }
-
-        let groups = self.inventory_wizard_groups.clone();
-        let hosts = self.inventory_wizard_hosts.clone();
-        let group_hosts = self
-            .normalized_inventory_wizard_assignments(&groups, &hosts)
+        let path_display = self
+            .inventory_edit_state
+            .as_ref()
+            .map(|s| display_path(self.active_project_root(), &s.path))
             .unwrap_or_default();
-        let Some(group_children) = self.normalized_inventory_wizard_group_children(&groups) else {
-            self.status_line = String::from("Builder: child-group links contain a cycle");
-            return;
-        };
-
-        let inventories_dir = self.active_project_root().join("inventories");
-        if let Err(err) = fs::create_dir_all(&inventories_dir) {
-            self.status_line = format!("Builder: failed to create inventories directory: {err}");
-            return;
-        }
-
-        let requested_path = inventories_dir.join(filename);
-        let mut updated_existing = false;
-        let output_path = if let Some(edit_path) = self.inventory_wizard_edit_path.clone() {
-            if requested_path == edit_path {
-                updated_existing = true;
-                edit_path
-            } else if requested_path.exists() {
-                self.status_line = format!(
-                    "Builder: inventory already exists: {}",
-                    display_path(self.active_project_root(), &requested_path)
-                );
-                return;
-            } else {
-                requested_path
-            }
-        } else if requested_path.exists() {
-            self.status_line = format!(
-                "Builder: inventory already exists: {}",
-                display_path(self.active_project_root(), &requested_path)
-            );
-            return;
-        } else {
-            requested_path
-        };
-
-        let content = render_inventory_yaml(&hosts, &groups, &group_hosts, &group_children);
-        if let Err(err) = fs::write(&output_path, content) {
-            self.status_line = format!("Builder: failed to write inventory: {err}");
-            return;
-        }
-
-        self.inventory_wizard_open = false;
-        self.inventory_wizard_filename.clear();
-        self.inventory_wizard_edit_path = None;
-        self.inventory_wizard_hosts.clear();
-        self.inventory_wizard_groups.clear();
-        self.inventory_wizard_assignments.clear();
-        self.inventory_wizard_group_children.clear();
-        self.inventory_wizard_focus = InventoryWizardFocus::Tree;
-        self.inventory_wizard_target_group = None;
-        self.inventory_wizard_tree_idx = 0;
-        self.inventory_wizard_host_idx = 0;
-        self.inventory_wizard_group_idx = 0;
-        self.inventory_wizard_input_mode = None;
-        self.inventory_wizard_input_buffer.clear();
         self.refresh_project();
-        if let Some(idx) = self.inventories.iter().position(|p| p == &output_path) {
-            self.inventory_idx = idx;
-        }
-        if updated_existing {
-            self.status_line = format!(
-                "Builder: updated inventory {}",
-                display_path(self.active_project_root(), &output_path)
-            );
-        } else {
-            self.status_line = format!(
-                "Builder: created inventory {}",
-                display_path(self.active_project_root(), &output_path)
-            );
-        }
+        self.status_line = format!("Inventory saved: {path_display}");
     }
 
     fn open_inventory_create_prompt(&mut self) {
@@ -3190,7 +3480,7 @@ impl App {
             return;
         }
 
-        let inventories_dir = self.active_project_root().join("inventories");
+        let inventories_dir = self.active_project_root().join("inventory");
         if let Err(err) = fs::create_dir_all(&inventories_dir) {
             self.status_line = format!("Failed to create inventories directory: {err}");
             return;
@@ -3250,9 +3540,9 @@ impl App {
     }
 
     fn delete_inventory_file(&mut self, path: PathBuf) {
-        let inventories_root = self.active_project_root().join("inventories");
+        let inventories_root = self.active_project_root().join("inventory");
         if path.strip_prefix(&inventories_root).is_err() {
-            self.status_line = String::from("Refusing to delete outside ./inventories");
+            self.status_line = String::from("Refusing to delete outside ./inventory");
             return;
         }
 
@@ -3296,6 +3586,24 @@ impl App {
         if let Err(err) = save_run(self.active_project_root(), run) {
             self.status_line = format!("history save failed: {err}");
         }
+    }
+
+    fn persist_all_runs(&mut self) {
+        if self.runs.is_empty() {
+            return;
+        }
+        let root = self.active_project_root().to_path_buf();
+        for run in &self.runs {
+            if let Err(err) = save_run(&root, run) {
+                self.status_line = format!("history save failed: {err}");
+                return;
+            }
+        }
+    }
+
+    fn request_quit(&mut self) {
+        self.persist_all_runs();
+        self.should_quit = true;
     }
 
     fn warn_if_playbook_bin_missing(&mut self) {
@@ -3476,6 +3784,8 @@ impl App {
             tags: self.run_options.tags.clone(),
             extra_vars: self.run_options.extra_vars.clone(),
             extra_args: self.run_options.extra_args.clone(),
+            ssh_private_key_file: None,
+            ssh_private_key_inline: None,
         }
     }
 
@@ -3507,8 +3817,9 @@ impl App {
         self.settings_editor_field_idx = 0;
         self.settings_editor_text_mode = false;
         self.settings_editor_text_buffer.clear();
-        self.status_line =
-            String::from("Playbook settings: j/k field, h/l or arrows adjust, Enter edit/save");
+        self.status_line = String::from(
+            "Playbook settings: j/k field, h/l or arrows adjust, Enter edit/save (inline key uses Ctrl+S to save)",
+        );
     }
 
     fn close_playbook_settings(&mut self) {
@@ -3617,7 +3928,7 @@ impl App {
             return;
         }
         if self.inventories.is_empty() {
-            self.status_line = String::from("No inventories found under ./inventories");
+            self.status_line = String::from("No inventories found under ./inventory");
             return;
         }
         let Some(playbook) = self.selected_playbook_key() else {
@@ -3806,6 +4117,16 @@ impl App {
     }
 }
 
+fn normalize_optional_multiline_text(value: String) -> Option<String> {
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = normalized.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn normalize_optional_text(value: String) -> Option<String> {
     let value = value.trim().to_string();
     if value.is_empty() {
@@ -3817,14 +4138,10 @@ fn normalize_optional_text(value: String) -> Option<String> {
 
 fn ensure_ansible_project_layout(root: &Path) -> std::io::Result<()> {
     for dir in [
-        "inventories",
+        "inventory",
+        "inventory/group_vars",
         "playbooks",
-        "group_vars",
-        "host_vars",
         "roles",
-        "collections",
-        "files",
-        "templates",
     ] {
         fs::create_dir_all(root.join(dir))?;
     }
@@ -3833,20 +4150,34 @@ fn ensure_ansible_project_layout(root: &Path) -> std::io::Result<()> {
     if !ansible_cfg.exists() {
         fs::write(
             ansible_cfg,
-            "[defaults]\ninventory = inventories/hosts.ini\nstdout_callback = yaml\n",
+            "[defaults]\n\
+             inventory = ./inventory\n\
+             roles_path = ./roles\n\
+             stdout_callback = yaml\n\
+             \n\
+             [ssh_connection]\n\
+             pipelining = True\n",
         )?;
     }
 
-    let inventory = root.join("inventories").join("hosts.ini");
+    let inventory = root.join("inventory").join("inventory.yml");
     if !inventory.exists() {
-        fs::write(inventory, "[local]\nlocalhost ansible_connection=local\n")?;
+        fs::write(
+            inventory,
+            "---\nall:\n  hosts:\n    localhost:\n      ansible_connection: local\n",
+        )?;
+    }
+
+    let group_vars_all = root.join("inventory").join("group_vars").join("all.yml");
+    if !group_vars_all.exists() {
+        fs::write(group_vars_all, "---\n")?;
     }
 
     let playbook = root.join("playbooks").join("site.yml");
     if !playbook.exists() {
         fs::write(
             playbook,
-            "---\n- name: Bootstrap project\n  hosts: all\n  gather_facts: false\n  tasks:\n    - name: Verify project scaffolding\n      ansible.builtin.debug:\n        msg: \"Ansible project is ready\"\n",
+            "---\n# Import playbooks here as they are added, e.g.:\n# - import_playbook: setup.yml\n",
         )?;
     }
 
@@ -3864,6 +4195,7 @@ struct ParsedInventoryYaml {
     groups: Vec<String>,
     assignments: BTreeMap<String, Vec<String>>,
     group_children: BTreeMap<String, Vec<String>>,
+    host_vars: BTreeMap<String, HostVars>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3898,11 +4230,13 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
     let mut in_children = false;
     let mut current_group: Option<String> = None;
     let mut current_group_section = ParsedInventoryGroupSection::None;
+    let mut current_host_name: Option<String> = None;
 
     let mut hosts = Vec::new();
     let mut groups = Vec::new();
     let mut assignments: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut group_children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut host_vars: BTreeMap<String, HostVars> = BTreeMap::new();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -3917,6 +4251,7 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
             in_children = false;
             current_group = None;
             current_group_section = ParsedInventoryGroupSection::None;
+            current_host_name = None;
             continue;
         }
         if !found_all_root {
@@ -3929,12 +4264,15 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
                 in_children = trimmed == "children:";
                 current_group = None;
                 current_group_section = ParsedInventoryGroupSection::None;
+                current_host_name = None;
             }
             4 => {
+                current_host_name = None;
                 if in_all_hosts {
                     if let Some(host) = parse_yaml_mapping_key(trimmed) {
                         if host != "hosts" {
-                            push_unique(&mut hosts, host);
+                            push_unique(&mut hosts, host.clone());
+                            current_host_name = Some(host);
                         }
                     }
                 } else if in_children {
@@ -3950,7 +4288,33 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
                 }
             }
             6 => {
-                if in_children && current_group.is_some() {
+                if in_all_hosts {
+                    if let Some(ref host_name) = current_host_name {
+                        if let Some((key, value)) = trimmed.split_once(':') {
+                            let key = key.trim();
+                            let value = value.trim();
+                            let vars = host_vars
+                                .entry(host_name.clone())
+                                .or_default();
+                            match key {
+                                "ansible_host" => vars.ansible_host = value.to_string(),
+                                "ansible_user" => vars.ansible_user = value.to_string(),
+                                "ansible_port" => {
+                                    vars.ansible_port = value.parse::<u16>().ok();
+                                }
+                                "ansible_connection" => {
+                                    vars.ansible_connection = value.to_string();
+                                }
+                                _ => {
+                                    if !key.is_empty() {
+                                        vars.custom_vars
+                                            .push((key.to_string(), value.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if in_children && current_group.is_some() {
                     current_group_section = match trimmed {
                         "hosts:" => ParsedInventoryGroupSection::Hosts,
                         "children:" => ParsedInventoryGroupSection::Children,
@@ -4011,6 +4375,7 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
         groups,
         assignments,
         group_children,
+        host_vars,
     })
 }
 
@@ -4085,7 +4450,7 @@ fn is_inventory_file(cwd: &Path, path: &Path, ext: &str) -> bool {
         return false;
     }
     let in_project_root = path.parent().map(|p| p == cwd).unwrap_or(false);
-    let in_inventories_tree = path_contains_dir_under(path, cwd, "inventories");
+    let in_inventories_tree = path_contains_dir_under(path, cwd, "inventory");
     let in_hosts_tree = path_contains_dir_under(path, cwd, "hosts");
 
     if in_inventories_tree || in_hosts_tree {
@@ -4111,28 +4476,6 @@ fn path_contains_dir_under(path: &Path, cwd: &Path, dir_name: &str) -> bool {
     };
     rel.components()
         .any(|component| component.as_os_str() == dir_name)
-}
-
-fn normalize_inventory_filename(value: &str) -> Option<String> {
-    let mut filename = value.trim().to_string();
-    if filename.is_empty()
-        || filename.contains('/')
-        || filename.contains('\\')
-        || filename.contains("..")
-    {
-        return None;
-    }
-    if Path::new(&filename).extension().is_none() {
-        filename.push_str(".yml");
-    }
-    let ext = Path::new(&filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
-    if !matches!(ext, "yml" | "yaml") {
-        return None;
-    }
-    Some(filename)
 }
 
 fn is_valid_inventory_key(value: &str) -> bool {
@@ -4191,54 +4534,150 @@ fn drain_stale_terminal_input(window: Duration) {
     }
 }
 
-fn render_inventory_yaml(
+fn render_inventory_yaml_with_vars(
     hosts: &[String],
     groups: &[String],
     group_hosts: &BTreeMap<String, Vec<String>>,
     group_children: &BTreeMap<String, Vec<String>>,
+    host_vars: &BTreeMap<String, HostVars>,
 ) -> String {
     let mut out = String::from("all:\n");
+
+    let has_any_vars = hosts
+        .iter()
+        .any(|h| host_vars.get(h).map(|v| !v.is_empty()).unwrap_or(false));
+
     let mut assigned_hosts = Vec::new();
     for host in group_hosts.values().flatten() {
         if !assigned_hosts.contains(host) {
             assigned_hosts.push(host.clone());
         }
     }
-    let unassigned_hosts = hosts
+
+    let hosts_with_vars: Vec<&String> = hosts
+        .iter()
+        .filter(|h| {
+            host_vars.get(*h).map(|v| !v.is_empty()).unwrap_or(false)
+                && assigned_hosts.contains(*h)
+        })
+        .collect();
+
+    let unassigned_hosts: Vec<&String> = hosts
         .iter()
         .filter(|host| !assigned_hosts.contains(*host))
-        .collect::<Vec<_>>();
+        .collect();
 
-    if !unassigned_hosts.is_empty() {
+    let need_all_hosts_section = !unassigned_hosts.is_empty() || !hosts_with_vars.is_empty();
+
+    if need_all_hosts_section || (has_any_vars && !hosts.is_empty()) {
         out.push_str("  hosts:\n");
-        for host in unassigned_hosts {
-            out.push_str(&format!("    {host}: {{}}\n"));
+        let mut written = HashSet::new();
+        for host in hosts {
+            let has_vars = host_vars.get(host).map(|v| !v.is_empty()).unwrap_or(false);
+            let is_unassigned = !assigned_hosts.contains(host);
+            if !has_vars && !is_unassigned {
+                continue;
+            }
+            if !written.insert(host.clone()) {
+                continue;
+            }
+            if has_vars {
+                let vars = host_vars.get(host).unwrap();
+                out.push_str(&format!("    {host}:\n"));
+                for (key, value) in vars.to_yaml_mapping() {
+                    out.push_str(&format!("      {key}: {value}\n"));
+                }
+            } else {
+                out.push_str(&format!("    {host}: {{}}\n"));
+            }
         }
     }
 
-    out.push_str("  children:\n");
-    for group in groups {
-        out.push_str(&format!("    {group}:\n"));
-        if let Some(hosts) = group_hosts.get(group) {
-            if hosts.is_empty() {
-                out.push_str("      hosts: {}\n");
+    if !groups.is_empty() {
+        out.push_str("  children:\n");
+        for group in groups {
+            out.push_str(&format!("    {group}:\n"));
+            if let Some(hosts) = group_hosts.get(group) {
+                if hosts.is_empty() {
+                    out.push_str("      hosts: {}\n");
+                } else {
+                    out.push_str("      hosts:\n");
+                    for host in hosts {
+                        out.push_str(&format!("        {host}: {{}}\n"));
+                    }
+                }
             } else {
-                out.push_str("      hosts:\n");
-                for host in hosts {
-                    out.push_str(&format!("        {host}: {{}}\n"));
-                }
+                out.push_str("      hosts: {}\n");
             }
-        } else {
-            out.push_str("      hosts: {}\n");
-        }
 
-        if let Some(children) = group_children.get(group) {
-            if !children.is_empty() {
-                out.push_str("      children:\n");
-                for child in children {
-                    out.push_str(&format!("        {child}: {{}}\n"));
+            if let Some(children) = group_children.get(group) {
+                if !children.is_empty() {
+                    out.push_str("      children:\n");
+                    for child in children {
+                        out.push_str(&format!("        {child}: {{}}\n"));
+                    }
                 }
             }
+        }
+    }
+    out
+}
+
+fn compute_tree_nodes(
+    groups: &[String],
+    group_children: &BTreeMap<String, Vec<String>>,
+) -> Vec<(Option<String>, usize)> {
+    fn push_node(
+        node: &str,
+        depth: usize,
+        known: &HashSet<String>,
+        group_children: &BTreeMap<String, Vec<String>>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<(Option<String>, usize)>,
+    ) {
+        if !known.contains(node) || !visited.insert(node.to_string()) {
+            return;
+        }
+        out.push((Some(node.to_string()), depth));
+        if let Some(children) = group_children.get(node) {
+            for child in children {
+                push_node(child, depth + 1, known, group_children, visited, out);
+            }
+        }
+    }
+
+    let mut out = vec![(None, 0)];
+    if groups.is_empty() {
+        return out;
+    }
+
+    let known: HashSet<String> = groups.iter().cloned().collect();
+    let mut parent_of = BTreeMap::new();
+    for parent in groups {
+        if let Some(children) = group_children.get(parent) {
+            for child in children {
+                if known.contains(child) {
+                    parent_of
+                        .entry(child.clone())
+                        .or_insert_with(|| parent.clone());
+                }
+            }
+        }
+    }
+
+    let roots: Vec<String> = groups
+        .iter()
+        .filter(|g| !parent_of.contains_key(*g))
+        .cloned()
+        .collect();
+
+    let mut visited = HashSet::new();
+    for root in roots {
+        push_node(&root, 1, &known, group_children, &mut visited, &mut out);
+    }
+    for group in groups {
+        if visited.insert(group.clone()) {
+            out.push((Some(group.clone()), 1));
         }
     }
     out

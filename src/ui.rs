@@ -10,7 +10,9 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{display_path, App, InventoryWizardFocus, ProjectCreateMode, RunStatus, View};
+use crate::app::{
+    display_path, App, InventorySubTab, GroupsFocus, ProjectCreateMode, RunStatus, View,
+};
 use crate::playbook_settings::PlaybookSettings;
 use crate::run::playbook_bin_available;
 use crate::theme as th;
@@ -44,12 +46,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.project_create_open {
         render_project_create_prompt(frame, app);
     }
+    if app.project_ssh_open {
+        render_project_ssh_prompt(frame, app);
+    }
     if app.inventory_edit_mode_open {
         render_inventory_edit_mode_prompt(frame, app);
-    }
-    if app.inventory_wizard_open {
-        render_inventory_wizard(frame, app);
-        render_inventory_wizard_input_prompt(frame, app);
     }
     if app.inventory_editor_open {
         render_inventory_editor(frame, app);
@@ -61,6 +62,13 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn render_body(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if app.current_view() == View::Dashboard || app.current_view() == View::Projects {
+        render_main(frame, app, area);
+        return;
+    }
+
+    if app.current_view() == View::Inventory
+        && !matches!(app.inventory_sub_tab, InventorySubTab::Files)
+    {
         render_main(frame, app, area);
         return;
     }
@@ -408,7 +416,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(10),
+            Constraint::Length(12),
             Constraint::Min(6),
             Constraint::Length(2),
         ])
@@ -443,6 +451,17 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     .unwrap_or_else(|| String::from("unset")),
             ),
             (
+                String::from("ssh_key_file"),
+                project
+                    .ssh_private_key_file
+                    .clone()
+                    .unwrap_or_else(|| String::from("unset")),
+            ),
+            (
+                String::from("ssh_key_inline"),
+                summarize_inline_key(project.ssh_private_key_inline.as_deref()),
+            ),
+            (
                 String::from("playbooks"),
                 if selected_active {
                     app.playbooks.len().to_string()
@@ -466,6 +485,8 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             (String::from("active"), String::from("false")),
             (String::from("inventory_sync"), String::from("unset")),
             (String::from("vars_sync"), String::from("unset")),
+            (String::from("ssh_key_file"), String::from("unset")),
+            (String::from("ssh_key_inline"), String::from("unset")),
             (String::from("playbooks"), String::from("0")),
             (String::from("inventories"), String::from("0")),
         ]
@@ -520,20 +541,65 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(logs, right[1]);
 
     let hint = Paragraph::new(
-        "n new | f import path | g clone git | a/Enter activate | i inventory sync | v vars sync | j/k select",
+        "n new | f import path | g clone git | e ssh key settings | a/Enter activate | Shift+D delete | i inventory sync | v vars sync | j/k select",
     )
     .style(Style::default().fg(th::SUBTEXT0));
     frame.render_widget(hint, right[2]);
 }
 
 fn render_inventory(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(5)])
+        .split(area);
+
+    let is_yaml = app.selected_inventory_is_yaml();
+    let tab_titles: Vec<Line> = vec![
+        Line::from("1:Files"),
+        Line::from(Span::styled(
+            "2:Hosts",
+            if is_yaml {
+                Style::default()
+            } else {
+                Style::default().fg(th::SURFACE1)
+            },
+        )),
+        Line::from(Span::styled(
+            "3:Groups",
+            if is_yaml {
+                Style::default()
+            } else {
+                Style::default().fg(th::SURFACE1)
+            },
+        )),
+    ];
+    let selected_tab = match app.inventory_sub_tab {
+        InventorySubTab::Files => 0,
+        InventorySubTab::Hosts => 1,
+        InventorySubTab::Groups => 2,
+    };
+    let sub_tabs = Tabs::new(tab_titles)
+        .select(selected_tab)
+        .highlight_style(Style::default().fg(th::MAUVE).add_modifier(Modifier::BOLD))
+        .style(Style::default().fg(th::SUBTEXT0))
+        .divider("|");
+    frame.render_widget(sub_tabs, layout[0]);
+
+    match app.inventory_sub_tab {
+        InventorySubTab::Files => render_inventory_files(frame, app, layout[1]),
+        InventorySubTab::Hosts => render_inventory_hosts(frame, app, layout[1]),
+        InventorySubTab::Groups => render_inventory_groups(frame, app, layout[1]),
+    }
+}
+
+fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
         .split(area);
 
     let items = if app.inventories.is_empty() {
-        vec![ListItem::new("No inventories found under ./inventories")]
+        vec![ListItem::new("No inventories found under ./inventory")]
     } else {
         app.inventories
             .iter()
@@ -600,11 +666,492 @@ fn render_inventory(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(preview, right[1]);
 
     let hint = Paragraph::new(
-        "n new inventory | g new guided inventory | e edit selected (choose mode) | Shift+D delete selected | j/k or Up/Down select",
+        "n new inventory | e edit selected (choose mode) | Shift+D delete selected | j/k select | 2 Hosts | 3 Groups",
     )
     .style(Style::default().fg(th::SUBTEXT0))
     .wrap(Wrap { trim: true });
     frame.render_widget(hint, right[2]);
+}
+
+fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let Some(ref state) = app.inventory_edit_state else {
+        let msg = Paragraph::new("No YAML inventory loaded. Select a YAML file and press 2.")
+            .style(Style::default().fg(th::SUBTEXT0));
+        frame.render_widget(msg, area);
+        return;
+    };
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(2)])
+        .split(area);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(layout[0]);
+
+    // Host list (left panel)
+    let list_items: Vec<ListItem> = if state.hosts.is_empty() {
+        vec![ListItem::new("No hosts. Press n to add.")]
+    } else {
+        state
+            .hosts
+            .iter()
+            .map(|h| ListItem::new(h.as_str()))
+            .collect()
+    };
+    let dirty_marker = if state.dirty { " [*]" } else { "" };
+    let list_border = if !app.hosts_subtab_focus_detail {
+        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th::SURFACE1)
+    };
+    let host_list = List::new(list_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(list_border)
+                .title(format!("Hosts{dirty_marker}")),
+        )
+        .highlight_style(Style::default().fg(th::YELLOW))
+        .highlight_symbol(">> ");
+    let mut list_state = ListState::default().with_selected(if state.hosts.is_empty() {
+        None
+    } else {
+        Some(app.hosts_subtab_idx)
+    });
+    frame.render_stateful_widget(host_list, cols[0], &mut list_state);
+
+    // Host detail (right panel)
+    let detail_border = if app.hosts_subtab_focus_detail {
+        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th::SURFACE1)
+    };
+
+    if let Some(host) = state.hosts.get(app.hosts_subtab_idx) {
+        let vars = state.host_vars.get(host);
+        let mut rows: Vec<Row> = Vec::new();
+
+        let fields: Vec<(&str, String)> = vec![
+            (
+                "ansible_host",
+                vars.map(|v| v.ansible_host.clone()).unwrap_or_default(),
+            ),
+            (
+                "ansible_user",
+                vars.map(|v| v.ansible_user.clone()).unwrap_or_default(),
+            ),
+            (
+                "ansible_port",
+                vars.and_then(|v| v.ansible_port)
+                    .map(|p| p.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "ansible_connection",
+                vars.map(|v| v.ansible_connection.clone())
+                    .unwrap_or_default(),
+            ),
+        ];
+
+        for (i, (key, value)) in fields.iter().enumerate() {
+            let display_val = if app.hosts_subtab_editing
+                && app.hosts_subtab_focus_detail
+                && app.hosts_subtab_field_idx == i
+            {
+                format!("{}|", app.hosts_subtab_edit_buffer)
+            } else {
+                value.clone()
+            };
+            rows.push(Row::new(vec![
+                Cell::from(*key),
+                Cell::from(display_val),
+            ]));
+        }
+
+        if let Some(v) = vars {
+            if !v.custom_vars.is_empty() {
+                rows.push(Row::new(vec![
+                    Cell::from("--- Custom ---").style(Style::default().fg(th::SUBTEXT0)),
+                    Cell::from(""),
+                ]));
+            }
+            for (ci, (key, value)) in v.custom_vars.iter().enumerate() {
+                let field_i = 4 + ci;
+                let display_val = if app.hosts_subtab_editing
+                    && app.hosts_subtab_focus_detail
+                    && app.hosts_subtab_field_idx == field_i
+                {
+                    format!("{}|", app.hosts_subtab_edit_buffer)
+                } else {
+                    value.clone()
+                };
+                rows.push(Row::new(vec![
+                    Cell::from(key.as_str()),
+                    Cell::from(display_val),
+                ]));
+            }
+        }
+
+        let detail_table =
+            Table::new(rows, [Constraint::Length(20), Constraint::Min(10)])
+                .header(
+                    Row::new(vec!["Property", "Value"]).style(
+                        Style::default()
+                            .fg(th::SUBTEXT1)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                )
+                .column_spacing(1)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(detail_border)
+                        .title(format!("Host: {host}")),
+                )
+                .row_highlight_style(
+                    if app.hosts_subtab_focus_detail {
+                        Style::default().fg(th::YELLOW)
+                    } else {
+                        Style::default()
+                    },
+                );
+        let mut table_state = TableState::default().with_selected(
+            if app.hosts_subtab_focus_detail {
+                Some(if let Some(v) = vars {
+                    if !v.custom_vars.is_empty() && app.hosts_subtab_field_idx >= 4 {
+                        // account for the separator row
+                        app.hosts_subtab_field_idx + 1
+                    } else {
+                        app.hosts_subtab_field_idx
+                    }
+                } else {
+                    app.hosts_subtab_field_idx
+                })
+            } else {
+                None
+            },
+        );
+        frame.render_stateful_widget(detail_table, cols[1], &mut table_state);
+    } else {
+        let empty = Paragraph::new("Select a host from the list")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(detail_border)
+                    .title("Host Detail"),
+            )
+            .style(Style::default().fg(th::SUBTEXT0));
+        frame.render_widget(empty, cols[1]);
+    }
+
+    // Input prompts
+    if app.hosts_subtab_add_host_open {
+        let prompt_area = centered_rect(50, 15, frame.area());
+        frame.render_widget(Clear, prompt_area);
+        let val = if app.hosts_subtab_add_host_buffer.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.hosts_subtab_add_host_buffer)
+        };
+        let input = Paragraph::new(val)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
+                    .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+                    .title("New Host Name"),
+            );
+        frame.render_widget(input, prompt_area);
+    }
+
+    if app.hosts_subtab_add_var_open {
+        let prompt_area = centered_rect(50, 15, frame.area());
+        frame.render_widget(Clear, prompt_area);
+        let val = if app.hosts_subtab_add_var_buffer.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.hosts_subtab_add_var_buffer)
+        };
+        let input = Paragraph::new(val)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
+                    .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+                    .title("New Variable Name"),
+            );
+        frame.render_widget(input, prompt_area);
+    }
+
+    let hint = Paragraph::new(
+        "h/l focus | j/k nav | e edit | n add host | a add var | D delete | Ctrl+S save | Esc back",
+    )
+    .style(Style::default().fg(th::SUBTEXT0))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(hint, layout[1]);
+}
+
+fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let Some(ref state) = app.inventory_edit_state else {
+        let msg = Paragraph::new("No YAML inventory loaded. Select a YAML file and press 3.")
+            .style(Style::default().fg(th::SUBTEXT0));
+        frame.render_widget(msg, area);
+        return;
+    };
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(2)])
+        .split(area);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(35),
+            Constraint::Percentage(35),
+        ])
+        .split(layout[0]);
+
+    // Group tree (left) with box-drawing connectors
+    let tree_nodes = app.groups_subtab_tree_nodes();
+    let tree_items: Vec<ListItem> = if tree_nodes.is_empty() {
+        vec![ListItem::new("No groups yet.")]
+    } else {
+        // Pre-compute: for each node, determine if it is the last sibling at its depth
+        let mut is_last_at_depth: Vec<bool> = vec![false; tree_nodes.len()];
+        for i in 0..tree_nodes.len() {
+            let (_, depth) = &tree_nodes[i];
+            let is_last = tree_nodes[i + 1..]
+                .iter()
+                .find(|(_, d)| *d <= *depth)
+                .map(|(_, d)| *d < *depth)
+                .unwrap_or(true);
+            is_last_at_depth[i] = is_last;
+        }
+        // Track which ancestor depths still have more siblings
+        let mut ancestors_open: Vec<bool> = Vec::new();
+        tree_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, (group, depth))| {
+                let label = match group {
+                    None => String::from("all"),
+                    Some(name) => {
+                        if *depth == 0 {
+                            name.clone()
+                        } else {
+                            // Adjust ancestors_open to match current depth
+                            ancestors_open.truncate(depth.saturating_sub(1));
+                            // Build prefix from ancestor continuation lines
+                            let mut prefix = String::new();
+                            for open in ancestors_open.iter() {
+                                if *open {
+                                    prefix.push_str("│  ");
+                                } else {
+                                    prefix.push_str("   ");
+                                }
+                            }
+                            // Add connector for this node
+                            if is_last_at_depth[i] {
+                                prefix.push_str("└─ ");
+                                ancestors_open.push(false);
+                            } else {
+                                prefix.push_str("├─ ");
+                                ancestors_open.push(true);
+                            }
+                            format!("{prefix}{name}")
+                        }
+                    }
+                };
+                ListItem::new(label)
+            })
+            .collect()
+    };
+    let tree_border = if app.groups_subtab_focus == GroupsFocus::Tree {
+        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th::SURFACE1)
+    };
+    let dirty_marker = if state.dirty { " [*]" } else { "" };
+    let tree = List::new(tree_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(tree_border)
+                .title(format!("Group Tree{dirty_marker}")),
+        )
+        .highlight_style(Style::default().fg(th::YELLOW))
+        .highlight_symbol(">> ");
+    let mut tree_state = ListState::default().with_selected(if tree_nodes.is_empty() {
+        None
+    } else {
+        Some(app.groups_subtab_tree_idx)
+    });
+    frame.render_stateful_widget(tree, cols[0], &mut tree_state);
+
+    // Groups list (middle)
+    let candidate_groups = app.groups_subtab_candidate_groups();
+    let group_items: Vec<ListItem> = if candidate_groups.is_empty() {
+        vec![ListItem::new("No groups available.")]
+    } else {
+        candidate_groups
+            .iter()
+            .map(|group| {
+                let attached = if let Some(target) = app.groups_subtab_target_group.as_ref() {
+                    state
+                        .group_children
+                        .get(target)
+                        .map(|c| c.contains(group))
+                        .unwrap_or(false)
+                } else {
+                    !state
+                        .group_children
+                        .values()
+                        .any(|c| c.contains(group))
+                };
+                if attached {
+                    ListItem::new(Line::from(vec![
+                        Span::styled("[x]", Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)),
+                        Span::raw(format!(" {group}")),
+                    ]))
+                } else {
+                    ListItem::new(Line::from(vec![
+                        Span::styled("[ ]", Style::default().fg(th::SURFACE1)),
+                        Span::styled(format!(" {group}"), Style::default().fg(th::SUBTEXT0)),
+                    ]))
+                }
+            })
+            .collect()
+    };
+    let groups_border = if app.groups_subtab_focus == GroupsFocus::Groups {
+        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th::SURFACE1)
+    };
+    let groups_list = List::new(group_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(groups_border)
+                .title("Groups"),
+        )
+        .highlight_style(Style::default().fg(th::YELLOW))
+        .highlight_symbol(">> ");
+    let mut groups_state = ListState::default().with_selected(if candidate_groups.is_empty() {
+        None
+    } else {
+        Some(app.groups_subtab_group_idx)
+    });
+    frame.render_stateful_widget(groups_list, cols[1], &mut groups_state);
+
+    // Hosts list (right)
+    let host_items: Vec<ListItem> = if state.hosts.is_empty() {
+        vec![ListItem::new("No hosts. Press n to add.")]
+    } else {
+        state
+            .hosts
+            .iter()
+            .map(|host| {
+                let attached = if let Some(target) = app.groups_subtab_target_group.as_ref() {
+                    state
+                        .assignments
+                        .get(target)
+                        .map(|hosts| hosts.contains(host))
+                        .unwrap_or(false)
+                } else {
+                    !state
+                        .assignments
+                        .values()
+                        .any(|hosts| hosts.contains(host))
+                };
+                if attached {
+                    ListItem::new(Line::from(vec![
+                        Span::styled("[x]", Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)),
+                        Span::raw(format!(" {host}")),
+                    ]))
+                } else {
+                    ListItem::new(Line::from(vec![
+                        Span::styled("[ ]", Style::default().fg(th::SURFACE1)),
+                        Span::styled(format!(" {host}"), Style::default().fg(th::SUBTEXT0)),
+                    ]))
+                }
+            })
+            .collect()
+    };
+    let hosts_border = if app.groups_subtab_focus == GroupsFocus::Hosts {
+        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th::SURFACE1)
+    };
+    let hosts_list = List::new(host_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(hosts_border)
+                .title("Hosts"),
+        )
+        .highlight_style(Style::default().fg(th::YELLOW))
+        .highlight_symbol(">> ");
+    let mut hosts_state = ListState::default().with_selected(if state.hosts.is_empty() {
+        None
+    } else {
+        Some(app.groups_subtab_host_idx)
+    });
+    frame.render_stateful_widget(hosts_list, cols[2], &mut hosts_state);
+
+    // Input prompts for groups sub-tab
+    if app.hosts_subtab_add_var_open {
+        let prompt_area = centered_rect(50, 15, frame.area());
+        frame.render_widget(Clear, prompt_area);
+        let val = if app.hosts_subtab_add_var_buffer.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.hosts_subtab_add_var_buffer)
+        };
+        let input = Paragraph::new(val)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
+                    .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+                    .title("New Group Name"),
+            );
+        frame.render_widget(input, prompt_area);
+    }
+
+    if app.hosts_subtab_add_host_open {
+        let prompt_area = centered_rect(50, 15, frame.area());
+        frame.render_widget(Clear, prompt_area);
+        let val = if app.hosts_subtab_add_host_buffer.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.hosts_subtab_add_host_buffer)
+        };
+        let input = Paragraph::new(val)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
+                    .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+                    .title("New Host Name"),
+            );
+        frame.render_widget(input, prompt_area);
+    }
+
+    let target_label = app
+        .groups_subtab_target_group
+        .as_deref()
+        .unwrap_or("all");
+    let hint = Paragraph::new(format!(
+        "Target: {target_label} | h/l focus | j/k nav | Space toggle | n add | d detach | D delete | Ctrl+S save | Esc back",
+    ))
+    .style(Style::default().fg(th::SUBTEXT0))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(hint, layout[1]);
 }
 
 fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -723,7 +1270,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
         frame.render_widget(
             Paragraph::new(
-                "Press t to edit settings | i/I cycle inventory target | <-/-> focus Playbooks/Runs | Up/Down move focused list",
+                "Press t to edit settings | i/I cycle inventory target | PgUp/PgDn scroll logs | End follow latest | <-/-> focus Playbooks/Runs | Up/Down move focused list",
             )
             .style(Style::default().fg(th::SUBTEXT0)),
             bottom_chunks[1],
@@ -1166,7 +1713,7 @@ fn render_project_create_prompt(frame: &mut Frame, app: &App) {
 
     let intro = match app.project_create_mode {
         ProjectCreateMode::New => {
-            "Creates a project root and standard Ansible layout (inventories/playbooks/roles/etc)."
+            "Creates a project root and standard Ansible layout (inventory/playbooks/roles/etc)."
         }
         ProjectCreateMode::ExistingFs => "Registers an existing local project path.",
         ProjectCreateMode::Git => "Clones a git repository and registers it as a project.",
@@ -1244,6 +1791,112 @@ fn render_project_create_prompt(frame: &mut Frame, app: &App) {
     );
 }
 
+fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
+    let area = centered_rect(74, 64, frame.area());
+    frame.render_widget(Clear, area);
+
+    let wrapper = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th::MAUVE))
+        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+        .title("Project SSH Key Settings");
+    frame.render_widget(wrapper, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let project_name = app
+        .project_ssh_target_name()
+        .unwrap_or_else(|| String::from("(unknown)"));
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Project: {project_name} | Inline key overrides file path at project scope."
+        ))
+        .style(Style::default().fg(th::SUBTEXT1)),
+        chunks[0],
+    );
+
+    let file_focused = app.project_ssh_field_idx == 0;
+    let file_display = if file_focused {
+        if app.project_ssh_buffer_file.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.project_ssh_buffer_file)
+        }
+    } else if app.project_ssh_buffer_file.is_empty() {
+        String::from("(unset)")
+    } else {
+        app.project_ssh_buffer_file.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(file_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if file_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("SSH Key File Path"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[1],
+    );
+
+    let inline_focused = app.project_ssh_field_idx == 1;
+    let inline_display = if inline_focused {
+        if app.project_ssh_buffer_inline.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.project_ssh_buffer_inline)
+        }
+    } else if app.project_ssh_buffer_inline.is_empty() {
+        String::from("(unset)")
+    } else {
+        format!(
+            "(set: {} lines, {} chars)",
+            app.project_ssh_buffer_inline.lines().count(),
+            app.project_ssh_buffer_inline.chars().count()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(inline_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if inline_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Inline SSH Private Key"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE))
+            .wrap(Wrap { trim: false }),
+        chunks[2],
+    );
+
+    frame.render_widget(
+        Paragraph::new(
+            "Type text | Up/Down field | Enter next/newline | Ctrl+S save | Backspace edit | Esc cancel",
+        )
+        .style(Style::default().fg(th::SUBTEXT0)),
+        chunks[3],
+    );
+}
+
 fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
     let area = centered_rect(54, 26, frame.area());
     frame.render_widget(Clear, area);
@@ -1268,7 +1921,7 @@ fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    let intro = Paragraph::new("Create under ./inventories (.ini, .yml, .yaml).")
+    let intro = Paragraph::new("Create under ./inventory (.ini, .yml, .yaml).")
         .style(Style::default().fg(th::SUBTEXT1));
     frame.render_widget(intro, chunks[0]);
 
@@ -1290,294 +1943,6 @@ fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
     let hint = Paragraph::new("Enter create | Backspace edit | Esc cancel")
         .style(Style::default().fg(th::SUBTEXT0));
     frame.render_widget(hint, chunks[2]);
-}
-
-fn render_inventory_wizard(frame: &mut Frame, app: &App) {
-    let area = centered_rect(84, 92, frame.area());
-    frame.render_widget(Clear, area);
-
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(th::MAUVE))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Guided Inventory Builder (YAML)");
-    frame.render_widget(wrapper, area);
-
-    let inner = area.inner(Margin {
-        vertical: 1,
-        horizontal: 1,
-    });
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(24),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
-    let target_path = app.inventory_wizard_target_group_path();
-    let header_lines = vec![
-        Line::styled(
-            format!("File: {}", app.inventory_wizard_filename),
-            Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(format!(
-            "Target Group: {target_path} | Focus: {} | Group attached: {} | Host attached: {}",
-            if app.inventory_wizard_focus == InventoryWizardFocus::Tree {
-                "Tree"
-            } else if app.inventory_wizard_focus == InventoryWizardFocus::Groups {
-                "Available Groups"
-            } else {
-                "Available Hosts"
-            },
-            if app.inventory_wizard_selected_group_attached_to_target() {
-                "yes"
-            } else {
-                "no"
-            },
-            if app.inventory_wizard_selected_host_assigned_to_target() {
-                "yes"
-            } else {
-                "no"
-            }
-        )),
-    ];
-    let header = Paragraph::new(header_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(th::SURFACE1))
-            .title("Builder State"),
-    );
-    frame.render_widget(header, chunks[0]);
-
-    let lists = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
-        .split(chunks[1]);
-
-    let tree_nodes = app.inventory_wizard_tree_nodes();
-    let tree_items = if tree_nodes.is_empty() {
-        vec![ListItem::new("No groups yet.")]
-    } else {
-        tree_nodes
-            .iter()
-            .map(|(group, depth)| {
-                let label = match group {
-                    None => String::from("all"),
-                    Some(name) => {
-                        let indent = "  ".repeat(depth.saturating_sub(1));
-                        format!("{indent}{name}")
-                    }
-                };
-                ListItem::new(label)
-            })
-            .collect::<Vec<_>>()
-    };
-    let tree = List::new(tree_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(
-                    if app.inventory_wizard_focus == InventoryWizardFocus::Tree {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(th::SURFACE1)
-                    },
-                )
-                .title("Group Tree"),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
-    let mut tree_state = ListState::default().with_selected(if tree_nodes.is_empty() {
-        None
-    } else {
-        Some(app.inventory_wizard_tree_idx)
-    });
-    frame.render_stateful_widget(tree, lists[0], &mut tree_state);
-
-    let child_groups = app.inventory_wizard_child_groups_for_target();
-    let hosts_in_target = app.inventory_wizard_hosts_for_target();
-    let mut detail_lines = vec![
-        Line::raw("Child groups:"),
-        Line::raw(if child_groups.is_empty() {
-            String::from("  (none)")
-        } else {
-            String::new()
-        }),
-    ];
-    if !child_groups.is_empty() {
-        detail_lines.extend(
-            child_groups
-                .iter()
-                .map(|group| Line::raw(format!("  - {group}"))),
-        );
-    }
-    detail_lines.push(Line::raw(""));
-    detail_lines.push(Line::raw("Hosts in target:"));
-    if hosts_in_target.is_empty() {
-        detail_lines.push(Line::raw("  (none)"));
-    } else {
-        detail_lines.extend(
-            hosts_in_target
-                .iter()
-                .map(|host| Line::raw(format!("  - {host}"))),
-        );
-    }
-    let target_details = Paragraph::new(Text::from(detail_lines))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
-                .title("Target Preview"),
-        )
-        .wrap(Wrap { trim: false });
-
-    let candidate_groups = app.inventory_wizard_candidate_groups();
-    let group_items = if candidate_groups.is_empty() {
-        vec![ListItem::new("No groups available.")]
-    } else {
-        candidate_groups
-            .iter()
-            .map(|group| {
-                let attached = if let Some(target) = app.inventory_wizard_target_group.as_ref() {
-                    app.inventory_wizard_group_children
-                        .get(target)
-                        .map(|children| children.contains(group))
-                        .unwrap_or(false)
-                } else {
-                    !app.inventory_wizard_group_children
-                        .values()
-                        .any(|children| children.contains(group))
-                };
-                let marker = if attached { "[x]" } else { "[ ]" };
-                ListItem::new(format!("{marker} {group}"))
-            })
-            .collect::<Vec<_>>()
-    };
-    let groups = List::new(group_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(
-                    if app.inventory_wizard_focus == InventoryWizardFocus::Groups {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(th::SURFACE1)
-                    },
-                )
-                .title("Available Groups"),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
-    let mut groups_state = ListState::default().with_selected(if candidate_groups.is_empty() {
-        None
-    } else {
-        Some(app.inventory_wizard_group_idx)
-    });
-    frame.render_stateful_widget(groups, lists[1], &mut groups_state);
-
-    let host_items = if app.inventory_wizard_hosts.is_empty() {
-        vec![ListItem::new("No hosts. Press n to add.")]
-    } else {
-        app.inventory_wizard_hosts
-            .iter()
-            .map(|host| {
-                let attached = if let Some(target) = app.inventory_wizard_target_group.as_ref() {
-                    app.inventory_wizard_assignments
-                        .get(target)
-                        .map(|hosts| hosts.contains(host))
-                        .unwrap_or(false)
-                } else {
-                    !app.inventory_wizard_assignments
-                        .values()
-                        .any(|hosts| hosts.contains(host))
-                };
-                let marker = if attached { "[x]" } else { "[ ]" };
-                ListItem::new(format!("{marker} {host}"))
-            })
-            .collect::<Vec<_>>()
-    };
-    let hosts = List::new(host_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(
-                    if app.inventory_wizard_focus == InventoryWizardFocus::Hosts {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(th::SURFACE1)
-                    },
-                )
-                .title("Available Hosts"),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
-    let mut hosts_state =
-        ListState::default().with_selected(if app.inventory_wizard_hosts.is_empty() {
-            None
-        } else {
-            Some(app.inventory_wizard_host_idx)
-        });
-    frame.render_stateful_widget(hosts, lists[2], &mut hosts_state);
-    frame.render_widget(target_details, lists[3]);
-
-    let hint_text = String::from(
-        "Tab or <-/-> focus tree/groups/hosts | Up/Down select | space or Enter attach/toggle | d detach | n add | Shift+D delete | f filename | Ctrl+S save | Esc close",
-    );
-    let hint = Paragraph::new(hint_text)
-        .style(Style::default().fg(th::SUBTEXT0))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(hint, chunks[2]);
-}
-
-fn render_inventory_wizard_input_prompt(frame: &mut Frame, app: &App) {
-    let Some(prompt) = app.inventory_wizard_input_prompt() else {
-        return;
-    };
-
-    let area = centered_rect(54, 20, frame.area());
-    frame.render_widget(Clear, area);
-
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title(prompt);
-    frame.render_widget(wrapper, area);
-
-    let inner = area.inner(Margin {
-        vertical: 1,
-        horizontal: 1,
-    });
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(1)])
-        .split(inner);
-
-    let value = if app.inventory_wizard_input_buffer.is_empty() {
-        String::from("|")
-    } else {
-        format!("{}|", app.inventory_wizard_input_buffer)
-    };
-    let input = Paragraph::new(value)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
-                .title("Value"),
-        )
-        .style(Style::default().fg(th::TEXT).bg(th::BASE));
-    frame.render_widget(input, chunks[0]);
-
-    let hint = Paragraph::new("Enter confirm | Backspace edit | Esc cancel")
-        .style(Style::default().fg(th::SUBTEXT0));
-    frame.render_widget(hint, chunks[1]);
 }
 
 fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
@@ -1614,7 +1979,6 @@ fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
     frame.render_widget(intro, chunks[0]);
 
     let items = vec![
-        ListItem::new("Guided Builder (structured YAML)"),
         ListItem::new("External Editor ($VISUAL/$EDITOR/vim)"),
         ListItem::new("Built-in Text Editor (raw YAML/INI)"),
     ];
@@ -1631,7 +1995,7 @@ fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(list, chunks[1], &mut state);
 
     let hint =
-        Paragraph::new("Enter confirm | j/k or Up/Down select | 1/2/3 quick select | Esc cancel")
+        Paragraph::new("Enter confirm | j/k or Up/Down select | 1/2 quick select | e external | t text | Esc cancel")
             .style(Style::default().fg(th::SUBTEXT0));
     frame.render_widget(hint, chunks[2]);
 }
@@ -1706,7 +2070,7 @@ fn render_inventory_editor(frame: &mut Frame, app: &App) {
 }
 
 fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
-    let area = centered_rect(70, 64, frame.area());
+    let area = centered_rect(76, 72, frame.area());
     frame.render_widget(Clear, area);
 
     let border_color = if app.settings_editor_text_mode {
@@ -1809,9 +2173,11 @@ fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
     let mut fields_state = TableState::default().with_selected(Some(app.settings_editor_field_idx));
     frame.render_stateful_widget(fields, chunks[2], &mut fields_state);
 
-    let hint = Paragraph::new(
-        "j/k field | h/l or <-/-> adjust | Enter edit/save | e edit text | Esc cancel/close | t close",
-    )
+    let hint = Paragraph::new(if app.settings_text_mode_is_multiline() {
+        "j/k field | h/l or <-/-> adjust | Enter newline | Ctrl+S save | Esc cancel | t close"
+    } else {
+        "j/k field | h/l or <-/-> adjust | Enter edit/save | e edit text | Esc cancel/close | t close"
+    })
     .style(Style::default().fg(th::SUBTEXT0));
     frame.render_widget(hint, chunks[3]);
 }
@@ -1857,6 +2223,18 @@ fn settings_rows(app: &App, settings: &PlaybookSettings) -> Vec<(String, String)
         (
             String::from("additional args (appended)"),
             display_setting_text(app, 9, settings.extra_args.as_deref().unwrap_or("unset")),
+        ),
+        (
+            String::from("ssh private key file (--private-key)"),
+            display_setting_text(
+                app,
+                10,
+                settings.ssh_private_key_file.as_deref().unwrap_or("unset"),
+            ),
+        ),
+        (
+            String::from("ssh private key inline"),
+            display_setting_inline_key_text(app, 11, settings.ssh_private_key_inline.as_deref()),
         ),
     ]
 }
@@ -1954,17 +2332,14 @@ fn active_help_text(app: &App) -> String {
             "Keys: Type text | Up/Down field | Enter next/save | Backspace edit | Esc cancel (mode from n/f/g)",
         );
     }
-    if app.inventory_edit_mode_open {
+    if app.project_ssh_open {
         return String::from(
-            "Keys: j/k or Up/Down select mode | Enter confirm | 1/2/3 quick select | Esc cancel",
+            "Keys: Type text | Up/Down field | Enter next/newline | Ctrl+S save | Backspace edit | Esc cancel",
         );
     }
-    if app.inventory_wizard_open {
-        if app.inventory_wizard_input_prompt().is_some() {
-            return String::from("Keys: Type value | Enter confirm | Backspace edit | Esc cancel");
-        }
+    if app.inventory_edit_mode_open {
         return String::from(
-            "Keys: Tab or <-/-> focus tree/groups/hosts | Up/Down select | space or Enter attach/toggle | d detach | n add | Shift+D delete | f filename | Ctrl+S save | Esc close",
+            "Keys: j/k or Up/Down select mode | Enter confirm | 1/2 quick select | e external | t text | Esc cancel",
         );
     }
     if app.inventory_editor_open {
@@ -1974,9 +2349,13 @@ fn active_help_text(app: &App) -> String {
     }
     if app.settings_editor_open {
         if app.settings_editor_text_mode {
-            return String::from(
-                "Keys: Type text | Backspace edit | Enter save | Esc cancel | t close",
-            );
+            return if app.settings_text_mode_is_multiline() {
+                String::from(
+                    "Keys: Type text | Enter newline | Ctrl+S save | Backspace edit | Esc cancel | t close",
+                )
+            } else {
+                String::from("Keys: Type text | Backspace edit | Enter save | Esc cancel | t close")
+            };
         }
         return String::from(
             "Keys: j/k field | h/l or <-/-> adjust | Enter or e edit text | space toggle | Esc or t close",
@@ -1988,30 +2367,30 @@ fn active_help_text(app: &App) -> String {
             String::from("Keys: Tab/h/l views | r run selected playbook+inventory | u runtime picker | q quit")
         }
         View::Projects => String::from(
-            "Keys: j/k or Up/Down select project | Enter/a activate | n new | f import path | g clone git | i inventory sync | v vars sync | Tab/h/l views | q quit",
+            "Keys: j/k or Up/Down select project | Enter/a activate | n new | f import path | g clone git | e ssh key settings | Shift+D delete selected (confirm) | i inventory sync | v vars sync | Tab/h/l views | q quit",
         ),
         View::Inventory => String::from(
-            "Keys: j/k or Up/Down select inventory | n new | g new guided inventory | e edit selected (choose mode) | Shift+D delete selected | Tab/h/l views | q quit",
+            "Keys: j/k or Up/Down select inventory | n new | e edit selected (choose mode) | Shift+D delete selected | PgUp/PgDn scroll logs | End follow latest | Tab/h/l views | q quit",
         ),
         View::Playbooks => {
             if app.log_select_mode {
                 String::from(
-                    "Keys: j/k or Up/Down select log lines | space mark | y copy | v exit log-select | <-/-> focus playbooks/runs | i/I inventory target | r run | t playbook settings | Tab/h/l views | q quit",
+                    "Keys: j/k or Up/Down select log lines | PgUp/PgDn scroll logs | End follow latest | space mark | y copy | v exit log-select | <-/-> focus playbooks/runs | i/I inventory target | r run | t playbook settings | Tab/h/l views | q quit",
                 )
             } else {
                 String::from(
-                    "Keys: j/k or Up/Down move focused list | <-/-> focus playbooks/runs | Shift+J/K switch runs | i/I inventory target | r run | t playbook settings | v log-select | Tab/h/l views | q quit",
+                    "Keys: j/k or Up/Down move focused list | PgUp/PgDn scroll logs | End follow latest | <-/-> focus playbooks/runs | Shift+J/K switch runs | i/I inventory target | r run | t playbook settings | v log-select | Tab/h/l views | q quit",
                 )
             }
         }
         View::Settings => {
             if app.global_settings_text_mode {
                 String::from(
-                    "Keys: Type text | Backspace edit | Enter save | Esc cancel | j/k field | Tab views | q quit",
+                    "Keys: Type text | Backspace edit | Enter save | Esc cancel | j/k field | PgUp/PgDn scroll logs | End follow latest | Tab views | q quit",
                 )
             } else {
                 String::from(
-                    "Keys: j/k field | h/l or <-/-> adjust | Enter or e edit text | space toggle | u runtime picker | Tab views | q quit",
+                    "Keys: j/k field | h/l or <-/-> adjust | Enter or e edit text | space toggle | u runtime picker | PgUp/PgDn scroll logs | End follow latest | Tab views | q quit",
                 )
             }
         }
@@ -2075,6 +2454,17 @@ fn settings_preview_rows(
                 .clone()
                 .unwrap_or_else(|| String::from("unset")),
         ),
+        (
+            String::from("ssh_key_file"),
+            settings
+                .ssh_private_key_file
+                .clone()
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("ssh_key_inline"),
+            summarize_inline_key(settings.ssh_private_key_inline.as_deref()),
+        ),
     ]
 }
 
@@ -2087,6 +2477,35 @@ fn display_setting_text(app: &App, idx: usize, current: &str) -> String {
         }
     } else {
         current.to_string()
+    }
+}
+
+fn display_setting_inline_key_text(app: &App, idx: usize, current: Option<&str>) -> String {
+    if app.settings_editor_text_mode && app.settings_editor_field_idx == idx {
+        let escaped = app
+            .settings_editor_text_buffer
+            .replace('\n', "\\n")
+            .replace('\t', "\\t");
+        if escaped.is_empty() {
+            String::from("|")
+        } else {
+            format!("{escaped}|")
+        }
+    } else {
+        summarize_inline_key(current)
+    }
+}
+
+fn summarize_inline_key(value: Option<&str>) -> String {
+    match value {
+        Some(value) if !value.trim().is_empty() => {
+            format!(
+                "set ({} lines, {} chars)",
+                value.lines().count(),
+                value.chars().count()
+            )
+        }
+        _ => String::from("unset"),
     }
 }
 

@@ -36,6 +36,9 @@ pub fn spawn_input_listener(tx: UnboundedSender<Action>) {
                         (KeyCode::Esc, _) => Some(Action::CloseRuntimePrompt),
                         (KeyCode::Up, _) => Some(Action::MoveUp),
                         (KeyCode::Down, _) => Some(Action::MoveDown),
+                        (KeyCode::PageUp, _) => Some(Action::LogScrollPageUp),
+                        (KeyCode::PageDown, _) => Some(Action::LogScrollPageDown),
+                        (KeyCode::End, _) => Some(Action::LogFollowLatest),
                         (KeyCode::Enter, _) => Some(Action::SelectRuntimeCandidate),
                         (KeyCode::Backspace, _) => Some(Action::Backspace),
                         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
@@ -71,6 +74,8 @@ pub fn spawn_input_listener(tx: UnboundedSender<Action>) {
                             viewport_height,
                         }),
                         MouseEventKind::Up(MouseButton::Left) => Some(Action::LogMouseUp),
+                        MouseEventKind::ScrollUp => Some(Action::LogScrollUp),
+                        MouseEventKind::ScrollDown => Some(Action::LogScrollDown),
                         _ => None,
                     };
 

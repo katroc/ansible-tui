@@ -8,6 +8,8 @@ pub struct ProjectDefinition {
     pub root: PathBuf,
     pub inventory_sync_cmd: Option<String>,
     pub vars_sync_cmd: Option<String>,
+    pub ssh_private_key_file: Option<String>,
+    pub ssh_private_key_inline: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,8 +51,19 @@ pub fn load_projects(cwd: &Path) -> io::Result<ProjectRegistry> {
         let root = resolve_root(cwd, fields[1]);
         let inventory_sync_cmd = fields.get(2).and_then(|v| to_opt_text(v));
         let vars_sync_cmd = fields.get(3).and_then(|v| to_opt_text(v));
+        let ssh_private_key_file = if fields.len() >= 7 {
+            fields.get(4).and_then(|v| to_opt_text(v))
+        } else {
+            None
+        };
+        let ssh_private_key_inline = if fields.len() >= 7 {
+            fields.get(5).and_then(|v| to_opt_multiline_text(v))
+        } else {
+            None
+        };
+        let active_field_idx = if fields.len() >= 7 { 6 } else { 4 };
         let is_active = fields
-            .get(4)
+            .get(active_field_idx)
             .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
             .unwrap_or(false);
 
@@ -69,6 +82,8 @@ pub fn load_projects(cwd: &Path) -> io::Result<ProjectRegistry> {
             root,
             inventory_sync_cmd,
             vars_sync_cmd,
+            ssh_private_key_file,
+            ssh_private_key_inline,
         });
 
         if is_active && !saw_active {
@@ -107,13 +122,25 @@ pub fn save_projects(cwd: &Path, registry: &ProjectRegistry) -> io::Result<()> {
             .as_deref()
             .map(sanitize_field)
             .unwrap_or_default();
+        let ssh_private_key_file = project
+            .ssh_private_key_file
+            .as_deref()
+            .map(sanitize_field)
+            .unwrap_or_default();
+        let ssh_private_key_inline = project
+            .ssh_private_key_inline
+            .as_deref()
+            .map(escape_multiline_field)
+            .unwrap_or_default();
         let active = if idx == registry.active_idx { "1" } else { "0" };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             sanitize_field(&project.name),
             root,
             inventory_sync_cmd,
             vars_sync_cmd,
+            ssh_private_key_file,
+            ssh_private_key_inline,
             active
         ));
     }
@@ -127,6 +154,8 @@ pub fn default_project(cwd: &Path) -> ProjectDefinition {
         root: cwd.to_path_buf(),
         inventory_sync_cmd: None,
         vars_sync_cmd: None,
+        ssh_private_key_file: None,
+        ssh_private_key_inline: None,
     }
 }
 
@@ -152,6 +181,44 @@ fn to_opt_text(value: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn to_opt_multiline_text(value: &str) -> Option<String> {
+    let unescaped = unescape_multiline_field(value);
+    if unescaped.trim().is_empty() {
+        None
+    } else {
+        Some(unescaped)
+    }
+}
+
+fn escape_multiline_field(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+}
+
+fn unescape_multiline_field(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn resolve_root(cwd: &Path, value: &str) -> PathBuf {

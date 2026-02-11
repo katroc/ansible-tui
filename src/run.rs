@@ -1,4 +1,8 @@
 use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio as StdStdio;
 
@@ -21,6 +25,8 @@ pub struct RunOptions {
     pub tags: Option<String>,
     pub extra_vars: Option<String>,
     pub extra_args: Option<String>,
+    pub ssh_private_key_file: Option<String>,
+    pub ssh_private_key_inline: Option<String>,
 }
 
 impl RunOptions {
@@ -41,6 +47,8 @@ impl RunOptions {
             tags: env_var("ANSIBLE_TUI_TAGS"),
             extra_vars: env_var("ANSIBLE_TUI_EXTRA_VARS"),
             extra_args: env_var("ANSIBLE_TUI_EXTRA_ARGS"),
+            ssh_private_key_file: None,
+            ssh_private_key_inline: None,
         }
     }
 }
@@ -74,7 +82,24 @@ pub fn spawn_ansible_run(req: RunRequest, tx: UnboundedSender<Action>) {
             return;
         }
 
-        let args = build_args(&req);
+        let inline_key_file = match prepare_inline_private_key_file(&req) {
+            Ok(file) => file,
+            Err(err) => {
+                let message = format!("failed to prepare inline SSH private key: {err}");
+                let _ = tx.send(Action::RunLog {
+                    run_id: req.run_id,
+                    line: message.clone(),
+                });
+                let _ = tx.send(Action::Error(message));
+                let _ = tx.send(Action::RunFinished {
+                    run_id: req.run_id,
+                    success: false,
+                    exit_code: None,
+                });
+                return;
+            }
+        };
+        let args = build_args(&req, inline_key_file.as_ref().map(|file| file.path()));
         let command_line = format!("{} {}", req.options.ansible_bin, args.join(" "));
         if tx
             .send(Action::RunLog {
@@ -209,10 +234,18 @@ fn env_var(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn build_args(req: &RunRequest) -> Vec<String> {
+fn build_args(req: &RunRequest, inline_key_path: Option<&Path>) -> Vec<String> {
     let mut args = Vec::new();
     args.push(String::from("-i"));
     args.push(req.inventory.clone());
+
+    if let Some(path) = inline_key_path {
+        args.push(String::from("--private-key"));
+        args.push(path.to_string_lossy().to_string());
+    } else if let Some(path) = &req.options.ssh_private_key_file {
+        args.push(String::from("--private-key"));
+        args.push(resolve_private_key_path(&req.cwd, path));
+    }
 
     if req.options.check {
         args.push(String::from("--check"));
@@ -256,6 +289,77 @@ fn build_args(req: &RunRequest) -> Vec<String> {
 
     args.push(req.playbook.clone());
     args
+}
+
+struct TempKeyFile {
+    path: PathBuf,
+}
+
+impl TempKeyFile {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempKeyFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn prepare_inline_private_key_file(req: &RunRequest) -> io::Result<Option<TempKeyFile>> {
+    let Some(inline_key) = req.options.ssh_private_key_inline.as_ref() else {
+        return Ok(None);
+    };
+    if inline_key.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let key_dir = req.cwd.join(".ansible-tui").join("keys");
+    fs::create_dir_all(&key_dir)?;
+    let key_path = key_dir.join(format!("run-{}.key", req.run_id));
+
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options.open(&key_path)?;
+    if inline_key.ends_with('\n') {
+        file.write_all(inline_key.as_bytes())?;
+    } else {
+        file.write_all(inline_key.as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+    file.flush()?;
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(Some(TempKeyFile { path: key_path }))
+}
+
+fn resolve_private_key_path(cwd: &Path, raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return raw.to_string();
+    }
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(suffix)
+                .to_string_lossy()
+                .to_string();
+        }
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        raw.to_string()
+    } else {
+        cwd.join(path).to_string_lossy().to_string()
+    }
 }
 
 pub fn playbook_bin_available(playbook_bin: &str) -> bool {

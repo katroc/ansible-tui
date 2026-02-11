@@ -22,6 +22,7 @@ Foundation-first Rust TUI for Ansible operations.
 - Inventory management panel with details/preview plus create/delete actions
 - In-app inventory editor with save/discard flow
 - Guided YAML inventory builder (filename + host/group lists + dynamic assignment -> preview/save)
+- SSH private key assignment at project scope and per-playbook scope (file path or inline key text)
 - Global shortcut helper strip visible on all tabs
 - Editable global run profile in Settings tab (saved to `ansible.cfg` + app config)
 - Per-playbook settings for common ansible-playbook flags
@@ -35,18 +36,22 @@ Foundation-first Rust TUI for Ansible operations.
 - `g` (Inventory tab): open guided YAML inventory builder (new inventory)
 - `e` (Inventory tab): choose edit mode for selected inventory (guided, external `$VISUAL/$EDITOR`/`vim`, or built-in raw text editor)
 - `Shift+D` (Inventory tab): delete selected inventory (double-press confirmation)
+- `Shift+D` (Projects tab): delete selected project (double-press confirmation, keeps at least one project)
+- `e` (Projects tab): edit selected project's SSH private key settings (file path or inline key)
 - Guided builder flow: select target in Group Tree, then attach/detach available groups or hosts with `space`/`d` (`Enter` also toggles attach)
 - `Left`/`Right` (Playbooks tab): switch focus between Playbooks and Runs lists
 - `Shift+J`/`Shift+K` (Playbooks tab): alternate run selection shortcuts
 - `i`/`I` (Playbooks tab): cycle inventory target for selected playbook
 - `r`: start run from Playbooks context with selected playbook + inventory
-- `Ctrl+S`: save inventory while editor is open
+- `Ctrl+S`: save inventory editor/builder, project SSH key prompt, or playbook text-edit field
 - `t`: open/close playbook settings editor (in Playbooks tab)
 - `e`: edit selected text field (or press `Enter`) in Playbook/Global settings editors
 - `Left/Right` or `h/l` (Settings tab): adjust selected boolean/numeric setting
 - `Space`: toggle selected boolean in Playbook/Global settings editors
 - `Backspace`: delete while editing a text field
 - `v`: toggle log select mode (selection constrained to Live Logs)
+- `PgUp`/`PgDn`: scroll Live Logs (also works via mouse wheel over logs)
+- `End`: return Live Logs to follow-latest mode
 - `Space`: set/clear log selection mark (when log-select mode is active)
 - `y`: copy selected log lines
 - Mouse: click/drag/release in Live Logs to select and copy
@@ -104,6 +109,8 @@ Per playbook, settings currently manage:
 - `--limit`
 - `--tags`
 - `--extra-vars`
+- SSH private key via file path (`--private-key`)
+- SSH private key via inline pasted key material (written to a temporary key file at run-time)
 - additional CLI args appended as-is (split on whitespace, no `--extra-args` flag)
 
 ## Clipboard notes
