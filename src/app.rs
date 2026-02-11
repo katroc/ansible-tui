@@ -20,6 +20,7 @@ use crate::ansible_cfg::{
 };
 use crate::config::{load_app_config, save_app_config, AppConfig};
 use crate::input::set_input_paused;
+use crate::job_template::{load_job_templates, save_job_templates, JobTemplate};
 use crate::playbook_settings::{
     cycle_u16, load_playbook_settings, save_playbook_settings, PlaybookSettings,
 };
@@ -39,6 +40,7 @@ const AUTO_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const PLAYBOOK_SETTINGS_FIELD_COUNT: usize = 12;
 const PLAYBOOK_SETTINGS_TEXT_FIELD_START: usize = 6;
 const GLOBAL_SETTINGS_FIELD_COUNT: usize = 12;
+const TEMPLATE_EDITOR_FIELD_COUNT: usize = 16;
 const MAX_PROJECT_SYNC_LOG_LINES: usize = 400;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,16 +49,18 @@ pub enum View {
     Projects,
     Inventory,
     Playbooks,
+    Templates,
     Settings,
 }
 
 impl View {
-    pub fn all() -> [View; 5] {
+    pub fn all() -> [View; 6] {
         [
             View::Dashboard,
             View::Projects,
             View::Inventory,
             View::Playbooks,
+            View::Templates,
             View::Settings,
         ]
     }
@@ -67,6 +71,7 @@ impl View {
             View::Projects => "Projects",
             View::Inventory => "Inventory",
             View::Playbooks => "Playbooks",
+            View::Templates => "Templates",
             View::Settings => "Settings",
         }
     }
@@ -144,6 +149,7 @@ pub enum InventorySubTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum HostDetailField {
     AnsibleHost,
     AnsibleUser,
@@ -214,6 +220,28 @@ pub struct RunRecord {
     pub finished_at: Option<DateTime<Local>>,
     pub exit_code: Option<i32>,
     pub logs: Vec<String>,
+    pub template_id: Option<String>,
+    pub environment: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TemplateEffectiveContext {
+    pub inventory: String,
+    pub inventory_source: String,
+    pub vars_files: Vec<String>,
+    pub ssh_private_key_file: Option<String>,
+    pub has_inline_ssh_key: bool,
+    pub ssh_key_source: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTemplateRunContext {
+    inventory: String,
+    options: RunOptions,
+    inventory_source: String,
+    ssh_key_source: String,
+    warnings: Vec<String>,
 }
 
 pub struct App {
@@ -223,6 +251,7 @@ pub struct App {
     pub active_project_idx: usize,
     pub inventories: Vec<PathBuf>,
     pub playbooks: Vec<PathBuf>,
+    pub vars_files: Vec<PathBuf>,
     pub runs: Vec<RunRecord>,
     pub playbook_settings: BTreeMap<String, PlaybookSettings>,
     selected_run_by_playbook: BTreeMap<String, u64>,
@@ -290,6 +319,23 @@ pub struct App {
     pub global_settings_field_idx: usize,
     pub global_settings_text_mode: bool,
     pub global_settings_text_buffer: String,
+    // Template state
+    pub job_templates: Vec<JobTemplate>,
+    pub template_idx: usize,
+    pub templates_focus_runs: bool,
+    pending_template_delete: Option<String>,
+
+    // Template editor state
+    pub template_editor_open: bool,
+    pub template_editor_editing_id: Option<String>,
+    pub template_editor_field_idx: usize,
+    pub template_editor_text_mode: bool,
+    pub template_editor_text_buffer: String,
+    pub template_editor_name: String,
+    pub template_editor_playbook_idx: usize,
+    pub template_editor_inventory_idx: usize,
+    pub template_editor_settings: PlaybookSettings,
+
     pub should_quit: bool,
     needs_full_redraw: bool,
     pending_project_delete: Option<PathBuf>,
@@ -301,7 +347,7 @@ pub struct App {
 impl App {
     pub fn new(cwd: PathBuf) -> Self {
         let mut run_options = RunOptions::from_env();
-        let mut status_line = String::from("Ready. Press r to run selected playbook.");
+        let mut status_line = String::from("Ready. Press r to run selected template.");
         match load_app_config(&cwd) {
             Ok(config) => Self::apply_loaded_global_config(&mut run_options, config),
             Err(err) => {
@@ -316,6 +362,7 @@ impl App {
             active_project_idx: 0,
             inventories: Vec::new(),
             playbooks: Vec::new(),
+            vars_files: Vec::new(),
             runs: Vec::new(),
             playbook_settings: BTreeMap::new(),
             selected_run_by_playbook: BTreeMap::new(),
@@ -383,6 +430,19 @@ impl App {
             global_settings_field_idx: 0,
             global_settings_text_mode: false,
             global_settings_text_buffer: String::new(),
+            job_templates: Vec::new(),
+            template_idx: 0,
+            templates_focus_runs: false,
+            pending_template_delete: None,
+            template_editor_open: false,
+            template_editor_editing_id: None,
+            template_editor_field_idx: 0,
+            template_editor_text_mode: false,
+            template_editor_text_buffer: String::new(),
+            template_editor_name: String::new(),
+            template_editor_playbook_idx: 0,
+            template_editor_inventory_idx: 0,
+            template_editor_settings: PlaybookSettings::default(),
             should_quit: false,
             needs_full_redraw: false,
             pending_project_delete: None,
@@ -509,11 +569,15 @@ impl App {
 
     fn load_active_project_state(&mut self) {
         self.playbooks_focus_runs = false;
+        self.templates_focus_runs = false;
         self.log_select_mode = false;
         self.log_anchor = None;
         self.log_cursor = 0;
         self.pending_project_delete = None;
         self.pending_inventory_delete = None;
+        self.pending_template_delete = None;
+        self.template_idx = 0;
+        self.template_editor_open = false;
         self.project_ssh_open = false;
         self.project_ssh_field_idx = 0;
         self.project_ssh_buffer_file.clear();
@@ -531,6 +595,7 @@ impl App {
         self.restore_playbook_settings();
         self.restore_ansible_cfg_settings();
         self.restore_history();
+        self.restore_job_templates();
         self.refresh_runtime_candidates();
     }
 
@@ -560,6 +625,7 @@ impl App {
                 if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(1);
                 } else if !self.settings_editor_open
+                    && !self.template_editor_open
                     && !self.inventory_create_open
                     && !self.project_create_open
                     && !self.project_ssh_open
@@ -572,6 +638,9 @@ impl App {
                     if self.current_view() == View::Playbooks {
                         self.playbooks_focus_runs = false;
                         self.sync_run_selection_to_selected_playbook();
+                    } else if self.current_view() == View::Templates {
+                        self.templates_focus_runs = false;
+                        self.sync_run_selection_to_selected_template();
                     }
                 }
             }
@@ -579,6 +648,7 @@ impl App {
                 if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(-1);
                 } else if !self.settings_editor_open
+                    && !self.template_editor_open
                     && !self.inventory_create_open
                     && !self.project_create_open
                     && !self.project_ssh_open
@@ -591,11 +661,16 @@ impl App {
                     if self.current_view() == View::Playbooks {
                         self.playbooks_focus_runs = false;
                         self.sync_run_selection_to_selected_playbook();
+                    } else if self.current_view() == View::Templates {
+                        self.templates_focus_runs = false;
+                        self.sync_run_selection_to_selected_template();
                     }
                 }
             }
             Action::SettingsIncrease => {
-                if self.settings_editor_open {
+                if self.template_editor_open {
+                    self.adjust_template_editor_field(1);
+                } else if self.settings_editor_open {
                     self.adjust_settings_field(1);
                 } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(1);
@@ -612,12 +687,17 @@ impl App {
                     }
                 } else if self.current_view() == View::Playbooks && !self.runtime_prompt_open {
                     self.playbooks_focus_runs = true;
+                } else if self.current_view() == View::Templates && !self.runtime_prompt_open {
+                    self.templates_focus_runs = true;
+                    self.sync_run_selection_to_selected_template();
                 } else {
                     self.adjust_global_settings_field(1);
                 }
             }
             Action::SettingsDecrease => {
-                if self.settings_editor_open {
+                if self.template_editor_open {
+                    self.adjust_template_editor_field(-1);
+                } else if self.settings_editor_open {
                     self.adjust_settings_field(-1);
                 } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(-1);
@@ -634,12 +714,19 @@ impl App {
                     }
                 } else if self.current_view() == View::Playbooks && !self.runtime_prompt_open {
                     self.playbooks_focus_runs = false;
+                } else if self.current_view() == View::Templates && !self.runtime_prompt_open {
+                    self.templates_focus_runs = false;
                 } else {
                     self.adjust_global_settings_field(-1);
                 }
             }
             Action::MoveUp => {
-                if self.settings_editor_open {
+                if self.template_editor_open {
+                    if !self.template_editor_text_mode {
+                        self.template_editor_field_idx =
+                            self.template_editor_field_idx.saturating_sub(1);
+                    }
+                } else if self.settings_editor_open {
                     if !self.settings_editor_text_mode {
                         self.settings_editor_field_idx =
                             self.settings_editor_field_idx.saturating_sub(1);
@@ -677,7 +764,14 @@ impl App {
                 }
             }
             Action::MoveDown => {
-                if self.settings_editor_open {
+                if self.template_editor_open {
+                    if !self.template_editor_text_mode {
+                        self.template_editor_field_idx = min(
+                            self.template_editor_field_idx + 1,
+                            TEMPLATE_EDITOR_FIELD_COUNT - 1,
+                        );
+                    }
+                } else if self.settings_editor_open {
                     if !self.settings_editor_text_mode {
                         self.settings_editor_field_idx = min(
                             self.settings_editor_field_idx + 1,
@@ -748,6 +842,12 @@ impl App {
             Action::SaveInventoryEditor => {
                 if self.project_ssh_open {
                     self.save_project_ssh_prompt();
+                } else if self.template_editor_open {
+                    if self.template_editor_text_mode {
+                        self.commit_template_editor_text_edit();
+                    } else {
+                        self.save_template_from_editor();
+                    }
                 } else if self.settings_editor_open && self.settings_editor_text_mode {
                     self.commit_settings_text_edit();
                 } else if self.current_view() == View::Inventory
@@ -763,7 +863,13 @@ impl App {
             }
             Action::OpenRuntimePrompt => self.open_runtime_prompt(),
             Action::CloseRuntimePrompt => {
-                if self.settings_editor_open && self.settings_editor_text_mode {
+                if self.template_editor_open {
+                    if self.template_editor_text_mode {
+                        self.cancel_template_editor_text_edit();
+                    } else {
+                        self.close_template_editor();
+                    }
+                } else if self.settings_editor_open && self.settings_editor_text_mode {
                     self.cancel_settings_text_edit();
                 } else if self.settings_editor_open {
                     self.close_playbook_settings();
@@ -802,7 +908,9 @@ impl App {
                 }
             }
             Action::SelectRuntimeCandidate => {
-                if self.settings_editor_open {
+                if self.template_editor_open {
+                    self.confirm_template_editor();
+                } else if self.settings_editor_open {
                     self.confirm_settings_editor();
                 } else if self.inventory_editor_open {
                     self.insert_inventory_editor_newline();
@@ -896,10 +1004,15 @@ impl App {
             }
             Action::RefreshProject => self.refresh_project(),
             Action::StartRun => self.start_run(tx),
+            Action::StartTemplateRun => self.start_template_run(tx),
+            Action::SaveTemplate => self.save_template_from_editor(),
+            Action::DeleteTemplate => self.delete_selected_template(),
             Action::RunStarted {
                 run_id,
                 playbook,
                 inventory,
+                template_id,
+                environment,
             } => {
                 self.runs.insert(
                     0,
@@ -912,6 +1025,8 @@ impl App {
                         finished_at: None,
                         exit_code: None,
                         logs: Vec::new(),
+                        template_id,
+                        environment,
                     },
                 );
                 self.run_idx = 0;
@@ -980,6 +1095,10 @@ impl App {
             self.push_settings_text_char(ch);
             return;
         }
+        if self.template_editor_open {
+            self.handle_template_editor_char(ch);
+            return;
+        }
         if self.project_ssh_open {
             self.push_project_ssh_char(ch);
             return;
@@ -1016,6 +1135,12 @@ impl App {
             && ch != 'D'
         {
             self.pending_project_delete = None;
+        }
+        if self.current_view() == View::Templates
+            && self.pending_template_delete.is_some()
+            && ch != 'D'
+        {
+            self.pending_template_delete = None;
         }
 
         if ch == 'q' {
@@ -1181,7 +1306,7 @@ impl App {
                     return;
                 }
                 'r' => {
-                    self.status_line = String::from("Use Playbooks tab to run a selected playbook");
+                    self.status_line = String::from("Use Templates tab to run a selected template");
                     return;
                 }
                 _ => {}
@@ -1240,6 +1365,45 @@ impl App {
             }
         }
 
+        if self.current_view() == View::Templates {
+            match ch {
+                'n' => {
+                    self.open_template_editor_new();
+                    return;
+                }
+                'e' => {
+                    self.open_template_editor_edit();
+                    return;
+                }
+                't' => {
+                    self.open_template_editor_edit();
+                    return;
+                }
+                'D' => {
+                    self.delete_selected_template();
+                    return;
+                }
+                'r' => {
+                    self.start_template_run(tx);
+                    return;
+                }
+                'h' => {
+                    self.templates_focus_runs = false;
+                    return;
+                }
+                'l' => {
+                    self.templates_focus_runs = true;
+                    self.sync_run_selection_to_selected_template();
+                    return;
+                }
+                'v' => {
+                    self.toggle_log_select_mode();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if self.current_view() == View::Settings {
             match ch {
                 'j' => {
@@ -1269,6 +1433,9 @@ impl App {
                 if self.current_view() == View::Playbooks {
                     self.playbooks_focus_runs = false;
                     self.sync_run_selection_to_selected_playbook();
+                } else if self.current_view() == View::Templates {
+                    self.templates_focus_runs = false;
+                    self.sync_run_selection_to_selected_template();
                 }
             }
             'l' => {
@@ -1276,6 +1443,9 @@ impl App {
                 if self.current_view() == View::Playbooks {
                     self.playbooks_focus_runs = false;
                     self.sync_run_selection_to_selected_playbook();
+                } else if self.current_view() == View::Templates {
+                    self.templates_focus_runs = false;
+                    self.sync_run_selection_to_selected_template();
                 }
             }
             'j' => {
@@ -1292,23 +1462,42 @@ impl App {
                     self.move_selection_up();
                 }
             }
-            'J' => self.select_playbook_run_offset(1),
-            'K' => self.select_playbook_run_offset(-1),
+            'J' => {
+                if self.current_view() == View::Templates {
+                    self.move_template_run_selection(1);
+                } else {
+                    self.select_playbook_run_offset(1);
+                }
+            }
+            'K' => {
+                if self.current_view() == View::Templates {
+                    self.move_template_run_selection(-1);
+                } else {
+                    self.select_playbook_run_offset(-1);
+                }
+            }
             'r' => {
                 if self.current_view() == View::Projects {
                     self.refresh_project();
                 } else {
-                    self.start_run(tx);
+                    self.start_template_run(tx);
                 }
             }
             'v' => {
-                if self.current_view() == View::Playbooks {
+                if self.current_view() == View::Playbooks || self.current_view() == View::Templates
+                {
                     self.toggle_log_select_mode();
                 }
             }
             'y' => self.copy_log_selection(),
             ' ' => self.mark_log_selection(),
-            't' => self.open_playbook_settings(),
+            't' => {
+                if self.current_view() == View::Templates {
+                    self.open_template_editor_edit();
+                } else if self.current_view() == View::Playbooks {
+                    self.open_playbook_settings();
+                }
+            }
             'u' => self.open_runtime_prompt(),
             'b' => self.bootstrap_managed_runtime(tx),
             'c' => self.toggle_check_mode(),
@@ -1321,6 +1510,10 @@ impl App {
     fn handle_backspace(&mut self) {
         if self.settings_editor_open && self.settings_editor_text_mode {
             self.settings_editor_text_buffer.pop();
+            return;
+        }
+        if self.template_editor_open && self.template_editor_text_mode {
+            self.template_editor_text_buffer.pop();
             return;
         }
         if self.project_ssh_open {
@@ -1641,6 +1834,20 @@ impl App {
                     self.sync_run_selection_to_selected_playbook();
                 }
             }
+            View::Templates => {
+                if self.templates_focus_runs {
+                    self.move_template_run_selection(-1);
+                } else {
+                    let filtered = self.filtered_template_indices();
+                    if let Some(pos) = filtered.iter().position(|i| *i == self.template_idx) {
+                        if pos > 0 {
+                            self.template_idx = filtered[pos - 1];
+                        }
+                    }
+                    self.pending_template_delete = None;
+                    self.sync_run_selection_to_selected_template();
+                }
+            }
             _ => {}
         }
     }
@@ -1667,6 +1874,20 @@ impl App {
                         self.playbook_idx = min(self.playbook_idx + 1, self.playbooks.len() - 1);
                     }
                     self.sync_run_selection_to_selected_playbook();
+                }
+            }
+            View::Templates => {
+                if self.templates_focus_runs {
+                    self.move_template_run_selection(1);
+                } else {
+                    let filtered = self.filtered_template_indices();
+                    if let Some(pos) = filtered.iter().position(|i| *i == self.template_idx) {
+                        if pos + 1 < filtered.len() {
+                            self.template_idx = filtered[pos + 1];
+                        }
+                    }
+                    self.pending_template_delete = None;
+                    self.sync_run_selection_to_selected_template();
                 }
             }
             _ => {}
@@ -1785,7 +2006,7 @@ impl App {
     }
 
     fn log_mouse_down(&mut self, row: u16, viewport_height: u16) {
-        if self.current_view() != View::Playbooks
+        if !matches!(self.current_view(), View::Playbooks | View::Templates)
             || self.runtime_prompt_open
             || self.settings_editor_open
             || self.runs.is_empty()
@@ -2424,6 +2645,8 @@ impl App {
                 playbook,
                 inventory,
                 options,
+                template_id: None,
+                environment: Some(self.active_project_name()),
             },
             tx.clone(),
         );
@@ -2452,12 +2675,13 @@ impl App {
 
     fn refresh_project(&mut self) {
         let project_root = self.active_project_root().to_path_buf();
-        let (inventories, playbooks) = discover_project(&project_root);
-        self.apply_discovered_project(inventories, playbooks);
+        let (inventories, playbooks, vars_files) = discover_project(&project_root);
+        self.apply_discovered_project(inventories, playbooks, vars_files);
         self.status_line = format!(
-            "Loaded {} playbooks and {} inventories ({})",
+            "Loaded {} playbooks, {} inventories, {} vars files ({})",
             self.playbooks.len(),
             self.inventories.len(),
+            self.vars_files.len(),
             self.active_project_name()
         );
     }
@@ -2468,23 +2692,33 @@ impl App {
         }
         self.last_auto_discovery_at = Instant::now();
         let project_root = self.active_project_root().to_path_buf();
-        let (inventories, playbooks) = discover_project(&project_root);
-        if inventories == self.inventories && playbooks == self.playbooks {
+        let (inventories, playbooks, vars_files) = discover_project(&project_root);
+        if inventories == self.inventories
+            && playbooks == self.playbooks
+            && vars_files == self.vars_files
+        {
             return;
         }
-        self.apply_discovered_project(inventories, playbooks);
+        self.apply_discovered_project(inventories, playbooks, vars_files);
         self.status_line = format!(
-            "Project updated: {} playbooks, {} inventories ({})",
+            "Project updated: {} playbooks, {} inventories, {} vars files ({})",
             self.playbooks.len(),
             self.inventories.len(),
+            self.vars_files.len(),
             self.active_project_name()
         );
     }
 
-    fn apply_discovered_project(&mut self, inventories: Vec<PathBuf>, playbooks: Vec<PathBuf>) {
+    fn apply_discovered_project(
+        &mut self,
+        inventories: Vec<PathBuf>,
+        playbooks: Vec<PathBuf>,
+        vars_files: Vec<PathBuf>,
+    ) {
         let project_root = self.active_project_root().to_path_buf();
         self.inventories = inventories;
         self.playbooks = playbooks;
+        self.vars_files = vars_files;
         if self.inventory_idx >= self.inventories.len() {
             self.inventory_idx = self.inventories.len().saturating_sub(1);
         }
@@ -2735,7 +2969,6 @@ impl App {
         }
     }
 
-
     pub fn selected_inventory_is_yaml(&self) -> bool {
         self.inventories
             .get(self.inventory_idx)
@@ -2744,11 +2977,6 @@ impl App {
             .map(|e| matches!(e.to_ascii_lowercase().as_str(), "yml" | "yaml"))
             .unwrap_or(false)
     }
-
-    fn selected_inventory_path(&self) -> Option<&Path> {
-        self.inventories.get(self.inventory_idx).map(|p| p.as_path())
-    }
-
     fn load_inventory_edit_state(&mut self) {
         let Some(path) = self.inventories.get(self.inventory_idx).cloned() else {
             self.inventory_edit_state = None;
@@ -3077,36 +3305,32 @@ impl App {
                     GroupsFocus::Hosts => GroupsFocus::Tree,
                 };
             }
-            'j' => {
-                match self.groups_subtab_focus {
-                    GroupsFocus::Tree => {
-                        let len = self.groups_subtab_tree_nodes().len();
-                        if len > 0 {
-                            self.groups_subtab_tree_idx =
-                                min(self.groups_subtab_tree_idx + 1, len - 1);
-                            self.sync_groups_subtab_tree_selection();
-                        }
-                    }
-                    GroupsFocus::Groups => {
-                        let len = self.groups_subtab_candidate_groups().len();
-                        if len > 0 {
-                            self.groups_subtab_group_idx =
-                                min(self.groups_subtab_group_idx + 1, len - 1);
-                        }
-                    }
-                    GroupsFocus::Hosts => {
-                        let len = self
-                            .inventory_edit_state
-                            .as_ref()
-                            .map(|s| s.hosts.len())
-                            .unwrap_or(0);
-                        if len > 0 {
-                            self.groups_subtab_host_idx =
-                                min(self.groups_subtab_host_idx + 1, len - 1);
-                        }
+            'j' => match self.groups_subtab_focus {
+                GroupsFocus::Tree => {
+                    let len = self.groups_subtab_tree_nodes().len();
+                    if len > 0 {
+                        self.groups_subtab_tree_idx = min(self.groups_subtab_tree_idx + 1, len - 1);
+                        self.sync_groups_subtab_tree_selection();
                     }
                 }
-            }
+                GroupsFocus::Groups => {
+                    let len = self.groups_subtab_candidate_groups().len();
+                    if len > 0 {
+                        self.groups_subtab_group_idx =
+                            min(self.groups_subtab_group_idx + 1, len - 1);
+                    }
+                }
+                GroupsFocus::Hosts => {
+                    let len = self
+                        .inventory_edit_state
+                        .as_ref()
+                        .map(|s| s.hosts.len())
+                        .unwrap_or(0);
+                    if len > 0 {
+                        self.groups_subtab_host_idx = min(self.groups_subtab_host_idx + 1, len - 1);
+                    }
+                }
+            },
             'k' => match self.groups_subtab_focus {
                 GroupsFocus::Tree => {
                     self.groups_subtab_tree_idx = self.groups_subtab_tree_idx.saturating_sub(1);
@@ -3128,8 +3352,7 @@ impl App {
                         // Add group via prompt reuse - open the add_var prompt repurposed
                         self.hosts_subtab_add_var_open = true;
                         self.hosts_subtab_add_var_buffer.clear();
-                        self.status_line =
-                            String::from("Type new group name and press Enter");
+                        self.status_line = String::from("Type new group name and press Enter");
                     }
                     GroupsFocus::Hosts => {
                         self.hosts_subtab_add_host_open = true;
@@ -3201,8 +3424,7 @@ impl App {
                 };
                 if let Some(parent) = self.groups_subtab_target_group.clone() {
                     if child == parent {
-                        self.status_line =
-                            String::from("Group cannot be child of itself");
+                        self.status_line = String::from("Group cannot be child of itself");
                         return;
                     }
                     let linked = state
@@ -3221,10 +3443,12 @@ impl App {
                         for children in prospective.values_mut() {
                             children.retain(|g| g != &child);
                         }
-                        prospective.entry(parent.clone()).or_default().push(child.clone());
+                        prospective
+                            .entry(parent.clone())
+                            .or_default()
+                            .push(child.clone());
                         if group_children_has_cycle(&prospective) {
-                            self.status_line =
-                                String::from("Link would create a cycle");
+                            self.status_line = String::from("Link would create a cycle");
                             return;
                         }
                         for children in state.group_children.values_mut() {
@@ -3292,8 +3516,7 @@ impl App {
     fn detach_groups_subtab_item(&mut self) {
         match self.groups_subtab_focus {
             GroupsFocus::Tree => {
-                self.status_line =
-                    String::from("Move focus to Groups or Hosts to detach");
+                self.status_line = String::from("Move focus to Groups or Hosts to detach");
             }
             GroupsFocus::Groups => {
                 let candidates = self.groups_subtab_candidate_groups();
@@ -3726,6 +3949,26 @@ impl App {
         }
     }
 
+    fn restore_job_templates(&mut self) {
+        match load_job_templates(self.active_project_root()) {
+            Ok(templates) => {
+                self.job_templates = templates;
+                self.template_idx = 0;
+                self.pending_template_delete = None;
+                self.sync_run_selection_to_selected_template();
+            }
+            Err(err) => {
+                self.status_line = format!("job templates load failed: {err}");
+            }
+        }
+    }
+
+    fn persist_job_templates(&mut self) {
+        if let Err(err) = save_job_templates(self.active_project_root(), &self.job_templates) {
+            self.status_line = format!("job templates save failed: {err}");
+        }
+    }
+
     fn restore_ansible_cfg_settings(&mut self) {
         match load_ansible_cfg_settings(self.active_project_root()) {
             Ok(settings) => {
@@ -4115,6 +4358,552 @@ impl App {
             None
         }
     }
+
+    // ── Templates ──────────────────────────────────────────────
+
+    pub fn filtered_template_indices(&self) -> Vec<usize> {
+        self.job_templates
+            .iter()
+            .enumerate()
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn selected_template(&self) -> Option<&JobTemplate> {
+        self.job_templates.get(self.template_idx)
+    }
+
+    pub fn run_indices_for_selected_template(&self) -> Vec<usize> {
+        let Some(template) = self.selected_template() else {
+            return Vec::new();
+        };
+        let tid = &template.id;
+        self.runs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, run)| {
+                if run.template_id.as_deref() == Some(tid) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn sync_run_selection_to_selected_template(&mut self) {
+        let indices = self.run_indices_for_selected_template();
+        if indices.is_empty() {
+            self.run_idx = self.runs.len();
+            self.log_cursor = 0;
+            self.log_anchor = None;
+            return;
+        }
+
+        if !indices.contains(&self.run_idx) {
+            self.run_idx = indices[0];
+        }
+        self.sync_log_cursor_to_selected_run();
+    }
+
+    fn move_template_run_selection(&mut self, delta: i32) {
+        let indices = self.run_indices_for_selected_template();
+        if indices.is_empty() {
+            return;
+        }
+        let current_pos = indices.iter().position(|i| *i == self.run_idx).unwrap_or(0);
+        let new_pos = if delta > 0 {
+            min(current_pos + 1, indices.len() - 1)
+        } else {
+            current_pos.saturating_sub(1)
+        };
+        self.run_idx = indices[new_pos];
+    }
+
+    fn start_template_run(&mut self, tx: &UnboundedSender<Action>) {
+        if self.template_editor_open {
+            self.status_line = String::from("Close editor before running");
+            return;
+        }
+        if self.runtime_bootstrapping {
+            self.status_line = String::from("Runtime bootstrap in progress...");
+            return;
+        }
+        if !playbook_bin_available(&self.run_options.ansible_bin) {
+            self.status_line = format!(
+                "{} not found. Press u to pick runtime or b to bootstrap managed runtime",
+                self.run_options.ansible_bin
+            );
+            self.open_runtime_prompt();
+            return;
+        }
+        let Some(template) = self.job_templates.get(self.template_idx).cloned() else {
+            self.status_line = String::from("No template selected");
+            return;
+        };
+        if template.playbook.trim().is_empty() {
+            self.status_line = String::from("Template must have a playbook set");
+            return;
+        }
+        let project_root = self.active_project_root().to_path_buf();
+        let (inventories, playbooks, vars_files) = discover_project(&project_root);
+        self.apply_discovered_project(inventories, playbooks, vars_files);
+
+        let resolved = match self.resolve_template_run_context(&template, true) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                self.status_line = err;
+                return;
+            }
+        };
+
+        let run_id = self.next_run_id;
+        self.next_run_id += 1;
+
+        let warning_suffix = if resolved.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" | {}", resolved.warnings.join(" | "))
+        };
+        self.status_line = format!(
+            "Starting template run #{run_id} ({}) [inv: {} via {} | ssh: {}]{}",
+            template.name,
+            resolved.inventory,
+            resolved.inventory_source,
+            resolved.ssh_key_source,
+            warning_suffix
+        );
+        spawn_ansible_run(
+            RunRequest {
+                run_id,
+                cwd: project_root,
+                playbook: template.playbook.clone(),
+                inventory: resolved.inventory,
+                options: resolved.options,
+                template_id: Some(template.id.clone()),
+                environment: Some(self.active_project_name()),
+            },
+            tx.clone(),
+        );
+    }
+
+    fn open_template_editor_new(&mut self) {
+        self.template_editor_open = true;
+        self.template_editor_editing_id = None;
+        self.template_editor_field_idx = 0;
+        self.template_editor_text_mode = false;
+        self.template_editor_text_buffer.clear();
+        self.template_editor_name = String::new();
+        self.template_editor_playbook_idx = self
+            .playbook_idx
+            .min(self.playbooks.len().saturating_sub(1));
+        self.template_editor_inventory_idx = self
+            .inventory_idx
+            .min(self.inventories.len().saturating_sub(1));
+        self.template_editor_settings = self
+            .playbooks
+            .get(self.template_editor_playbook_idx)
+            .map(|path| display_path(self.active_project_root(), path))
+            .and_then(|key| self.playbook_settings.get(&key).cloned())
+            .unwrap_or_else(|| self.default_settings());
+        self.status_line = String::from("New template: fill in fields, Ctrl+S to save");
+    }
+
+    fn open_template_editor_edit(&mut self) {
+        let Some(template) = self.job_templates.get(self.template_idx).cloned() else {
+            self.status_line = String::from("No template selected");
+            return;
+        };
+        self.template_editor_open = true;
+        self.template_editor_editing_id = Some(template.id.clone());
+        self.template_editor_field_idx = 0;
+        self.template_editor_text_mode = false;
+        self.template_editor_text_buffer.clear();
+        self.template_editor_name = template.name.clone();
+        self.template_editor_playbook_idx = self
+            .playbooks
+            .iter()
+            .position(|p| display_path(self.active_project_root(), p) == template.playbook)
+            .unwrap_or(0);
+        self.template_editor_inventory_idx = self
+            .inventories
+            .iter()
+            .position(|p| display_path(self.active_project_root(), p) == template.inventory)
+            .unwrap_or(0);
+        self.template_editor_settings = PlaybookSettings {
+            check: template.check,
+            diff: template.diff,
+            become_enabled: template.become_enabled,
+            verbosity: template.verbosity,
+            forks: template.forks,
+            timeout: template.timeout,
+            limit: template.limit,
+            tags: template.tags,
+            extra_vars: template.extra_vars,
+            extra_args: template.extra_args,
+            ssh_private_key_file: template.ssh_private_key_file,
+            ssh_private_key_inline: template.ssh_private_key_inline,
+        };
+        self.status_line = format!("Editing template: {}", template.name);
+    }
+
+    fn close_template_editor(&mut self) {
+        self.template_editor_open = false;
+        self.template_editor_text_mode = false;
+        self.template_editor_text_buffer.clear();
+        self.status_line = String::from("Template editor closed");
+    }
+
+    fn save_template_from_editor(&mut self) {
+        let name = self.template_editor_name.trim().to_string();
+        if name.is_empty() {
+            self.status_line = String::from("Template name cannot be empty");
+            return;
+        }
+        let playbook = self
+            .playbooks
+            .get(self.template_editor_playbook_idx)
+            .map(|p| display_path(self.active_project_root(), p))
+            .unwrap_or_default();
+        let inventory = self
+            .inventories
+            .get(self.template_editor_inventory_idx)
+            .map(|p| display_path(self.active_project_root(), p))
+            .unwrap_or_default();
+        let s = &self.template_editor_settings;
+        if let Some(ref editing_id) = self.template_editor_editing_id.clone() {
+            if let Some(t) = self.job_templates.iter_mut().find(|t| &t.id == editing_id) {
+                t.name = name.clone();
+                t.playbook = playbook;
+                t.inventory = inventory;
+                t.environment = None;
+                t.check = s.check;
+                t.diff = s.diff;
+                t.become_enabled = s.become_enabled;
+                t.verbosity = s.verbosity;
+                t.forks = s.forks;
+                t.timeout = s.timeout;
+                t.limit = s.limit.clone();
+                t.tags = s.tags.clone();
+                t.extra_vars = s.extra_vars.clone();
+                t.extra_args = s.extra_args.clone();
+                t.ssh_private_key_file = s.ssh_private_key_file.clone();
+                t.ssh_private_key_inline = s.ssh_private_key_inline.clone();
+            }
+        } else {
+            let mut t = JobTemplate::new(&name);
+            t.playbook = playbook;
+            t.inventory = inventory;
+            t.environment = None;
+            t.check = s.check;
+            t.diff = s.diff;
+            t.become_enabled = s.become_enabled;
+            t.verbosity = s.verbosity;
+            t.forks = s.forks;
+            t.timeout = s.timeout;
+            t.limit = s.limit.clone();
+            t.tags = s.tags.clone();
+            t.extra_vars = s.extra_vars.clone();
+            t.extra_args = s.extra_args.clone();
+            t.ssh_private_key_file = s.ssh_private_key_file.clone();
+            t.ssh_private_key_inline = s.ssh_private_key_inline.clone();
+            self.job_templates.push(t);
+            self.template_idx = self.job_templates.len() - 1;
+        }
+
+        self.persist_job_templates();
+        self.sync_run_selection_to_selected_template();
+        self.close_template_editor();
+        self.status_line = format!("Template saved: {name}");
+    }
+
+    fn delete_selected_template(&mut self) {
+        if self.job_templates.is_empty() {
+            return;
+        }
+        let Some(template) = self.job_templates.get(self.template_idx) else {
+            return;
+        };
+        if self.pending_template_delete.as_deref() == Some(&template.id) {
+            let name = template.name.clone();
+            self.job_templates.remove(self.template_idx);
+            if self.template_idx >= self.job_templates.len() && self.template_idx > 0 {
+                self.template_idx -= 1;
+            }
+            self.pending_template_delete = None;
+            self.persist_job_templates();
+            self.sync_run_selection_to_selected_template();
+            self.status_line = format!("Template deleted: {name}");
+        } else {
+            self.pending_template_delete = Some(template.id.clone());
+            self.status_line =
+                format!("Press Shift+D again to confirm deleting: {}", template.name);
+        }
+    }
+
+    fn confirm_template_editor(&mut self) {
+        if !self.template_editor_open {
+            return;
+        }
+        if self.template_editor_text_mode {
+            if self.template_editor_is_multiline_field() {
+                self.template_editor_text_buffer.push('\n');
+            } else {
+                self.commit_template_editor_text_edit();
+            }
+            return;
+        }
+        if self.template_editor_is_text_field() {
+            self.begin_template_editor_text_edit();
+            return;
+        }
+        self.toggle_template_editor_boolean();
+    }
+
+    pub fn template_editor_is_text_field(&self) -> bool {
+        // Fields: 0=name, 1=playbook, 2=inventory,
+        //         4=check, 5=diff, 6=become, 7=verbosity,
+        //         8=forks, 9=timeout,
+        //         10=limit, 11=tags, 12=extra_vars, 13=extra_args,
+        //         14=ssh key file, 15=ssh key inline
+        matches!(
+            self.template_editor_field_idx,
+            0 | 10 | 11 | 12 | 13 | 14 | 15
+        )
+    }
+
+    pub fn template_editor_is_multiline_field(&self) -> bool {
+        self.template_editor_field_idx == 15
+    }
+
+    fn handle_template_editor_char(&mut self, ch: char) {
+        if self.template_editor_text_mode {
+            self.template_editor_text_buffer.push(ch);
+            return;
+        }
+        match ch {
+            'j' => {
+                self.template_editor_field_idx = min(
+                    self.template_editor_field_idx + 1,
+                    TEMPLATE_EDITOR_FIELD_COUNT - 1,
+                );
+            }
+            'k' => {
+                self.template_editor_field_idx = self.template_editor_field_idx.saturating_sub(1);
+            }
+            'h' => self.adjust_template_editor_field(-1),
+            'l' => self.adjust_template_editor_field(1),
+            ' ' => self.toggle_template_editor_boolean(),
+            'e' => self.begin_template_editor_text_edit(),
+            _ => {}
+        }
+    }
+
+    fn adjust_template_editor_field(&mut self, delta: i8) {
+        if self.template_editor_text_mode {
+            return;
+        }
+        let s = &mut self.template_editor_settings;
+        match self.template_editor_field_idx {
+            1 => {
+                // playbook picker
+                if !self.playbooks.is_empty() {
+                    if delta > 0 {
+                        self.template_editor_playbook_idx = min(
+                            self.template_editor_playbook_idx + 1,
+                            self.playbooks.len() - 1,
+                        );
+                    } else {
+                        self.template_editor_playbook_idx =
+                            self.template_editor_playbook_idx.saturating_sub(1);
+                    }
+                }
+            }
+            2 => {
+                // inventory picker
+                if !self.inventories.is_empty() {
+                    if delta > 0 {
+                        self.template_editor_inventory_idx = min(
+                            self.template_editor_inventory_idx + 1,
+                            self.inventories.len() - 1,
+                        );
+                    } else {
+                        self.template_editor_inventory_idx =
+                            self.template_editor_inventory_idx.saturating_sub(1);
+                    }
+                }
+            }
+            4 => s.check = !s.check,
+            5 => s.diff = !s.diff,
+            6 => s.become_enabled = !s.become_enabled,
+            7 => {
+                let v = s.verbosity as i8 + delta;
+                s.verbosity = max(0, min(4, v)) as u8;
+            }
+            8 => {
+                s.forks = cycle_u16(
+                    s.forks,
+                    &[None, Some(5), Some(10), Some(20), Some(50)],
+                    delta,
+                );
+            }
+            9 => {
+                s.timeout = cycle_u16(
+                    s.timeout,
+                    &[None, Some(10), Some(30), Some(60), Some(120)],
+                    delta,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn toggle_template_editor_boolean(&mut self) {
+        if self.template_editor_text_mode {
+            return;
+        }
+        let s = &mut self.template_editor_settings;
+        match self.template_editor_field_idx {
+            4 => s.check = !s.check,
+            5 => s.diff = !s.diff,
+            6 => s.become_enabled = !s.become_enabled,
+            _ => {}
+        }
+    }
+
+    fn begin_template_editor_text_edit(&mut self) {
+        if self.template_editor_text_mode {
+            return;
+        }
+        let s = &self.template_editor_settings;
+        let current = match self.template_editor_field_idx {
+            0 => self.template_editor_name.clone(),
+            10 => s.limit.clone().unwrap_or_default(),
+            11 => s.tags.clone().unwrap_or_default(),
+            12 => s.extra_vars.clone().unwrap_or_default(),
+            13 => s.extra_args.clone().unwrap_or_default(),
+            14 => s.ssh_private_key_file.clone().unwrap_or_default(),
+            15 => s.ssh_private_key_inline.clone().unwrap_or_default(),
+            _ => return,
+        };
+        self.template_editor_text_mode = true;
+        self.template_editor_text_buffer = current;
+    }
+
+    fn commit_template_editor_text_edit(&mut self) {
+        if !self.template_editor_text_mode {
+            return;
+        }
+        let buf = self.template_editor_text_buffer.clone();
+        let s = &mut self.template_editor_settings;
+        match self.template_editor_field_idx {
+            0 => self.template_editor_name = buf.trim().to_string(),
+            10 => s.limit = normalize_optional_text(buf),
+            11 => s.tags = normalize_optional_text(buf),
+            12 => s.extra_vars = normalize_optional_text(buf),
+            13 => s.extra_args = normalize_optional_text(buf),
+            14 => s.ssh_private_key_file = normalize_optional_text(buf),
+            15 => s.ssh_private_key_inline = normalize_optional_multiline_text(buf),
+            _ => {}
+        }
+        self.template_editor_text_mode = false;
+        self.template_editor_text_buffer.clear();
+    }
+
+    fn cancel_template_editor_text_edit(&mut self) {
+        self.template_editor_text_mode = false;
+        self.template_editor_text_buffer.clear();
+    }
+
+    pub fn template_effective_context(
+        &self,
+        template: &JobTemplate,
+    ) -> Result<TemplateEffectiveContext, String> {
+        let resolved = self.resolve_template_run_context(template, false)?;
+        Ok(TemplateEffectiveContext {
+            inventory: resolved.inventory,
+            inventory_source: resolved.inventory_source,
+            vars_files: resolved.options.extra_vars_files,
+            ssh_private_key_file: resolved.options.ssh_private_key_file,
+            has_inline_ssh_key: resolved.options.ssh_private_key_inline.is_some(),
+            ssh_key_source: resolved.ssh_key_source,
+            warnings: resolved.warnings,
+        })
+    }
+
+    fn resolve_template_run_context(
+        &self,
+        template: &JobTemplate,
+        validate_paths: bool,
+    ) -> Result<ResolvedTemplateRunContext, String> {
+        let mut options = template.to_run_options(&self.run_options.ansible_bin);
+        let inventory = normalize_run_path(template.inventory.trim());
+        let inventory_source = String::from("template");
+        let mut ssh_key_source = if options.ssh_private_key_inline.is_some() {
+            String::from("template-inline")
+        } else if options.ssh_private_key_file.is_some() {
+            String::from("template")
+        } else {
+            String::from("unset")
+        };
+        let warnings = Vec::new();
+
+        options.extra_vars_files.clear();
+        if options.ssh_private_key_file.is_none() && options.ssh_private_key_inline.is_none() {
+            if let Some(project) = self.projects.get(self.active_project_idx) {
+                if project.ssh_private_key_file.is_some()
+                    || project.ssh_private_key_inline.is_some()
+                {
+                    options.ssh_private_key_file = project
+                        .ssh_private_key_file
+                        .as_deref()
+                        .map(normalize_run_path);
+                    options.ssh_private_key_inline = project.ssh_private_key_inline.clone();
+                    ssh_key_source = String::from("project");
+                }
+            }
+        }
+
+        if inventory.is_empty() {
+            return Err(String::from("Template has no inventory set."));
+        }
+        if validate_paths {
+            if !self.run_path_exists(&inventory) {
+                return Err(format!("Inventory path does not exist: {inventory}"));
+            }
+            for vars_file in &options.extra_vars_files {
+                if !self.run_path_exists(vars_file) {
+                    return Err(format!("Vars file does not exist: {vars_file}"));
+                }
+            }
+            if let Some(ref key_path) = options.ssh_private_key_file {
+                if !self.run_path_exists(key_path) {
+                    return Err(format!("SSH key file does not exist: {key_path}"));
+                }
+            }
+        }
+
+        Ok(ResolvedTemplateRunContext {
+            inventory,
+            options,
+            inventory_source,
+            ssh_key_source,
+            warnings,
+        })
+    }
+
+    fn run_path_exists(&self, raw: &str) -> bool {
+        let normalized = normalize_run_path(raw);
+        if normalized.is_empty() {
+            return false;
+        }
+        let path = PathBuf::from(&normalized);
+        if path.is_absolute() {
+            path.exists()
+        } else {
+            self.active_project_root().join(path).exists()
+        }
+    }
 }
 
 fn normalize_optional_multiline_text(value: String) -> Option<String> {
@@ -4136,13 +4925,24 @@ fn normalize_optional_text(value: String) -> Option<String> {
     }
 }
 
+fn normalize_run_path(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(suffix)
+                .to_string_lossy()
+                .to_string();
+        }
+    }
+    raw.to_string()
+}
+
 fn ensure_ansible_project_layout(root: &Path) -> std::io::Result<()> {
-    for dir in [
-        "inventory",
-        "inventory/group_vars",
-        "playbooks",
-        "roles",
-    ] {
+    for dir in ["inventory", "inventory/group_vars", "playbooks", "roles"] {
         fs::create_dir_all(root.join(dir))?;
     }
 
@@ -4293,9 +5093,7 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
                         if let Some((key, value)) = trimmed.split_once(':') {
                             let key = key.trim();
                             let value = value.trim();
-                            let vars = host_vars
-                                .entry(host_name.clone())
-                                .or_default();
+                            let vars = host_vars.entry(host_name.clone()).or_default();
                             match key {
                                 "ansible_host" => vars.ansible_host = value.to_string(),
                                 "ansible_user" => vars.ansible_user = value.to_string(),
@@ -4307,8 +5105,7 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
                                 }
                                 _ => {
                                     if !key.is_empty() {
-                                        vars.custom_vars
-                                            .push((key.to_string(), value.to_string()));
+                                        vars.custom_vars.push((key.to_string(), value.to_string()));
                                     }
                                 }
                             }
@@ -4379,9 +5176,10 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
     })
 }
 
-fn discover_project(cwd: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+fn discover_project(cwd: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let mut inventories = Vec::new();
     let mut playbooks = Vec::new();
+    let mut vars_files = Vec::new();
 
     for entry in WalkDir::new(cwd)
         .follow_links(false)
@@ -4420,6 +5218,11 @@ fn discover_project(cwd: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let in_project_root = path.parent().map(|p| p == cwd).unwrap_or(false);
         if (in_playbooks_dir || in_project_root) && is_playbook_ext(&ext) {
             playbooks.push(path.to_path_buf());
+            continue;
+        }
+
+        if is_vars_file(cwd, path, &ext) {
+            vars_files.push(path.to_path_buf());
         }
     }
 
@@ -4427,8 +5230,10 @@ fn discover_project(cwd: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     inventories.dedup();
     playbooks.sort();
     playbooks.dedup();
+    vars_files.sort();
+    vars_files.dedup();
 
-    (inventories, playbooks)
+    (inventories, playbooks, vars_files)
 }
 
 fn is_inventory_ext(ext: &str) -> bool {
@@ -4437,6 +5242,30 @@ fn is_inventory_ext(ext: &str) -> bool {
 
 fn is_playbook_ext(ext: &str) -> bool {
     matches!(ext, "yml" | "yaml")
+}
+
+fn is_vars_ext(ext: &str) -> bool {
+    matches!(ext, "yml" | "yaml" | "json")
+}
+
+fn is_vars_file(cwd: &Path, path: &Path, ext: &str) -> bool {
+    if !is_vars_ext(ext) {
+        return false;
+    }
+    if path_contains_dir_under(path, cwd, "group_vars")
+        || path_contains_dir_under(path, cwd, "host_vars")
+        || path_contains_dir_under(path, cwd, "vars")
+    {
+        return true;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    file_name.ends_with(".vars.yml")
+        || file_name.ends_with(".vars.yaml")
+        || file_name.ends_with(".vars.json")
 }
 
 fn is_inventory_file(cwd: &Path, path: &Path, ext: &str) -> bool {
@@ -4557,8 +5386,7 @@ fn render_inventory_yaml_with_vars(
     let hosts_with_vars: Vec<&String> = hosts
         .iter()
         .filter(|h| {
-            host_vars.get(*h).map(|v| !v.is_empty()).unwrap_or(false)
-                && assigned_hosts.contains(*h)
+            host_vars.get(*h).map(|v| !v.is_empty()).unwrap_or(false) && assigned_hosts.contains(*h)
         })
         .collect();
 

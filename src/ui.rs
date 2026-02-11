@@ -11,7 +11,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    display_path, App, InventorySubTab, GroupsFocus, ProjectCreateMode, RunStatus, View,
+    display_path, App, GroupsFocus, InventorySubTab, ProjectCreateMode, RunStatus, View,
 };
 use crate::playbook_settings::PlaybookSettings;
 use crate::run::playbook_bin_available;
@@ -39,6 +39,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_status(frame, app, layout[3]);
     if app.settings_editor_open {
         render_playbook_settings_editor(frame, app);
+    }
+    if app.template_editor_open {
+        render_template_editor(frame, app);
     }
     if app.inventory_create_open {
         render_inventory_create_prompt(frame, app);
@@ -108,6 +111,7 @@ fn render_main(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         View::Projects => render_projects(frame, app, area),
         View::Inventory => render_inventory(frame, app, area),
         View::Playbooks => render_playbooks(frame, app, area),
+        View::Templates => render_templates(frame, app, area),
         View::Settings => render_settings(frame, app, area),
     }
 }
@@ -157,9 +161,21 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let mut runs_by_playbook = BTreeMap::<String, u64>::new();
     let mut runs_by_inventory = BTreeMap::<String, u64>::new();
+    let mut runs_by_environment = BTreeMap::<String, u64>::new();
+    let mut successes_by_environment = BTreeMap::<String, u64>::new();
     for run in &app.runs {
         *runs_by_playbook.entry(run.playbook.clone()).or_insert(0) += 1;
         *runs_by_inventory.entry(run.inventory.clone()).or_insert(0) += 1;
+        if let Some(environment) = run.environment.as_deref() {
+            *runs_by_environment
+                .entry(environment.to_string())
+                .or_insert(0) += 1;
+            if matches!(run.status, RunStatus::Succeeded) {
+                *successes_by_environment
+                    .entry(environment.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
     }
     let (top_playbooks, playbook_max) = top_ranked_items(&runs_by_playbook, 6);
     let (top_inventories, inventory_max) = top_ranked_items(&runs_by_inventory, 6);
@@ -355,7 +371,11 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
         .split(bottom[2]);
     render_ranked_bar_panel(
         frame,
@@ -372,6 +392,12 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         &top_inventories,
         inventory_max.max(1),
         th::MAUVE,
+    );
+    render_environment_breakdown_panel(
+        frame,
+        right[2],
+        &runs_by_environment,
+        &successes_by_environment,
     );
 }
 
@@ -765,10 +791,7 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
             } else {
                 value.clone()
             };
-            rows.push(Row::new(vec![
-                Cell::from(*key),
-                Cell::from(display_val),
-            ]));
+            rows.push(Row::new(vec![Cell::from(*key), Cell::from(display_val)]));
         }
 
         if let Some(v) = vars {
@@ -795,31 +818,28 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
             }
         }
 
-        let detail_table =
-            Table::new(rows, [Constraint::Length(20), Constraint::Min(10)])
-                .header(
-                    Row::new(vec!["Property", "Value"]).style(
-                        Style::default()
-                            .fg(th::SUBTEXT1)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                )
-                .column_spacing(1)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(detail_border)
-                        .title(format!("Host: {host}")),
-                )
-                .row_highlight_style(
-                    if app.hosts_subtab_focus_detail {
-                        Style::default().fg(th::YELLOW)
-                    } else {
-                        Style::default()
-                    },
-                );
-        let mut table_state = TableState::default().with_selected(
-            if app.hosts_subtab_focus_detail {
+        let detail_table = Table::new(rows, [Constraint::Length(20), Constraint::Min(10)])
+            .header(
+                Row::new(vec!["Property", "Value"]).style(
+                    Style::default()
+                        .fg(th::SUBTEXT1)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .column_spacing(1)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(detail_border)
+                    .title(format!("Host: {host}")),
+            )
+            .row_highlight_style(if app.hosts_subtab_focus_detail {
+                Style::default().fg(th::YELLOW)
+            } else {
+                Style::default()
+            });
+        let mut table_state =
+            TableState::default().with_selected(if app.hosts_subtab_focus_detail {
                 Some(if let Some(v) = vars {
                     if !v.custom_vars.is_empty() && app.hosts_subtab_field_idx >= 4 {
                         // account for the separator row
@@ -832,8 +852,7 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
                 })
             } else {
                 None
-            },
-        );
+            });
         frame.render_stateful_widget(detail_table, cols[1], &mut table_state);
     } else {
         let empty = Paragraph::new("Select a host from the list")
@@ -856,14 +875,13 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
         } else {
             format!("{}|", app.hosts_subtab_add_host_buffer)
         };
-        let input = Paragraph::new(val)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
-                    .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-                    .title("New Host Name"),
-            );
+        let input = Paragraph::new(val).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
+                .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+                .title("New Host Name"),
+        );
         frame.render_widget(input, prompt_area);
     }
 
@@ -875,14 +893,13 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
         } else {
             format!("{}|", app.hosts_subtab_add_var_buffer)
         };
-        let input = Paragraph::new(val)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
-                    .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-                    .title("New Variable Name"),
-            );
+        let input = Paragraph::new(val).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
+                .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+                .title("New Variable Name"),
+        );
         frame.render_widget(input, prompt_area);
     }
 
@@ -1008,14 +1025,14 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
                         .map(|c| c.contains(group))
                         .unwrap_or(false)
                 } else {
-                    !state
-                        .group_children
-                        .values()
-                        .any(|c| c.contains(group))
+                    !state.group_children.values().any(|c| c.contains(group))
                 };
                 if attached {
                     ListItem::new(Line::from(vec![
-                        Span::styled("[x]", Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            "[x]",
+                            Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw(format!(" {group}")),
                     ]))
                 } else {
@@ -1063,14 +1080,14 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
                         .map(|hosts| hosts.contains(host))
                         .unwrap_or(false)
                 } else {
-                    !state
-                        .assignments
-                        .values()
-                        .any(|hosts| hosts.contains(host))
+                    !state.assignments.values().any(|hosts| hosts.contains(host))
                 };
                 if attached {
                     ListItem::new(Line::from(vec![
-                        Span::styled("[x]", Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            "[x]",
+                            Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw(format!(" {host}")),
                     ]))
                 } else {
@@ -1112,14 +1129,13 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         } else {
             format!("{}|", app.hosts_subtab_add_var_buffer)
         };
-        let input = Paragraph::new(val)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
-                    .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-                    .title("New Group Name"),
-            );
+        let input = Paragraph::new(val).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
+                .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+                .title("New Group Name"),
+        );
         frame.render_widget(input, prompt_area);
     }
 
@@ -1131,21 +1147,17 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         } else {
             format!("{}|", app.hosts_subtab_add_host_buffer)
         };
-        let input = Paragraph::new(val)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
-                    .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-                    .title("New Host Name"),
-            );
+        let input = Paragraph::new(val).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
+                .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+                .title("New Host Name"),
+        );
         frame.render_widget(input, prompt_area);
     }
 
-    let target_label = app
-        .groups_subtab_target_group
-        .as_deref()
-        .unwrap_or("all");
+    let target_label = app.groups_subtab_target_group.as_deref().unwrap_or("all");
     let hint = Paragraph::new(format!(
         "Target: {target_label} | h/l focus | j/k nav | Space toggle | n add | d detach | D delete | Ctrl+S save | Esc back",
     ))
@@ -1209,13 +1221,23 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     .exit_code
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| String::from("-"));
-                ListItem::new(format!(
+                let mut spans = vec![Span::raw(format!(
                     "#{:03} {:>9} code:{:<4} {}",
                     run.id,
                     run.status.as_str(),
                     code,
                     run.started_at.format("%H:%M:%S")
-                ))
+                ))];
+                if let Some(env) = run.environment.as_deref() {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        format!("[{}]", env.to_uppercase()),
+                        Style::default()
+                            .fg(th::SUBTEXT0)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect::<Vec<_>>()
     };
@@ -1290,7 +1312,164 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 }
 
+fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(14), Constraint::Length(8)])
+        .split(area);
+
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
+        .split(chunks[0]);
+
+    let filtered_template_indices = app.filtered_template_indices();
+    let template_items = if filtered_template_indices.is_empty() {
+        vec![ListItem::new("No templates found. Press n to create one.")]
+    } else {
+        filtered_template_indices
+            .iter()
+            .map(|idx| {
+                let template = &app.job_templates[*idx];
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        template.name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("({})", template.playbook),
+                        Style::default().fg(th::SUBTEXT0),
+                    ),
+                ]))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let template_list = List::new(template_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if app.templates_focus_runs {
+                    Style::default().fg(th::SURFACE1)
+                } else {
+                    Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                })
+                .title("Templates"),
+        )
+        .highlight_style(Style::default().fg(th::YELLOW))
+        .highlight_symbol(">> ");
+    let selected_template_pos = filtered_template_indices
+        .iter()
+        .position(|idx| *idx == app.template_idx);
+    let mut template_state = ListState::default().with_selected(selected_template_pos);
+    frame.render_stateful_widget(template_list, top[0], &mut template_state);
+
+    let template_run_indices = app.run_indices_for_selected_template();
+    let template_run_items = if template_run_indices.is_empty() {
+        vec![ListItem::new(
+            "No runs yet for this template. Press r to run.",
+        )]
+    } else {
+        template_run_indices
+            .iter()
+            .map(|idx| {
+                let run = &app.runs[*idx];
+                let code = run
+                    .exit_code
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| String::from("-"));
+                ListItem::new(format!(
+                    "#{:03} {:>9} code:{:<4} {}",
+                    run.id,
+                    run.status.as_str(),
+                    code,
+                    run.started_at.format("%H:%M:%S")
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let run_list = List::new(template_run_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if app.templates_focus_runs {
+                    Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th::SURFACE1)
+                })
+                .title("Runs For Selected Template"),
+        )
+        .highlight_style(Style::default().fg(th::GREEN))
+        .highlight_symbol(">> ");
+    let selected_run_pos = template_run_indices
+        .iter()
+        .position(|idx| *idx == app.run_idx);
+    let mut run_state = ListState::default().with_selected(selected_run_pos);
+    frame.render_stateful_widget(run_list, top[1], &mut run_state);
+
+    let rows = if let Some(template) = app.selected_template() {
+        template_settings_preview_rows(app, template)
+    } else {
+        vec![
+            (String::from("template"), String::from("none")),
+            (String::from("playbook"), String::from("unset")),
+            (String::from("inventory"), String::from("unset")),
+            (String::from("check"), String::from("false")),
+            (String::from("diff"), String::from("false")),
+            (String::from("become"), String::from("false")),
+            (String::from("verbosity"), String::from("0")),
+            (String::from("forks"), String::from("unset")),
+            (String::from("timeout"), String::from("unset")),
+            (String::from("limit"), String::from("unset")),
+            (String::from("tags"), String::from("unset")),
+            (String::from("extra-vars"), String::from("unset")),
+            (String::from("additional args"), String::from("unset")),
+            (String::from("ssh_key_file"), String::from("unset")),
+            (String::from("ssh_key_inline"), String::from("unset")),
+        ]
+    };
+    let bottom_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
+        .split(chunks[1]);
+
+    let table = Table::new(
+        rows.into_iter()
+            .map(|(k, v)| Row::new(vec![Cell::from(k), Cell::from(v)]))
+            .collect::<Vec<_>>(),
+        [Constraint::Length(20), Constraint::Min(10)],
+    )
+    .header(
+        Row::new(vec!["Property", "Value"]).style(
+            Style::default()
+                .fg(th::SUBTEXT1)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .column_spacing(1)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(th::SURFACE1))
+            .title("Template Settings"),
+    );
+    frame.render_widget(table, bottom_chunks[0]);
+
+    let hint = Paragraph::new(
+        "r run | t/e edit template | n new | Shift+D delete | <-/-> focus templates/runs",
+    )
+    .style(Style::default().fg(th::SUBTEXT0))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(hint, bottom_chunks[1]);
+}
+
 fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let empty_message = if app.current_view() == View::Templates {
+        "No run selected for this template yet."
+    } else {
+        "No run selected for this playbook yet."
+    };
     let content = app
         .runs
         .get(app.run_idx)
@@ -1349,14 +1528,30 @@ fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             }
             Text::from(lines)
         })
-        .unwrap_or_else(|| Text::from("No run selected for this playbook yet."));
+        .unwrap_or_else(|| Text::from(empty_message));
+
+    let (title, border_style) = if app.current_view() == View::Templates {
+        (
+            "Template Run Logs",
+            if app.templates_focus_runs {
+                Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th::SURFACE1)
+            },
+        )
+    } else {
+        (
+            "Live Logs (Selected Run)",
+            Style::default().fg(th::SURFACE1),
+        )
+    };
 
     let paragraph = Paragraph::new(content)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
-                .title("Live Logs (Selected Run)"),
+                .border_style(border_style)
+                .title(title),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
@@ -2182,6 +2377,221 @@ fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
     frame.render_widget(hint, chunks[3]);
 }
 
+fn render_template_editor(frame: &mut Frame, app: &App) {
+    let area = centered_rect(86, 84, frame.area());
+    frame.render_widget(Clear, area);
+
+    let border_color = if app.template_editor_text_mode {
+        th::YELLOW
+    } else {
+        th::MAUVE
+    };
+    let title = if app.template_editor_editing_id.is_some() {
+        "Template Editor (Edit)"
+    } else {
+        "Template Editor (New)"
+    };
+    let wrapper = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+        .title(title);
+    frame.render_widget(wrapper, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(14),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let mode_label = if app.template_editor_text_mode {
+        "Edit mode: ON"
+    } else {
+        "Edit mode: OFF"
+    };
+    let mode_style = if app.template_editor_text_mode {
+        Style::default()
+            .fg(th::CRUST)
+            .bg(th::YELLOW)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th::SUBTEXT1)
+    };
+    frame.render_widget(Paragraph::new(mode_label).style(mode_style), chunks[0]);
+
+    let selected_playbook = app
+        .playbooks
+        .get(app.template_editor_playbook_idx)
+        .map(|path| display_path(app.active_project_root(), path))
+        .unwrap_or_else(|| String::from("(none)"));
+    let selected_inventory = app
+        .inventories
+        .get(app.template_editor_inventory_idx)
+        .map(|path| display_path(app.active_project_root(), path))
+        .unwrap_or_else(|| String::from("(none)"));
+    let header = Paragraph::new(format!(
+        "Playbook: {selected_playbook} | Inventory: {selected_inventory} | Scope: active project"
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(th::SURFACE1)),
+    )
+    .style(Style::default().fg(th::TEXT).bg(th::BASE));
+    frame.render_widget(header, chunks[1]);
+
+    let rows = template_editor_rows(app);
+    let table_rows = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, (property, value))| {
+            let style = if idx == app.template_editor_field_idx {
+                Style::default()
+                    .fg(th::CRUST)
+                    .bg(th::YELLOW)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th::TEXT)
+            };
+            Row::new(vec![
+                Cell::from(property.clone()),
+                Cell::from(value.clone()),
+            ])
+            .style(style)
+        })
+        .collect::<Vec<_>>();
+    let fields = Table::new(table_rows, [Constraint::Length(34), Constraint::Min(10)])
+        .header(
+            Row::new(vec!["Property", "Value"]).style(
+                Style::default()
+                    .fg(th::SUBTEXT1)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .column_spacing(1)
+        .row_highlight_style(
+            Style::default()
+                .fg(th::CRUST)
+                .bg(th::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ")
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th::SURFACE1))
+                .style(Style::default().fg(th::TEXT).bg(th::BASE))
+                .title("Template Fields"),
+        );
+    let mut fields_state = TableState::default().with_selected(Some(app.template_editor_field_idx));
+    frame.render_stateful_widget(fields, chunks[2], &mut fields_state);
+
+    let hint = Paragraph::new(if app.template_editor_text_mode && app.template_editor_is_multiline_field() {
+        "j/k field | h/l or <-/-> adjust | Enter newline | Ctrl+S save | Esc cancel | Esc close editor"
+    } else {
+        "j/k field | h/l or <-/-> adjust | Enter edit/save | e edit text | space toggle | Ctrl+S save template | Esc cancel/close"
+    })
+    .style(Style::default().fg(th::SUBTEXT0));
+    frame.render_widget(hint, chunks[3]);
+}
+
+fn template_editor_rows(app: &App) -> Vec<(String, String)> {
+    let settings = &app.template_editor_settings;
+    let selected_inventory_display = app
+        .inventories
+        .get(app.template_editor_inventory_idx)
+        .map(|path| display_path(app.active_project_root(), path))
+        .unwrap_or_else(|| String::from("(none)"));
+
+    vec![
+        (
+            String::from("name"),
+            display_template_editor_text(app, 0, &app.template_editor_name),
+        ),
+        (
+            String::from("playbook"),
+            app.playbooks
+                .get(app.template_editor_playbook_idx)
+                .map(|path| display_path(app.active_project_root(), path))
+                .unwrap_or_else(|| String::from("(none)")),
+        ),
+        (String::from("inventory"), selected_inventory_display),
+        (String::from("scope"), String::from("active project")),
+        (String::from("check (--check)"), settings.check.to_string()),
+        (String::from("diff (--diff)"), settings.diff.to_string()),
+        (
+            String::from("become (--become)"),
+            settings.become_enabled.to_string(),
+        ),
+        (
+            String::from("verbosity (-v)"),
+            settings.verbosity.to_string(),
+        ),
+        (
+            String::from("forks (--forks)"),
+            settings
+                .forks
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("timeout (--timeout)"),
+            settings
+                .timeout
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("limit (--limit)"),
+            display_template_editor_text(app, 10, settings.limit.as_deref().unwrap_or("unset")),
+        ),
+        (
+            String::from("tags (--tags)"),
+            display_template_editor_text(app, 11, settings.tags.as_deref().unwrap_or("unset")),
+        ),
+        (
+            String::from("extra-vars (--extra-vars)"),
+            display_template_editor_text(
+                app,
+                12,
+                settings.extra_vars.as_deref().unwrap_or("unset"),
+            ),
+        ),
+        (
+            String::from("additional args (appended)"),
+            display_template_editor_text(
+                app,
+                13,
+                settings.extra_args.as_deref().unwrap_or("unset"),
+            ),
+        ),
+        (
+            String::from("ssh private key file (--private-key)"),
+            display_template_editor_text(
+                app,
+                14,
+                settings.ssh_private_key_file.as_deref().unwrap_or("unset"),
+            ),
+        ),
+        (
+            String::from("ssh private key inline"),
+            display_template_editor_inline_key_text(
+                app,
+                15,
+                settings.ssh_private_key_inline.as_deref(),
+            ),
+        ),
+    ]
+}
+
 fn settings_rows(app: &App, settings: &PlaybookSettings) -> Vec<(String, String)> {
     vec![
         (String::from("check (--check)"), settings.check.to_string()),
@@ -2361,10 +2771,25 @@ fn active_help_text(app: &App) -> String {
             "Keys: j/k field | h/l or <-/-> adjust | Enter or e edit text | space toggle | Esc or t close",
         );
     }
-
+    if app.template_editor_open {
+        if app.template_editor_text_mode {
+            return if app.template_editor_is_multiline_field() {
+                String::from(
+                    "Keys: Type text | Enter newline | Ctrl+S save | Backspace edit | Esc cancel",
+                )
+            } else {
+                String::from(
+                    "Keys: Type text | Enter save | Ctrl+S save template | Backspace edit | Esc cancel",
+                )
+            };
+        }
+        return String::from(
+            "Keys: j/k field | h/l or <-/-> adjust | Enter or e edit text | space toggle | Ctrl+S save | Esc close",
+        );
+    }
     match app.current_view() {
         View::Dashboard => {
-            String::from("Keys: Tab/h/l views | r run selected playbook+inventory | u runtime picker | q quit")
+            String::from("Keys: Tab/h/l views | r run selected template | u runtime picker | q quit")
         }
         View::Projects => String::from(
             "Keys: j/k or Up/Down select project | Enter/a activate | n new | f import path | g clone git | e ssh key settings | Shift+D delete selected (confirm) | i inventory sync | v vars sync | Tab/h/l views | q quit",
@@ -2380,6 +2805,17 @@ fn active_help_text(app: &App) -> String {
             } else {
                 String::from(
                     "Keys: j/k or Up/Down move focused list | PgUp/PgDn scroll logs | End follow latest | <-/-> focus playbooks/runs | Shift+J/K switch runs | i/I inventory target | r run | t playbook settings | v log-select | Tab/h/l views | q quit",
+                )
+            }
+        }
+        View::Templates => {
+            if app.log_select_mode {
+                String::from(
+                    "Keys: j/k select log lines | PgUp/PgDn scroll logs | End follow latest | space mark | y copy | v exit log-select | Left/Right focus templates/runs | Shift+J/K switch runs | r run | t/e edit | n new | Shift+D delete | q quit",
+                )
+            } else {
+                String::from(
+                    "Keys: j/k move focused list | PgUp/PgDn scroll logs | End follow latest | Left/Right focus templates/runs | Shift+J/K switch runs | r run | t/e edit | n new | Shift+D delete | v log-select | q quit",
                 )
             }
         }
@@ -2468,6 +2904,113 @@ fn settings_preview_rows(
     ]
 }
 
+fn template_settings_preview_rows(
+    app: &App,
+    template: &crate::job_template::JobTemplate,
+) -> Vec<(String, String)> {
+    let mut rows = vec![
+        (String::from("template"), template.name.clone()),
+        (String::from("playbook"), template.playbook.clone()),
+        (String::from("inventory"), template.inventory.clone()),
+        (String::from("scope"), String::from("active project")),
+        (String::from("check"), template.check.to_string()),
+        (String::from("diff"), template.diff.to_string()),
+        (String::from("become"), template.become_enabled.to_string()),
+        (String::from("verbosity"), template.verbosity.to_string()),
+        (
+            String::from("forks"),
+            template
+                .forks
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("timeout"),
+            template
+                .timeout
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("limit"),
+            template
+                .limit
+                .clone()
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("tags"),
+            template
+                .tags
+                .clone()
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("extra-vars"),
+            template
+                .extra_vars
+                .clone()
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("additional args"),
+            template
+                .extra_args
+                .clone()
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("ssh_key_file"),
+            template
+                .ssh_private_key_file
+                .clone()
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("ssh_key_inline"),
+            summarize_inline_key(template.ssh_private_key_inline.as_deref()),
+        ),
+    ];
+
+    match app.template_effective_context(template) {
+        Ok(context) => {
+            rows.push((
+                String::from("effective inventory"),
+                format!("{} ({})", context.inventory, context.inventory_source),
+            ));
+            rows.push((
+                String::from("effective vars files"),
+                if context.vars_files.is_empty() {
+                    String::from("none")
+                } else {
+                    context.vars_files.join(", ")
+                },
+            ));
+            rows.push((
+                String::from("effective ssh key"),
+                if context.has_inline_ssh_key {
+                    format!("inline ({})", context.ssh_key_source)
+                } else {
+                    context
+                        .ssh_private_key_file
+                        .clone()
+                        .map(|path| format!("{path} ({})", context.ssh_key_source))
+                        .unwrap_or_else(|| String::from("unset"))
+                },
+            ));
+            if !context.warnings.is_empty() {
+                rows.push((
+                    String::from("context warnings"),
+                    context.warnings.join(" | "),
+                ));
+            }
+        }
+        Err(err) => rows.push((String::from("context error"), err)),
+    }
+
+    rows
+}
+
 fn display_setting_text(app: &App, idx: usize, current: &str) -> String {
     if app.settings_editor_text_mode && app.settings_editor_field_idx == idx {
         if app.settings_editor_text_buffer.is_empty() {
@@ -2480,10 +3023,38 @@ fn display_setting_text(app: &App, idx: usize, current: &str) -> String {
     }
 }
 
+fn display_template_editor_text(app: &App, idx: usize, current: &str) -> String {
+    if app.template_editor_text_mode && app.template_editor_field_idx == idx {
+        if app.template_editor_text_buffer.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.template_editor_text_buffer)
+        }
+    } else {
+        current.to_string()
+    }
+}
+
 fn display_setting_inline_key_text(app: &App, idx: usize, current: Option<&str>) -> String {
     if app.settings_editor_text_mode && app.settings_editor_field_idx == idx {
         let escaped = app
             .settings_editor_text_buffer
+            .replace('\n', "\\n")
+            .replace('\t', "\\t");
+        if escaped.is_empty() {
+            String::from("|")
+        } else {
+            format!("{escaped}|")
+        }
+    } else {
+        summarize_inline_key(current)
+    }
+}
+
+fn display_template_editor_inline_key_text(app: &App, idx: usize, current: Option<&str>) -> String {
+    if app.template_editor_text_mode && app.template_editor_field_idx == idx {
+        let escaped = app
+            .template_editor_text_buffer
             .replace('\n', "\\n")
             .replace('\t', "\\t");
         if escaped.is_empty() {
@@ -2596,6 +3167,66 @@ fn render_ranked_bar_panel(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(th::SURFACE1))
                 .title(title),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
+}
+
+fn render_environment_breakdown_panel(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    runs_by_environment: &BTreeMap<String, u64>,
+    successes_by_environment: &BTreeMap<String, u64>,
+) {
+    let mut lines = Vec::new();
+    if runs_by_environment.is_empty() {
+        lines.push(Line::styled(
+            "No environment-tagged runs yet.",
+            Style::default().fg(th::SUBTEXT0),
+        ));
+    } else {
+        let mut pairs = runs_by_environment
+            .iter()
+            .map(|(env, count)| (env.clone(), *count))
+            .collect::<Vec<_>>();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let max_count = pairs.iter().map(|(_, count)| *count).max().unwrap_or(1);
+        let bar_width = area.width.saturating_sub(12) as usize;
+
+        for (env, count) in pairs.into_iter().take(6) {
+            let success_count = successes_by_environment.get(&env).copied().unwrap_or(0);
+            let success_pct = if count == 0 {
+                0
+            } else {
+                ((success_count as f64 / count as f64) * 100.0).round() as u16
+            };
+            let fill = if bar_width == 0 {
+                0
+            } else {
+                (((count as f64 / max_count as f64) * bar_width as f64).round() as usize).max(1)
+            };
+            let color = th::SUBTEXT1;
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", env.to_uppercase()),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("█".repeat(fill), Style::default().fg(color)),
+                Span::styled(
+                    format!(" {count} ({success_pct}%)"),
+                    Style::default().fg(th::SUBTEXT1),
+                ),
+            ]));
+        }
+    }
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(th::SURFACE1))
+                .title("Environment Breakdown"),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(panel, area);

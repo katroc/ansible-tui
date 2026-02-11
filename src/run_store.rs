@@ -33,7 +33,9 @@ pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
             status || char(31) || \
             started_at || char(31) || \
             COALESCE(finished_at, '') || char(31) || \
-            COALESCE(exit_code, '') \
+            COALESCE(exit_code, '') || char(31) || \
+            COALESCE(hex(template_id), '') || char(31) || \
+            COALESCE(hex(environment), '') \
          FROM runs \
          ORDER BY id DESC \
          LIMIT {MAX_PERSISTED_RUNS};"
@@ -46,7 +48,7 @@ pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
             continue;
         }
         let fields = split_fields(line);
-        if fields.len() != 7 {
+        if fields.len() < 7 {
             continue;
         }
         let Ok(id) = fields[0].parse::<u64>() else {
@@ -74,6 +76,20 @@ pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
         } else {
             fields[6].parse::<i32>().ok()
         };
+        let template_id = if fields.len() > 7 && !fields[7].is_empty() {
+            decode_hex(fields[7])
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+        } else {
+            None
+        };
+        let environment = if fields.len() > 8 && !fields[8].is_empty() {
+            decode_hex(fields[8])
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+        } else {
+            None
+        };
 
         let playbook =
             String::from_utf8(playbook_bytes).map_err(|err| io::Error::other(err.to_string()))?;
@@ -90,6 +106,8 @@ pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
             finished_at,
             exit_code,
             logs,
+            template_id,
+            environment,
         });
     }
 
@@ -113,17 +131,29 @@ pub fn save_run(cwd: &Path, run: &RunRecord) -> io::Result<()> {
         .exit_code
         .map(|v| v.to_string())
         .unwrap_or_else(|| String::from("NULL"));
+    let template_id = run
+        .template_id
+        .as_deref()
+        .map(sql_quote)
+        .unwrap_or_else(|| String::from("NULL"));
+    let env = run
+        .environment
+        .as_deref()
+        .map(sql_quote)
+        .unwrap_or_else(|| String::from("NULL"));
     let mut sql = format!(
         "BEGIN; \
-         INSERT INTO runs (id, playbook, inventory, status, started_at, finished_at, exit_code) \
-         VALUES ({id}, {playbook}, {inventory}, {status}, {started}, {finished}, {exit_code}) \
+         INSERT INTO runs (id, playbook, inventory, status, started_at, finished_at, exit_code, template_id, environment) \
+         VALUES ({id}, {playbook}, {inventory}, {status}, {started}, {finished}, {exit_code}, {template_id}, {env}) \
          ON CONFLICT(id) DO UPDATE SET \
             playbook=excluded.playbook, \
             inventory=excluded.inventory, \
             status=excluded.status, \
             started_at=excluded.started_at, \
             finished_at=excluded.finished_at, \
-            exit_code=excluded.exit_code; \
+            exit_code=excluded.exit_code, \
+            template_id=excluded.template_id, \
+            environment=excluded.environment; \
          DELETE FROM run_logs WHERE run_id={id};",
         id = run.id,
         playbook = sql_quote(&run.playbook),
@@ -131,7 +161,9 @@ pub fn save_run(cwd: &Path, run: &RunRecord) -> io::Result<()> {
         status = sql_quote(run.status.as_str()),
         started = sql_quote(&run.started_at.to_rfc3339()),
         finished = finished_at,
-        exit_code = exit_code
+        exit_code = exit_code,
+        template_id = template_id,
+        env = env,
     );
 
     for (seq, line) in run.logs.iter().enumerate() {
@@ -203,7 +235,20 @@ fn ensure_schema(cwd: &Path) -> io::Result<()> {
             PRIMARY KEY (run_id, seq)
          );
          CREATE INDEX IF NOT EXISTS idx_run_logs_run_id_seq ON run_logs(run_id, seq);",
-    )
+    )?;
+    migrate_add_template_columns(cwd)
+}
+
+fn migrate_add_template_columns(cwd: &Path) -> io::Result<()> {
+    let info = run_sql_query(cwd, "PRAGMA table_info(runs);")?;
+    if !info.contains("template_id") {
+        run_sql_exec(
+            cwd,
+            "ALTER TABLE runs ADD COLUMN template_id TEXT;
+             ALTER TABLE runs ADD COLUMN environment TEXT;",
+        )?;
+    }
+    Ok(())
 }
 
 fn migrate_from_tsv_if_needed(cwd: &Path) -> io::Result<()> {

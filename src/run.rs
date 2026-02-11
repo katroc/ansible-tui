@@ -23,6 +23,7 @@ pub struct RunOptions {
     pub timeout: Option<u16>,
     pub limit: Option<String>,
     pub tags: Option<String>,
+    pub extra_vars_files: Vec<String>,
     pub extra_vars: Option<String>,
     pub extra_args: Option<String>,
     pub ssh_private_key_file: Option<String>,
@@ -45,6 +46,7 @@ impl RunOptions {
             timeout: env_var("ANSIBLE_TUI_TIMEOUT").and_then(|v| v.parse::<u16>().ok()),
             limit: env_var("ANSIBLE_TUI_LIMIT"),
             tags: env_var("ANSIBLE_TUI_TAGS"),
+            extra_vars_files: Vec::new(),
             extra_vars: env_var("ANSIBLE_TUI_EXTRA_VARS"),
             extra_args: env_var("ANSIBLE_TUI_EXTRA_ARGS"),
             ssh_private_key_file: None,
@@ -60,6 +62,8 @@ pub struct RunRequest {
     pub playbook: String,
     pub inventory: String,
     pub options: RunOptions,
+    pub template_id: Option<String>,
+    pub environment: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +80,8 @@ pub fn spawn_ansible_run(req: RunRequest, tx: UnboundedSender<Action>) {
                 run_id: req.run_id,
                 playbook: req.playbook.clone(),
                 inventory: req.inventory.clone(),
+                template_id: req.template_id.clone(),
+                environment: req.environment.clone(),
             })
             .is_err()
         {
@@ -244,7 +250,7 @@ fn build_args(req: &RunRequest, inline_key_path: Option<&Path>) -> Vec<String> {
         args.push(path.to_string_lossy().to_string());
     } else if let Some(path) = &req.options.ssh_private_key_file {
         args.push(String::from("--private-key"));
-        args.push(resolve_private_key_path(&req.cwd, path));
+        args.push(resolve_run_path(&req.cwd, path));
     }
 
     if req.options.check {
@@ -274,6 +280,10 @@ fn build_args(req: &RunRequest, inline_key_path: Option<&Path>) -> Vec<String> {
     if let Some(tags) = &req.options.tags {
         args.push(String::from("--tags"));
         args.push(tags.clone());
+    }
+    for vars_file in &req.options.extra_vars_files {
+        args.push(String::from("--extra-vars"));
+        args.push(format!("@{}", resolve_run_path(&req.cwd, vars_file)));
     }
     if let Some(extra_vars) = &req.options.extra_vars {
         args.push(String::from("--extra-vars"));
@@ -341,7 +351,7 @@ fn prepare_inline_private_key_file(req: &RunRequest) -> io::Result<Option<TempKe
     Ok(Some(TempKeyFile { path: key_path }))
 }
 
-fn resolve_private_key_path(cwd: &Path, raw: &str) -> String {
+fn resolve_run_path(cwd: &Path, raw: &str) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
         return raw.to_string();

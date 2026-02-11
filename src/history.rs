@@ -60,9 +60,12 @@ fn format_line(run: &RunRecord) -> String {
     let playbook = escape(&run.playbook);
     let inventory = escape(&run.inventory);
 
+    let template_id = run.template_id.as_deref().map(escape).unwrap_or_default();
+    let environment = run.environment.as_deref().map(escape).unwrap_or_default();
+
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        run.id, status, started, finished, exit_code, playbook, inventory
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        run.id, status, started, finished, exit_code, playbook, inventory, template_id, environment
     )
 }
 
@@ -76,6 +79,9 @@ fn parse_line(line: &str) -> Option<RunRecord> {
     let playbook = unescape(fields.next().unwrap_or_default());
     let inventory = unescape(fields.next().unwrap_or_default());
 
+    let template_id = parse_opt_escaped(fields.next().unwrap_or_default());
+    let environment = parse_opt_escaped(fields.next().unwrap_or_default());
+
     Some(RunRecord {
         id,
         playbook,
@@ -85,6 +91,8 @@ fn parse_line(line: &str) -> Option<RunRecord> {
         finished_at,
         exit_code,
         logs: Vec::new(),
+        template_id,
+        environment,
     })
 }
 
@@ -116,6 +124,16 @@ fn parse_optional_i32(raw: &str) -> Option<i32> {
         None
     } else {
         raw.parse::<i32>().ok()
+    }
+}
+
+fn parse_opt_escaped(raw: &str) -> Option<String> {
+    let s = unescape(raw);
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 

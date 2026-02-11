@@ -48,10 +48,15 @@ pub enum Action {
     },
     RefreshProject,
     StartRun,
+    StartTemplateRun,
+    SaveTemplate,
+    DeleteTemplate,
     RunStarted {
         run_id: u64,
         playbook: String,
         inventory: String,
+        template_id: Option<String>,
+        environment: Option<String>,
     },
     RunLog {
         run_id: u64,
