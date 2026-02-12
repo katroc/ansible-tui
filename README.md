@@ -33,7 +33,7 @@ Foundation-first Rust TUI for Ansible operations.
 ## Keybindings
 
 - `Tab`: switch view (or move to next field in vault password prompt)
-- `h`/`l`: switch view (except in Settings tab where they adjust selected setting)
+- `h`/`l`: switch view (except in split/field-focused contexts where they move focus or adjust values)
 - `j`/`k` or `Up`/`Down`: move selection in the focused list
 - `n` (Inventory tab): create a new inventory file under `./inventories`
 - `g` (Inventory tab): open guided YAML inventory builder (new inventory)
@@ -47,6 +47,7 @@ Foundation-first Rust TUI for Ansible operations.
 - `Shift+P` (Projects tab): create a vault password file from inside the app (sets vault source to `file`)
 - Guided builder flow: select target in Group Tree, then attach/detach available groups or hosts with `space`/`d` (`Enter` also toggles attach)
 - `Left`/`Right` (Playbooks tab): switch focus between Playbooks and Runs lists
+- `Enter` (Playbooks/Templates tab): toggle focus between list and runs pane
 - `Shift+J`/`Shift+K` (Playbooks tab): alternate run selection shortcuts
 - `i`/`I` (Playbooks tab): cycle inventory target for selected playbook
 - `r`: start run from Playbooks context with selected playbook + inventory
@@ -56,6 +57,7 @@ Foundation-first Rust TUI for Ansible operations.
 - `Left/Right` or `h/l` (Settings tab): adjust selected boolean/numeric setting
 - `Space`: toggle selected boolean in Playbook/Global settings editors
 - `Backspace`: delete while editing a text field
+- `?`: toggle keyboard help overlay for the current context (`Esc` or `?` closes)
 - `v`: toggle log select mode (selection constrained to Live Logs)
 - `PgUp`/`PgDn`: scroll Live Logs (also works via mouse wheel over logs)
 - `End`: return Live Logs to follow-latest mode

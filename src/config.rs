@@ -75,7 +75,9 @@ pub fn save_app_config(cwd: &Path, config: &AppConfig) -> io::Result<()> {
         .map_err(sqlite_to_io)?;
 
     if let Some(ref v) = config.ansible_bin {
-        insert.execute(params!["ansible_bin", v]).map_err(sqlite_to_io)?;
+        insert
+            .execute(params!["ansible_bin", v])
+            .map_err(sqlite_to_io)?;
     }
     if let Some(v) = config.check {
         insert
@@ -179,7 +181,11 @@ fn migrate_from_env_if_needed(cwd: &Path, conn: &rusqlite::Connection) -> io::Re
 }
 
 fn bool_str(v: bool) -> &'static str {
-    if v { "1" } else { "0" }
+    if v {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 fn parse_opt_string(value: &str) -> Option<String> {

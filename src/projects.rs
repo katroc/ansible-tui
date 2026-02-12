@@ -65,8 +65,19 @@ pub fn load_projects(cwd: &Path) -> io::Result<ProjectRegistry> {
     let mut saw_active = false;
 
     for row in rows {
-        let (_idx, name, root_str, inv_sync, vars_sync, ssh_key_file, ssh_key_inline, vault_type, vault_pass, vault_label, is_active) =
-            row.map_err(sqlite_to_io)?;
+        let (
+            _idx,
+            name,
+            root_str,
+            inv_sync,
+            vars_sync,
+            ssh_key_file,
+            ssh_key_inline,
+            vault_type,
+            vault_pass,
+            vault_label,
+            is_active,
+        ) = row.map_err(sqlite_to_io)?;
 
         let root = resolve_root(cwd, &root_str);
         let inferred_name = if name.is_empty() {
@@ -113,7 +124,8 @@ pub fn load_projects(cwd: &Path) -> io::Result<ProjectRegistry> {
 pub fn save_projects(cwd: &Path, registry: &ProjectRegistry) -> io::Result<()> {
     let conn = open_projects_db(cwd)?;
     let tx = conn.unchecked_transaction().map_err(sqlite_to_io)?;
-    tx.execute("DELETE FROM projects", []).map_err(sqlite_to_io)?;
+    tx.execute("DELETE FROM projects", [])
+        .map_err(sqlite_to_io)?;
 
     let mut insert = tx
         .prepare(

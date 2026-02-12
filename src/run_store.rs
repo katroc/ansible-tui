@@ -44,8 +44,16 @@ pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
 
     let mut out = Vec::new();
     for row in rows {
-        let (id, playbook, inventory, status_str, started_str, finished_str, exit_code, template_id) =
-            row.map_err(sqlite_to_io)?;
+        let (
+            id,
+            playbook,
+            inventory,
+            status_str,
+            started_str,
+            finished_str,
+            exit_code,
+            template_id,
+        ) = row.map_err(sqlite_to_io)?;
         let Some(status) = parse_status(&status_str) else {
             continue;
         };
@@ -100,8 +108,11 @@ pub fn save_run(cwd: &Path, run: &RunRecord) -> io::Result<()> {
     )
     .map_err(sqlite_to_io)?;
 
-    tx.execute("DELETE FROM run_logs WHERE run_id=?1", params![run.id as i64])
-        .map_err(sqlite_to_io)?;
+    tx.execute(
+        "DELETE FROM run_logs WHERE run_id=?1",
+        params![run.id as i64],
+    )
+    .map_err(sqlite_to_io)?;
 
     {
         let mut insert_log = tx
@@ -135,8 +146,8 @@ pub fn take_legacy_environment_migration_notice(cwd: &Path) -> io::Result<Option
         return Ok(None);
     }
 
-    let has_legacy = sqlite_store_has_legacy_environment_column(cwd)?
-        || tsv_has_legacy_environment_field(cwd)?;
+    let has_legacy =
+        sqlite_store_has_legacy_environment_column(cwd)? || tsv_has_legacy_environment_field(cwd)?;
     if !has_legacy {
         return Ok(None);
     }
@@ -232,7 +243,10 @@ fn migrate_add_template_column(conn: &rusqlite::Connection) -> io::Result<()> {
         .prepare("PRAGMA table_info(runs)")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| row.get::<_, String>(1))
-                .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == "template_id"))
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .any(|name| name == "template_id")
+                })
         })
         .unwrap_or(false);
     if !has_col {
@@ -330,7 +344,10 @@ fn sqlite_store_has_legacy_environment_column(cwd: &Path) -> io::Result<bool> {
         .prepare("PRAGMA table_info(runs)")
         .and_then(|mut stmt| {
             stmt.query_map([], |row| row.get::<_, String>(1))
-                .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == "environment"))
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .any(|name| name == "environment")
+                })
         })
         .unwrap_or(false);
     Ok(has_col)
@@ -407,7 +424,11 @@ fn parse_tsv_line(line: &str) -> Option<RunRecord> {
     let inventory = tsv_unescape(fields[6]);
     let template_id = fields.get(7).and_then(|v| {
         let s = tsv_unescape(v).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     });
 
     Some(RunRecord {

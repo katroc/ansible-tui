@@ -81,8 +81,21 @@ pub fn load_playbook_settings(cwd: &Path) -> io::Result<BTreeMap<String, Playboo
 
     let mut out = BTreeMap::new();
     for row in rows {
-        let (path, check, diff, become_enabled, verbosity, forks, timeout, limit, tags, extra_vars, extra_args, ssh_key_file, ssh_key_inline) =
-            row.map_err(sqlite_to_io)?;
+        let (
+            path,
+            check,
+            diff,
+            become_enabled,
+            verbosity,
+            forks,
+            timeout,
+            limit,
+            tags,
+            extra_vars,
+            extra_args,
+            ssh_key_file,
+            ssh_key_inline,
+        ) = row.map_err(sqlite_to_io)?;
         out.insert(
             path,
             PlaybookSettings {
