@@ -10,7 +10,6 @@ pub struct JobTemplate {
     pub name: String,
     pub playbook: String,
     pub inventory: String,
-    pub environment: Option<String>,
     pub check: bool,
     pub diff: bool,
     pub become_enabled: bool,
@@ -32,7 +31,6 @@ impl JobTemplate {
             name: name.to_string(),
             playbook: String::new(),
             inventory: String::new(),
-            environment: None,
             check: false,
             diff: false,
             become_enabled: false,
@@ -129,20 +127,19 @@ pub fn save_job_templates(cwd: &Path, templates: &[JobTemplate]) -> io::Result<(
     fs::write(path, out)
 }
 
-// TSV format (17 fields):
-// id, name, playbook, inventory, environment,
+// TSV format (16 fields):
+// id, name, playbook, inventory,
 // check, diff, become_enabled, verbosity,
 // forks, timeout, limit, tags, extra_vars, extra_args,
 // ssh_private_key_file, ssh_private_key_inline
 
 fn format_line(t: &JobTemplate) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         escape(&t.id),
         escape(&t.name),
         escape(&t.playbook),
         escape(&t.inventory),
-        escape_opt(&t.environment),
         bool_to_u8(t.check),
         bool_to_u8(t.diff),
         bool_to_u8(t.become_enabled),
@@ -159,38 +156,63 @@ fn format_line(t: &JobTemplate) -> String {
 }
 
 fn parse_line(line: &str) -> Option<JobTemplate> {
-    let mut fields = line.split('\t');
-    let id = unescape(fields.next()?);
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() < 16 {
+        return None;
+    }
+
+    let mut idx = 0;
+    let id = unescape(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
     if id.is_empty() {
         return None;
     }
-    let name = unescape(fields.next().unwrap_or_default());
-    let playbook = unescape(fields.next().unwrap_or_default());
-    let inventory = unescape(fields.next().unwrap_or_default());
-    let environment = parse_opt_string(fields.next().unwrap_or_default());
-    let check = parse_bool(fields.next().unwrap_or_default());
-    let diff = parse_bool(fields.next().unwrap_or_default());
-    let become_enabled = parse_bool(fields.next().unwrap_or_default());
+    let name = unescape(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let playbook = unescape(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let inventory = unescape(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+
+    // Backward compatibility: legacy rows included an `environment` field after inventory.
+    if fields.len() >= 17 {
+        idx += 1;
+    }
+
+    let check = parse_bool(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let diff = parse_bool(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let become_enabled = parse_bool(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
     let verbosity = fields
-        .next()
+        .get(idx)
+        .copied()
         .and_then(|v| v.parse::<u8>().ok())
         .unwrap_or(0)
         .min(4);
-    let forks = parse_opt_u16(fields.next().unwrap_or_default());
-    let timeout = parse_opt_u16(fields.next().unwrap_or_default());
-    let limit = parse_opt_string(fields.next().unwrap_or_default());
-    let tags = parse_opt_string(fields.next().unwrap_or_default());
-    let extra_vars = parse_opt_string(fields.next().unwrap_or_default());
-    let extra_args = parse_opt_string(fields.next().unwrap_or_default());
-    let ssh_private_key_file = parse_opt_string(fields.next().unwrap_or_default());
-    let ssh_private_key_inline = parse_opt_string(fields.next().unwrap_or_default());
+    idx += 1;
+    let forks = parse_opt_u16(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let timeout = parse_opt_u16(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let limit = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let tags = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let extra_vars = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let extra_args = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let ssh_private_key_file = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let ssh_private_key_inline = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
 
     Some(JobTemplate {
         id,
         name,
         playbook,
         inventory,
-        environment,
         check,
         diff,
         become_enabled,
@@ -281,7 +303,6 @@ mod tests {
                 name: String::from("Deploy Web"),
                 playbook: String::from("playbooks/deploy.yml"),
                 inventory: String::from("inventory/prod.yml"),
-                environment: Some(String::from("prod")),
                 check: false,
                 diff: true,
                 become_enabled: true,
@@ -300,7 +321,6 @@ mod tests {
                 name: String::from("Simple"),
                 playbook: String::from("site.yml"),
                 inventory: String::from("hosts"),
-                environment: None,
                 check: false,
                 diff: false,
                 become_enabled: false,
@@ -319,7 +339,6 @@ mod tests {
                 name: String::from("Has\ttab\nand\nnewline"),
                 playbook: String::from("play\tbook.yml"),
                 inventory: String::from("inv\\entory"),
-                environment: Some(String::from("dev")),
                 check: true,
                 diff: false,
                 become_enabled: false,
@@ -356,7 +375,6 @@ mod tests {
             assert_eq!(original.name, restored.name);
             assert_eq!(original.playbook, restored.playbook);
             assert_eq!(original.inventory, restored.inventory);
-            assert_eq!(original.environment, restored.environment);
             assert_eq!(original.check, restored.check);
             assert_eq!(original.diff, restored.diff);
             assert_eq!(original.become_enabled, restored.become_enabled);
@@ -373,6 +391,43 @@ mod tests {
                 restored.ssh_private_key_inline
             );
         }
+    }
+
+    #[test]
+    fn test_parse_legacy_environment_field() {
+        let legacy = [
+            "legacy-1",
+            "Legacy Template",
+            "playbooks/site.yml",
+            "inventories/prod.yml",
+            "prod",
+            "1",
+            "0",
+            "1",
+            "3",
+            "20",
+            "90",
+            "web",
+            "deploy",
+            "{\"dry_run\":false}",
+            "--check",
+            "~/.ssh/key",
+            "inline-key",
+        ]
+        .join("\t");
+
+        let parsed = parse_line(&legacy).expect("legacy row should parse");
+        assert_eq!(parsed.id, "legacy-1");
+        assert_eq!(parsed.name, "Legacy Template");
+        assert_eq!(parsed.inventory, "inventories/prod.yml");
+        assert!(parsed.check);
+        assert!(!parsed.diff);
+        assert!(parsed.become_enabled);
+        assert_eq!(parsed.verbosity, 3);
+        assert_eq!(parsed.forks, Some(20));
+        assert_eq!(parsed.timeout, Some(90));
+        assert_eq!(parsed.ssh_private_key_file.as_deref(), Some("~/.ssh/key"));
+        assert_eq!(parsed.ssh_private_key_inline.as_deref(), Some("inline-key"));
     }
 
     #[test]

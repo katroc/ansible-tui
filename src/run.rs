@@ -60,10 +60,10 @@ pub struct RunRequest {
     pub run_id: u64,
     pub cwd: PathBuf,
     pub playbook: String,
+    pub command_playbook: Option<String>,
     pub inventory: String,
     pub options: RunOptions,
     pub template_id: Option<String>,
-    pub environment: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +81,6 @@ pub fn spawn_ansible_run(req: RunRequest, tx: UnboundedSender<Action>) {
                 playbook: req.playbook.clone(),
                 inventory: req.inventory.clone(),
                 template_id: req.template_id.clone(),
-                environment: req.environment.clone(),
             })
             .is_err()
         {
@@ -297,7 +296,12 @@ fn build_args(req: &RunRequest, inline_key_path: Option<&Path>) -> Vec<String> {
         );
     }
 
-    args.push(req.playbook.clone());
+    args.push(
+        req.command_playbook
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| req.playbook.clone()),
+    );
     args
 }
 

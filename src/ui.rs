@@ -69,16 +69,16 @@ fn render_body(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         return;
     }
 
-    if app.current_view() == View::Inventory
+    let constraints = if app.current_view() == View::Inventory
         && !matches!(app.inventory_sub_tab, InventorySubTab::Files)
     {
-        render_main(frame, app, area);
-        return;
-    }
-
+        [Constraint::Percentage(65), Constraint::Percentage(35)]
+    } else {
+        [Constraint::Percentage(40), Constraint::Percentage(60)]
+    };
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints(constraints)
         .split(area);
     render_main(frame, app, columns[0]);
     render_logs(frame, app, columns[1]);
@@ -161,21 +161,9 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let mut runs_by_playbook = BTreeMap::<String, u64>::new();
     let mut runs_by_inventory = BTreeMap::<String, u64>::new();
-    let mut runs_by_environment = BTreeMap::<String, u64>::new();
-    let mut successes_by_environment = BTreeMap::<String, u64>::new();
     for run in &app.runs {
         *runs_by_playbook.entry(run.playbook.clone()).or_insert(0) += 1;
         *runs_by_inventory.entry(run.inventory.clone()).or_insert(0) += 1;
-        if let Some(environment) = run.environment.as_deref() {
-            *runs_by_environment
-                .entry(environment.to_string())
-                .or_insert(0) += 1;
-            if matches!(run.status, RunStatus::Succeeded) {
-                *successes_by_environment
-                    .entry(environment.to_string())
-                    .or_insert(0) += 1;
-            }
-        }
     }
     let (top_playbooks, playbook_max) = top_ranked_items(&runs_by_playbook, 6);
     let (top_inventories, inventory_max) = top_ranked_items(&runs_by_inventory, 6);
@@ -393,12 +381,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         inventory_max.max(1),
         th::MAUVE,
     );
-    render_environment_breakdown_panel(
-        frame,
-        right[2],
-        &runs_by_environment,
-        &successes_by_environment,
-    );
+    render_project_summary_panel(frame, right[2], app, running, succeeded, failed, total_runs);
 }
 
 fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -783,15 +766,22 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
         ];
 
         for (i, (key, value)) in fields.iter().enumerate() {
-            let display_val = if app.hosts_subtab_editing
+            let is_editing_field = app.hosts_subtab_editing
                 && app.hosts_subtab_focus_detail
-                && app.hosts_subtab_field_idx == i
-            {
-                format!("{}|", app.hosts_subtab_edit_buffer)
+                && app.hosts_subtab_field_idx == i;
+            let value_cell = if is_editing_field {
+                Cell::from(format!("{}|", app.hosts_subtab_edit_buffer))
+            } else if value.is_empty() {
+                Cell::from(Line::from(Span::styled(
+                    host_field_placeholder(*key),
+                    Style::default()
+                        .fg(th::SUBTEXT0)
+                        .add_modifier(Modifier::ITALIC),
+                )))
             } else {
-                value.clone()
+                Cell::from(value.clone())
             };
-            rows.push(Row::new(vec![Cell::from(*key), Cell::from(display_val)]));
+            rows.push(Row::new(vec![Cell::from(*key), value_cell]));
         }
 
         if let Some(v) = vars {
@@ -803,18 +793,22 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
             }
             for (ci, (key, value)) in v.custom_vars.iter().enumerate() {
                 let field_i = 4 + ci;
-                let display_val = if app.hosts_subtab_editing
+                let is_editing_field = app.hosts_subtab_editing
                     && app.hosts_subtab_focus_detail
-                    && app.hosts_subtab_field_idx == field_i
-                {
-                    format!("{}|", app.hosts_subtab_edit_buffer)
+                    && app.hosts_subtab_field_idx == field_i;
+                let value_cell = if is_editing_field {
+                    Cell::from(format!("{}|", app.hosts_subtab_edit_buffer))
+                } else if value.is_empty() {
+                    Cell::from(Line::from(Span::styled(
+                        "e.g. value",
+                        Style::default()
+                            .fg(th::SUBTEXT0)
+                            .add_modifier(Modifier::ITALIC),
+                    )))
                 } else {
-                    value.clone()
+                    Cell::from(value.clone())
                 };
-                rows.push(Row::new(vec![
-                    Cell::from(key.as_str()),
-                    Cell::from(display_val),
-                ]));
+                rows.push(Row::new(vec![Cell::from(key.as_str()), value_cell]));
             }
         }
 
@@ -904,11 +898,21 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
     }
 
     let hint = Paragraph::new(
-        "h/l focus | j/k nav | e edit | n add host | a add var | D delete | Ctrl+S save | Esc back",
+        "h/l focus | j/k nav | e edit | p ping host | n add host | a add var | D delete | Ctrl+S save | Esc back",
     )
     .style(Style::default().fg(th::SUBTEXT0))
     .wrap(Wrap { trim: true });
     frame.render_widget(hint, layout[1]);
+}
+
+fn host_field_placeholder(key: &str) -> &'static str {
+    match key {
+        "ansible_host" => "e.g. 192.0.2.10",
+        "ansible_user" => "e.g. ubuntu",
+        "ansible_port" => "e.g. 22",
+        "ansible_connection" => "e.g. ssh",
+        _ => "e.g. value",
+    }
 }
 
 fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -1159,7 +1163,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
 
     let target_label = app.groups_subtab_target_group.as_deref().unwrap_or("all");
     let hint = Paragraph::new(format!(
-        "Target: {target_label} | h/l focus | j/k nav | Space toggle | n add | d detach | D delete | Ctrl+S save | Esc back",
+        "Target: {target_label} | h/l focus | j/k nav | Space toggle | p ping target | n add | d detach | D delete | Ctrl+S save | Esc back",
     ))
     .style(Style::default().fg(th::SUBTEXT0))
     .wrap(Wrap { trim: true });
@@ -1221,23 +1225,13 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                     .exit_code
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| String::from("-"));
-                let mut spans = vec![Span::raw(format!(
+                ListItem::new(Line::from(Span::raw(format!(
                     "#{:03} {:>9} code:{:<4} {}",
                     run.id,
                     run.status.as_str(),
                     code,
                     run.started_at.format("%H:%M:%S")
-                ))];
-                if let Some(env) = run.environment.as_deref() {
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::styled(
-                        format!("[{}]", env.to_uppercase()),
-                        Style::default()
-                            .fg(th::SUBTEXT0)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-                ListItem::new(Line::from(spans))
+                ))))
             })
             .collect::<Vec<_>>()
     };
@@ -1250,7 +1244,10 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 } else {
                     Style::default().fg(th::SURFACE1)
                 })
-                .title("Runs For Selected Playbook"),
+                .title(format!(
+                    "Runs For Selected Playbook ({})",
+                    app.active_project_name()
+                )),
         )
         .highlight_style(Style::default().fg(th::GREEN))
         .highlight_symbol(">> ");
@@ -2794,9 +2791,17 @@ fn active_help_text(app: &App) -> String {
         View::Projects => String::from(
             "Keys: j/k or Up/Down select project | Enter/a activate | n new | f import path | g clone git | e ssh key settings | Shift+D delete selected (confirm) | i inventory sync | v vars sync | Tab/h/l views | q quit",
         ),
-        View::Inventory => String::from(
-            "Keys: j/k or Up/Down select inventory | n new | e edit selected (choose mode) | Shift+D delete selected | PgUp/PgDn scroll logs | End follow latest | Tab/h/l views | q quit",
-        ),
+        View::Inventory => match app.inventory_sub_tab {
+            InventorySubTab::Files => String::from(
+                "Keys: j/k or Up/Down select inventory | n new | e edit selected (choose mode) | Shift+D delete selected | 2 hosts | 3 groups | PgUp/PgDn scroll logs | End follow latest | Tab/h/l views | q quit",
+            ),
+            InventorySubTab::Hosts => String::from(
+                "Keys: h/l focus | j/k nav | e/Enter edit | p ping selected host | n add host | a add var | Shift+D delete | Ctrl+S save | Esc back | Tab/h/l views | q quit",
+            ),
+            InventorySubTab::Groups => String::from(
+                "Keys: h/l focus | j/k nav | Space toggle attach | p ping selected target | n add group/host | d detach | Shift+D delete | Ctrl+S save | Esc back | Tab/h/l views | q quit",
+            ),
+        },
         View::Playbooks => {
             if app.log_select_mode {
                 String::from(
@@ -3172,61 +3177,48 @@ fn render_ranked_bar_panel(
     frame.render_widget(panel, area);
 }
 
-fn render_environment_breakdown_panel(
+fn render_project_summary_panel(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
-    runs_by_environment: &BTreeMap<String, u64>,
-    successes_by_environment: &BTreeMap<String, u64>,
+    app: &App,
+    running: usize,
+    succeeded: usize,
+    failed: usize,
+    total_runs: usize,
 ) {
     let mut lines = Vec::new();
-    if runs_by_environment.is_empty() {
-        lines.push(Line::styled(
-            "No environment-tagged runs yet.",
-            Style::default().fg(th::SUBTEXT0),
-        ));
-    } else {
-        let mut pairs = runs_by_environment
-            .iter()
-            .map(|(env, count)| (env.clone(), *count))
-            .collect::<Vec<_>>();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let max_count = pairs.iter().map(|(_, count)| *count).max().unwrap_or(1);
-        let bar_width = area.width.saturating_sub(12) as usize;
-
-        for (env, count) in pairs.into_iter().take(6) {
-            let success_count = successes_by_environment.get(&env).copied().unwrap_or(0);
-            let success_pct = if count == 0 {
-                0
-            } else {
-                ((success_count as f64 / count as f64) * 100.0).round() as u16
-            };
-            let fill = if bar_width == 0 {
-                0
-            } else {
-                (((count as f64 / max_count as f64) * bar_width as f64).round() as usize).max(1)
-            };
-            let color = th::SUBTEXT1;
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("[{}] ", env.to_uppercase()),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("█".repeat(fill), Style::default().fg(color)),
-                Span::styled(
-                    format!(" {count} ({success_pct}%)"),
-                    Style::default().fg(th::SUBTEXT1),
-                ),
-            ]));
-        }
-    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Project: ",
+            Style::default()
+                .fg(th::SUBTEXT1)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(app.active_project_name(), Style::default().fg(th::TEXT)),
+    ]));
+    lines.push(Line::styled(
+        format!("Total runs: {total_runs}"),
+        Style::default().fg(th::SUBTEXT1),
+    ));
+    lines.push(Line::styled(
+        format!("Succeeded: {succeeded}"),
+        Style::default().fg(th::GREEN),
+    ));
+    lines.push(Line::styled(
+        format!("Failed: {failed}"),
+        Style::default().fg(th::RED),
+    ));
+    lines.push(Line::styled(
+        format!("Running: {running}"),
+        Style::default().fg(th::YELLOW),
+    ));
 
     let panel = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(th::SURFACE1))
-                .title("Environment Breakdown"),
+                .title("Project Summary"),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(panel, area);

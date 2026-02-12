@@ -35,6 +35,7 @@ Foundation-first Rust TUI for Ansible operations.
 - `n` (Inventory tab): create a new inventory file under `./inventories`
 - `g` (Inventory tab): open guided YAML inventory builder (new inventory)
 - `e` (Inventory tab): choose edit mode for selected inventory (guided, external `$VISUAL/$EDITOR`/`vim`, or built-in raw text editor)
+- `p` (Inventory Hosts/Groups sub-tabs): run a quick `ansible.builtin.ping` test for the selected host or group target
 - `Shift+D` (Inventory tab): delete selected inventory (double-press confirmation)
 - `Shift+D` (Projects tab): delete selected project (double-press confirmation, keeps at least one project)
 - `e` (Projects tab): edit selected project's SSH private key settings (file path or inline key)

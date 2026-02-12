@@ -7,11 +7,12 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Local};
 
 use crate::app::{RunRecord, RunStatus};
-use crate::history::{load_run_history, save_run_history};
+use crate::history::{history_has_legacy_environment_field, load_run_history, save_run_history};
 
 const STORE_DIR: &str = ".ansible-tui";
 const STORE_FILE: &str = "history.db";
 const LEGACY_STORE_FILE: &str = "runs.db";
+const LEGACY_ENV_NOTICE_FILE: &str = "legacy-environment-migration-noted";
 const MAX_PERSISTED_RUNS: usize = 500;
 const FIELD_SEP: char = '\u{001f}';
 
@@ -34,8 +35,7 @@ pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
             started_at || char(31) || \
             COALESCE(finished_at, '') || char(31) || \
             COALESCE(exit_code, '') || char(31) || \
-            COALESCE(hex(template_id), '') || char(31) || \
-            COALESCE(hex(environment), '') \
+            COALESCE(hex(template_id), '') \
          FROM runs \
          ORDER BY id DESC \
          LIMIT {MAX_PERSISTED_RUNS};"
@@ -83,13 +83,6 @@ pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
         } else {
             None
         };
-        let environment = if fields.len() > 8 && !fields[8].is_empty() {
-            decode_hex(fields[8])
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok())
-        } else {
-            None
-        };
 
         let playbook =
             String::from_utf8(playbook_bytes).map_err(|err| io::Error::other(err.to_string()))?;
@@ -107,7 +100,6 @@ pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
             exit_code,
             logs,
             template_id,
-            environment,
         });
     }
 
@@ -136,15 +128,10 @@ pub fn save_run(cwd: &Path, run: &RunRecord) -> io::Result<()> {
         .as_deref()
         .map(sql_quote)
         .unwrap_or_else(|| String::from("NULL"));
-    let env = run
-        .environment
-        .as_deref()
-        .map(sql_quote)
-        .unwrap_or_else(|| String::from("NULL"));
     let mut sql = format!(
         "BEGIN; \
-         INSERT INTO runs (id, playbook, inventory, status, started_at, finished_at, exit_code, template_id, environment) \
-         VALUES ({id}, {playbook}, {inventory}, {status}, {started}, {finished}, {exit_code}, {template_id}, {env}) \
+         INSERT INTO runs (id, playbook, inventory, status, started_at, finished_at, exit_code, template_id) \
+         VALUES ({id}, {playbook}, {inventory}, {status}, {started}, {finished}, {exit_code}, {template_id}) \
          ON CONFLICT(id) DO UPDATE SET \
             playbook=excluded.playbook, \
             inventory=excluded.inventory, \
@@ -152,8 +139,7 @@ pub fn save_run(cwd: &Path, run: &RunRecord) -> io::Result<()> {
             started_at=excluded.started_at, \
             finished_at=excluded.finished_at, \
             exit_code=excluded.exit_code, \
-            template_id=excluded.template_id, \
-            environment=excluded.environment; \
+            template_id=excluded.template_id; \
          DELETE FROM run_logs WHERE run_id={id};",
         id = run.id,
         playbook = sql_quote(&run.playbook),
@@ -163,7 +149,6 @@ pub fn save_run(cwd: &Path, run: &RunRecord) -> io::Result<()> {
         finished = finished_at,
         exit_code = exit_code,
         template_id = template_id,
-        env = env,
     );
 
     for (seq, line) in run.logs.iter().enumerate() {
@@ -226,7 +211,8 @@ fn ensure_schema(cwd: &Path) -> io::Result<()> {
             status TEXT NOT NULL,
             started_at TEXT NOT NULL,
             finished_at TEXT,
-            exit_code INTEGER
+            exit_code INTEGER,
+            template_id TEXT
          );
          CREATE TABLE IF NOT EXISTS run_logs (
             run_id INTEGER NOT NULL,
@@ -236,17 +222,13 @@ fn ensure_schema(cwd: &Path) -> io::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_run_logs_run_id_seq ON run_logs(run_id, seq);",
     )?;
-    migrate_add_template_columns(cwd)
+    migrate_add_template_column(cwd)
 }
 
-fn migrate_add_template_columns(cwd: &Path) -> io::Result<()> {
+fn migrate_add_template_column(cwd: &Path) -> io::Result<()> {
     let info = run_sql_query(cwd, "PRAGMA table_info(runs);")?;
     if !info.contains("template_id") {
-        run_sql_exec(
-            cwd,
-            "ALTER TABLE runs ADD COLUMN template_id TEXT;
-             ALTER TABLE runs ADD COLUMN environment TEXT;",
-        )?;
+        run_sql_exec(cwd, "ALTER TABLE runs ADD COLUMN template_id TEXT;")?;
     }
     Ok(())
 }
@@ -337,6 +319,46 @@ fn store_path(cwd: &Path) -> PathBuf {
 
 fn legacy_store_path(cwd: &Path) -> PathBuf {
     cwd.join(STORE_DIR).join(LEGACY_STORE_FILE)
+}
+
+pub fn take_legacy_environment_migration_notice(cwd: &Path) -> io::Result<Option<String>> {
+    let note_path = legacy_environment_notice_path(cwd);
+    if note_path.is_file() {
+        return Ok(None);
+    }
+
+    let has_legacy_environment = sqlite_store_has_legacy_environment_column(cwd)?
+        || history_has_legacy_environment_field(cwd)?;
+    if !has_legacy_environment {
+        return Ok(None);
+    }
+
+    ensure_store_dir(cwd)?;
+    fs::write(note_path, "acknowledged\n")?;
+    Ok(Some(String::from(
+        "Migration note: historical runs remain compatible, but legacy environment labels were removed from history and templates.",
+    )))
+}
+
+fn sqlite_store_has_legacy_environment_column(cwd: &Path) -> io::Result<bool> {
+    if !sqlite_available() {
+        return Ok(false);
+    }
+    let path = store_path(cwd);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let info = run_sql_query(cwd, "PRAGMA table_info(runs);")?;
+    Ok(info.lines().any(|line| {
+        line.split('|')
+            .nth(1)
+            .map(|name| name == "environment")
+            .unwrap_or(false)
+    }))
+}
+
+fn legacy_environment_notice_path(cwd: &Path) -> PathBuf {
+    cwd.join(STORE_DIR).join(LEGACY_ENV_NOTICE_FILE)
 }
 
 fn sql_quote(value: &str) -> String {

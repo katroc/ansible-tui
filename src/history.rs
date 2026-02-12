@@ -61,26 +61,27 @@ fn format_line(run: &RunRecord) -> String {
     let inventory = escape(&run.inventory);
 
     let template_id = run.template_id.as_deref().map(escape).unwrap_or_default();
-    let environment = run.environment.as_deref().map(escape).unwrap_or_default();
 
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        run.id, status, started, finished, exit_code, playbook, inventory, template_id, environment
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        run.id, status, started, finished, exit_code, playbook, inventory, template_id
     )
 }
 
 fn parse_line(line: &str) -> Option<RunRecord> {
-    let mut fields = line.split('\t');
-    let id = fields.next()?.parse::<u64>().ok()?;
-    let status = parse_status(fields.next()?)?;
-    let started_at = parse_local_datetime(fields.next()?)?;
-    let finished_at = parse_optional_datetime(fields.next().unwrap_or_default());
-    let exit_code = parse_optional_i32(fields.next().unwrap_or_default());
-    let playbook = unescape(fields.next().unwrap_or_default());
-    let inventory = unescape(fields.next().unwrap_or_default());
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() < 7 {
+        return None;
+    }
 
-    let template_id = parse_opt_escaped(fields.next().unwrap_or_default());
-    let environment = parse_opt_escaped(fields.next().unwrap_or_default());
+    let id = fields[0].parse::<u64>().ok()?;
+    let status = parse_status(fields[1])?;
+    let started_at = parse_local_datetime(fields[2])?;
+    let finished_at = parse_optional_datetime(fields.get(3).copied().unwrap_or_default());
+    let exit_code = parse_optional_i32(fields.get(4).copied().unwrap_or_default());
+    let playbook = unescape(fields.get(5).copied().unwrap_or_default());
+    let inventory = unescape(fields.get(6).copied().unwrap_or_default());
+    let template_id = parse_opt_escaped(fields.get(7).copied().unwrap_or_default());
 
     Some(RunRecord {
         id,
@@ -92,8 +93,26 @@ fn parse_line(line: &str) -> Option<RunRecord> {
         exit_code,
         logs: Vec::new(),
         template_id,
-        environment,
     })
+}
+
+pub fn history_has_legacy_environment_field(cwd: &Path) -> io::Result<bool> {
+    let path = history_file(cwd);
+    let data = match fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.split('\t').count() >= 9 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn parse_status(raw: &str) -> Option<RunStatus> {

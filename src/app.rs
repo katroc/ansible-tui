@@ -32,7 +32,7 @@ use crate::run::{
     spawn_bootstrap_managed_runtime, spawn_git_clone, spawn_project_sync, RunOptions, RunRequest,
     RuntimeCandidate,
 };
-use crate::run_store::{load_runs, save_run};
+use crate::run_store::{load_runs, save_run, take_legacy_environment_migration_notice};
 
 const MAX_LOG_LINES: usize = 1_000;
 const MAX_RUNTIME_LOG_LINES: usize = 120;
@@ -221,7 +221,6 @@ pub struct RunRecord {
     pub exit_code: Option<i32>,
     pub logs: Vec<String>,
     pub template_id: Option<String>,
-    pub environment: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1012,7 +1011,6 @@ impl App {
                 playbook,
                 inventory,
                 template_id,
-                environment,
             } => {
                 self.runs.insert(
                     0,
@@ -1026,7 +1024,6 @@ impl App {
                         exit_code: None,
                         logs: Vec::new(),
                         template_id,
-                        environment,
                     },
                 );
                 self.run_idx = 0;
@@ -1251,32 +1248,50 @@ impl App {
             }
 
             // Sub-tab switching
-            match ch {
-                '1' => {
-                    self.inventory_sub_tab = InventorySubTab::Files;
-                    return;
-                }
-                '2' => {
-                    if self.selected_inventory_is_yaml() {
-                        self.inventory_sub_tab = InventorySubTab::Hosts;
-                        self.load_inventory_edit_state();
-                    } else {
-                        self.status_line =
-                            String::from("Hosts sub-tab is only available for YAML inventories");
+            let inventory_input_mode_active = self.hosts_subtab_add_var_open
+                || self.hosts_subtab_add_host_open
+                || self.hosts_subtab_editing;
+            if !inventory_input_mode_active {
+                match ch {
+                    '1' => {
+                        self.inventory_sub_tab = InventorySubTab::Files;
+                        return;
                     }
-                    return;
-                }
-                '3' => {
-                    if self.selected_inventory_is_yaml() {
-                        self.inventory_sub_tab = InventorySubTab::Groups;
-                        self.load_inventory_edit_state();
-                    } else {
-                        self.status_line =
-                            String::from("Groups sub-tab is only available for YAML inventories");
+                    '2' => {
+                        if self.selected_inventory_is_yaml() {
+                            self.inventory_sub_tab = InventorySubTab::Hosts;
+                            self.load_inventory_edit_state();
+                        } else {
+                            self.status_line = String::from(
+                                "Hosts sub-tab is only available for YAML inventories",
+                            );
+                        }
+                        return;
                     }
-                    return;
+                    '3' => {
+                        if self.selected_inventory_is_yaml() {
+                            self.inventory_sub_tab = InventorySubTab::Groups;
+                            self.load_inventory_edit_state();
+                        } else {
+                            self.status_line = String::from(
+                                "Groups sub-tab is only available for YAML inventories",
+                            );
+                        }
+                        return;
+                    }
+                    _ => {}
                 }
-                _ => {}
+            }
+
+            if ch == 'p'
+                && !inventory_input_mode_active
+                && matches!(
+                    self.inventory_sub_tab,
+                    InventorySubTab::Hosts | InventorySubTab::Groups
+                )
+            {
+                self.start_inventory_ping_run(tx);
+                return;
             }
 
             // Dispatch to sub-tab handlers
@@ -2643,13 +2658,130 @@ impl App {
                 run_id,
                 cwd: project_root,
                 playbook,
+                command_playbook: None,
                 inventory,
                 options,
                 template_id: None,
-                environment: Some(self.active_project_name()),
             },
             tx.clone(),
         );
+    }
+
+    fn start_inventory_ping_run(&mut self, tx: &UnboundedSender<Action>) {
+        if self.runtime_bootstrapping {
+            self.status_line = String::from("Runtime bootstrap in progress...");
+            return;
+        }
+        if !playbook_bin_available(&self.run_options.ansible_bin) {
+            self.status_line = format!(
+                "{} not found. Press u to pick runtime or b to bootstrap managed runtime",
+                self.run_options.ansible_bin
+            );
+            self.open_runtime_prompt();
+            return;
+        }
+
+        let input_mode_active = self.hosts_subtab_add_var_open
+            || self.hosts_subtab_add_host_open
+            || self.hosts_subtab_editing;
+        if input_mode_active {
+            self.status_line = String::from("Finish or cancel inventory field editing before ping");
+            return;
+        }
+
+        if self
+            .inventory_edit_state
+            .as_ref()
+            .map(|state| state.dirty)
+            .unwrap_or(false)
+        {
+            self.save_inventory_edit_state();
+        }
+
+        let Some(state) = self.inventory_edit_state.as_ref() else {
+            self.status_line = String::from("No inventory loaded for ping test");
+            return;
+        };
+
+        let target = match self.inventory_sub_tab {
+            InventorySubTab::Hosts => state.hosts.get(self.hosts_subtab_idx).cloned(),
+            InventorySubTab::Groups => {
+                if self.groups_subtab_focus == GroupsFocus::Hosts {
+                    state.hosts.get(self.groups_subtab_host_idx).cloned()
+                } else {
+                    Some(
+                        self.groups_subtab_target_group
+                            .clone()
+                            .unwrap_or_else(|| String::from("all")),
+                    )
+                }
+            }
+            InventorySubTab::Files => None,
+        };
+        let Some(target) = target.map(|value| value.trim().to_string()) else {
+            self.status_line = String::from("No host/group selected for ping");
+            return;
+        };
+        if target.is_empty() {
+            self.status_line = String::from("No host/group selected for ping");
+            return;
+        }
+
+        let run_id = self.next_run_id;
+        self.next_run_id += 1;
+
+        let command_playbook = match self.write_inventory_ping_playbook(run_id) {
+            Ok(path) => path,
+            Err(err) => {
+                self.status_line = format!("Failed preparing ping playbook: {err}");
+                return;
+            }
+        };
+        let project_root = self.active_project_root().to_path_buf();
+        let inventory = display_path(&project_root, &state.path);
+        let mut options = self.run_options.clone();
+        options.check = false;
+        options.diff = false;
+        options.tags = None;
+        options.limit = Some(target.clone());
+        options.extra_vars_files.clear();
+        options.extra_vars = None;
+        if let Some(project) = self.projects.get(self.active_project_idx) {
+            options.ssh_private_key_file = project.ssh_private_key_file.clone();
+            options.ssh_private_key_inline = project.ssh_private_key_inline.clone();
+        }
+
+        self.status_line = format!("Starting ping run #{run_id} against {target}");
+        spawn_ansible_run(
+            RunRequest {
+                run_id,
+                cwd: project_root,
+                playbook: format!("adhoc ping ({target})"),
+                command_playbook: Some(command_playbook),
+                inventory,
+                options,
+                template_id: None,
+            },
+            tx.clone(),
+        );
+    }
+
+    fn write_inventory_ping_playbook(&self, run_id: u64) -> Result<String, String> {
+        let dir = self
+            .active_project_root()
+            .join(".ansible-tui")
+            .join("adhoc");
+        fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join(format!("ping-{run_id}.yml"));
+        let content = "\
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: ping
+      ansible.builtin.ping:
+";
+        fs::write(&path, content).map_err(|err| err.to_string())?;
+        Ok(path.to_string_lossy().to_string())
     }
 
     fn effective_ssh_private_key_settings(
@@ -3784,17 +3916,25 @@ impl App {
     fn restore_history(&mut self) {
         match load_runs(self.active_project_root()) {
             Ok(runs) => {
+                let migration_note =
+                    take_legacy_environment_migration_notice(self.active_project_root())
+                        .ok()
+                        .flatten();
                 if runs.is_empty() {
                     self.runs.clear();
                     self.run_idx = 0;
                     self.next_run_id = 1;
+                    if let Some(note) = migration_note {
+                        self.status_line = note;
+                    }
                     return;
                 }
                 self.next_run_id = runs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
                 self.runs = runs;
                 self.run_idx = 0;
                 self.sync_run_selection_to_selected_playbook();
-                self.status_line = format!("Loaded {} historical runs", self.runs.len());
+                self.status_line = migration_note
+                    .unwrap_or_else(|| format!("Loaded {} historical runs", self.runs.len()));
             }
             Err(err) => {
                 self.status_line = format!("history load failed: {err}");
@@ -4478,10 +4618,10 @@ impl App {
                 run_id,
                 cwd: project_root,
                 playbook: template.playbook.clone(),
+                command_playbook: None,
                 inventory: resolved.inventory,
                 options: resolved.options,
                 template_id: Some(template.id.clone()),
-                environment: Some(self.active_project_name()),
             },
             tx.clone(),
         );
@@ -4576,7 +4716,6 @@ impl App {
                 t.name = name.clone();
                 t.playbook = playbook;
                 t.inventory = inventory;
-                t.environment = None;
                 t.check = s.check;
                 t.diff = s.diff;
                 t.become_enabled = s.become_enabled;
@@ -4594,7 +4733,6 @@ impl App {
             let mut t = JobTemplate::new(&name);
             t.playbook = playbook;
             t.inventory = inventory;
-            t.environment = None;
             t.check = s.check;
             t.diff = s.diff;
             t.become_enabled = s.become_enabled;
@@ -5031,6 +5169,7 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
     let mut current_group: Option<String> = None;
     let mut current_group_section = ParsedInventoryGroupSection::None;
     let mut current_host_name: Option<String> = None;
+    let mut current_group_host_name: Option<String> = None;
 
     let mut hosts = Vec::new();
     let mut groups = Vec::new();
@@ -5052,6 +5191,7 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
             current_group = None;
             current_group_section = ParsedInventoryGroupSection::None;
             current_host_name = None;
+            current_group_host_name = None;
             continue;
         }
         if !found_all_root {
@@ -5065,9 +5205,11 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
                 current_group = None;
                 current_group_section = ParsedInventoryGroupSection::None;
                 current_host_name = None;
+                current_group_host_name = None;
             }
             4 => {
                 current_host_name = None;
+                current_group_host_name = None;
                 if in_all_hosts {
                     if let Some(host) = parse_yaml_mapping_key(trimmed) {
                         if host != "hosts" {
@@ -5091,27 +5233,16 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
                 if in_all_hosts {
                     if let Some(ref host_name) = current_host_name {
                         if let Some((key, value)) = trimmed.split_once(':') {
-                            let key = key.trim();
-                            let value = value.trim();
-                            let vars = host_vars.entry(host_name.clone()).or_default();
-                            match key {
-                                "ansible_host" => vars.ansible_host = value.to_string(),
-                                "ansible_user" => vars.ansible_user = value.to_string(),
-                                "ansible_port" => {
-                                    vars.ansible_port = value.parse::<u16>().ok();
-                                }
-                                "ansible_connection" => {
-                                    vars.ansible_connection = value.to_string();
-                                }
-                                _ => {
-                                    if !key.is_empty() {
-                                        vars.custom_vars.push((key.to_string(), value.to_string()));
-                                    }
-                                }
-                            }
+                            apply_inventory_host_var(
+                                &mut host_vars,
+                                host_name,
+                                key.trim(),
+                                value.trim(),
+                            );
                         }
                     }
                 } else if in_children && current_group.is_some() {
+                    current_group_host_name = None;
                     current_group_section = match trimmed {
                         "hosts:" => ParsedInventoryGroupSection::Hosts,
                         "children:" => ParsedInventoryGroupSection::Children,
@@ -5132,10 +5263,12 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
                         push_unique(&mut hosts, item.clone());
                         let entry = assignments.entry(group).or_default();
                         if !entry.contains(&item) {
-                            entry.push(item);
+                            entry.push(item.clone());
                         }
+                        current_group_host_name = Some(item);
                     }
                     ParsedInventoryGroupSection::Children => {
+                        current_group_host_name = None;
                         if item == group {
                             continue;
                         }
@@ -5148,6 +5281,24 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
                         }
                     }
                     ParsedInventoryGroupSection::None => {}
+                }
+            }
+            10 => {
+                if in_children && current_group.is_some() {
+                    if current_group_section != ParsedInventoryGroupSection::Hosts {
+                        continue;
+                    }
+                    let Some(ref host_name) = current_group_host_name else {
+                        continue;
+                    };
+                    if let Some((key, value)) = trimmed.split_once(':') {
+                        apply_inventory_host_var(
+                            &mut host_vars,
+                            host_name,
+                            key.trim(),
+                            value.trim(),
+                        );
+                    }
                 }
             }
             _ => {}
@@ -5174,6 +5325,29 @@ fn parse_inventory_yaml_for_builder(content: &str) -> Result<ParsedInventoryYaml
         group_children,
         host_vars,
     })
+}
+
+fn apply_inventory_host_var(
+    host_vars: &mut BTreeMap<String, HostVars>,
+    host_name: &str,
+    key: &str,
+    value: &str,
+) {
+    if key.is_empty() {
+        return;
+    }
+    let vars = host_vars.entry(host_name.to_string()).or_default();
+    match key {
+        "ansible_host" => vars.ansible_host = value.to_string(),
+        "ansible_user" => vars.ansible_user = value.to_string(),
+        "ansible_port" => {
+            vars.ansible_port = value.parse::<u16>().ok();
+        }
+        "ansible_connection" => {
+            vars.ansible_connection = value.to_string();
+        }
+        _ => vars.custom_vars.push((key.to_string(), value.to_string())),
+    }
 }
 
 fn discover_project(cwd: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
@@ -5621,4 +5795,38 @@ fn base64_encode(input: &[u8]) -> String {
         i += 3;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_group_host_vars_into_host_detail_state() {
+        let yaml = "\
+all:
+  children:
+    web:
+      hosts:
+        web01:
+          ansible_host: 192.0.2.10
+          ansible_user: ubuntu
+          ansible_port: 22
+";
+        let parsed = parse_inventory_yaml_for_builder(yaml).expect("inventory yaml should parse");
+
+        assert!(parsed.groups.contains(&String::from("web")));
+        assert!(parsed.hosts.contains(&String::from("web01")));
+        assert_eq!(
+            parsed.assignments.get("web").cloned().unwrap_or_default(),
+            vec![String::from("web01")]
+        );
+        let vars = parsed
+            .host_vars
+            .get("web01")
+            .expect("web01 host vars should be present");
+        assert_eq!(vars.ansible_host, "192.0.2.10");
+        assert_eq!(vars.ansible_user, "ubuntu");
+        assert_eq!(vars.ansible_port, Some(22));
+    }
 }
