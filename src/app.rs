@@ -34,8 +34,7 @@ use crate::run::{
     spawn_project_sync, RunOptions, RunRequest, RuntimeCandidate,
 };
 use crate::run_store::{
-    load_runs, migrate_unstable_hash_history, save_run,
-    take_legacy_environment_migration_notice,
+    load_runs, migrate_unstable_hash_history, save_run, take_legacy_environment_migration_notice,
 };
 use crate::secrets::{SecretEnforcementMode, VaultSourceType};
 
@@ -195,6 +194,27 @@ pub enum InventorySubTab {
     Files,
     Hosts,
     Groups,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusContext {
+    RuntimePrompt,
+    Modal,
+    Dashboard,
+    Projects,
+    InventoryFiles,
+    InventoryHostsList,
+    InventoryHostDetails,
+    InventoryGroupsTree,
+    InventoryGroupsGroups,
+    InventoryGroupsHosts,
+    PlaybooksList,
+    PlaybooksRuns,
+    PlaybooksLogSelect,
+    TemplatesList,
+    TemplatesRuns,
+    TemplatesLogSelect,
+    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +438,7 @@ pub struct App {
     pub template_editor_vault_source_type: Option<VaultSourceType>,
     pub template_editor_vault_password_file: String,
     pub template_editor_vault_id_label: String,
+    pub help_overlay_open: bool,
 
     pub should_quit: bool,
     needs_full_redraw: bool,
@@ -563,6 +584,7 @@ impl App {
             template_editor_vault_source_type: None,
             template_editor_vault_password_file: String::new(),
             template_editor_vault_id_label: String::new(),
+            help_overlay_open: false,
             should_quit: false,
             needs_full_redraw: false,
             pending_project_delete: None,
@@ -579,6 +601,73 @@ impl App {
 
     pub fn current_view(&self) -> View {
         View::all()[self.view_idx]
+    }
+
+    pub fn content_focus_context(&self) -> FocusContext {
+        self.compute_focus_context()
+    }
+
+    fn compute_focus_context(&self) -> FocusContext {
+        if self.runtime_prompt_open {
+            return FocusContext::RuntimePrompt;
+        }
+        if self.settings_editor_open
+            || self.template_editor_open
+            || self.inventory_create_open
+            || self.project_create_open
+            || self.project_ssh_open
+            || self.vault_create_open
+            || self.vault_edit_open
+            || self.vault_runtime_prompt_open
+            || self.vault_password_create_open
+            || self.inventory_edit_mode_open
+            || self.inventory_editor_open
+            || self.hosts_subtab_editing
+            || self.hosts_subtab_add_host_open
+            || self.hosts_subtab_add_var_open
+            || (self.current_view() == View::Settings && self.global_settings_text_mode)
+        {
+            return FocusContext::Modal;
+        }
+
+        match self.current_view() {
+            View::Dashboard => FocusContext::Dashboard,
+            View::Projects => FocusContext::Projects,
+            View::Inventory => match self.inventory_sub_tab {
+                InventorySubTab::Files => FocusContext::InventoryFiles,
+                InventorySubTab::Hosts => {
+                    if self.hosts_subtab_focus_detail {
+                        FocusContext::InventoryHostDetails
+                    } else {
+                        FocusContext::InventoryHostsList
+                    }
+                }
+                InventorySubTab::Groups => match self.groups_subtab_focus {
+                    GroupsFocus::Tree => FocusContext::InventoryGroupsTree,
+                    GroupsFocus::Groups => FocusContext::InventoryGroupsGroups,
+                    GroupsFocus::Hosts => FocusContext::InventoryGroupsHosts,
+                },
+            },
+            View::Playbooks => {
+                if self.log_select_mode {
+                    FocusContext::PlaybooksLogSelect
+                } else if self.playbooks_focus_runs {
+                    FocusContext::PlaybooksRuns
+                } else {
+                    FocusContext::PlaybooksList
+                }
+            }
+            View::Templates => {
+                if self.log_select_mode {
+                    FocusContext::TemplatesLogSelect
+                } else if self.templates_focus_runs {
+                    FocusContext::TemplatesRuns
+                } else {
+                    FocusContext::TemplatesList
+                }
+            }
+            View::Settings => FocusContext::Settings,
+        }
     }
 
     pub fn take_full_redraw_request(&mut self) -> bool {
@@ -723,6 +812,7 @@ impl App {
         self.template_editor_vault_source_type = None;
         self.template_editor_vault_password_file.clear();
         self.template_editor_vault_id_label.clear();
+        self.help_overlay_open = false;
         self.project_ssh_open = false;
         self.project_ssh_field_idx = 0;
         self.project_ssh_buffer_file.clear();
@@ -788,265 +878,37 @@ impl App {
     }
 
     pub fn update(&mut self, action: Action, tx: &UnboundedSender<Action>) {
+        if self.help_overlay_open
+            && !matches!(
+                action,
+                Action::Tick
+                    | Action::Quit
+                    | Action::CharInput(_)
+                    | Action::CloseRuntimePrompt
+                    | Action::RuntimeBootstrapLog(_)
+                    | Action::RuntimeBootstrapFinished { .. }
+                    | Action::ProjectSyncLog(_)
+                    | Action::ProjectSyncFinished { .. }
+                    | Action::VaultEditLoaded { .. }
+                    | Action::RunStarted { .. }
+                    | Action::RunLog { .. }
+                    | Action::RunFinished { .. }
+                    | Action::Error(_)
+            )
+        {
+            return;
+        }
         match action {
             Action::Tick => self.auto_refresh_project(),
             Action::Quit => self.request_quit(),
             Action::CharInput(ch) => self.handle_char_input(ch, tx),
             Action::Backspace => self.handle_backspace(),
-            Action::NextView => {
-                if self.vault_runtime_prompt_open {
-                    self.vault_runtime_prompt_field_idx = min(
-                        self.vault_runtime_prompt_field_idx + 1,
-                        self.vault_runtime_prompt_last_field_idx(),
-                    );
-                } else if self.inventory_edit_mode_open {
-                    self.move_inventory_edit_mode_selection(1);
-                } else if !self.settings_editor_open
-                    && !self.template_editor_open
-                    && !self.inventory_create_open
-                    && !self.project_create_open
-                    && !self.project_ssh_open
-                    && !self.vault_create_open
-                    && !self.vault_edit_open
-                    && !self.vault_password_create_open
-                    && !self.vault_runtime_prompt_open
-                    && !self.inventory_editor_open
-                    && !self.inventory_edit_mode_open
-                    && !self.runtime_prompt_open
-                    && !(self.current_view() == View::Settings && self.global_settings_text_mode)
-                {
-                    self.clear_log_select_mode_for_view_change();
-                    self.view_idx = (self.view_idx + 1) % View::all().len();
-                    if self.current_view() == View::Playbooks {
-                        self.playbooks_focus_runs = false;
-                        self.sync_run_selection_to_selected_playbook();
-                    } else if self.current_view() == View::Templates {
-                        self.templates_focus_runs = false;
-                        self.sync_run_selection_to_selected_template();
-                    }
-                }
-            }
-            Action::PrevView => {
-                if self.vault_runtime_prompt_open {
-                    self.vault_runtime_prompt_field_idx =
-                        self.vault_runtime_prompt_field_idx.saturating_sub(1);
-                } else if self.inventory_edit_mode_open {
-                    self.move_inventory_edit_mode_selection(-1);
-                } else if !self.settings_editor_open
-                    && !self.template_editor_open
-                    && !self.inventory_create_open
-                    && !self.project_create_open
-                    && !self.project_ssh_open
-                    && !self.vault_create_open
-                    && !self.vault_edit_open
-                    && !self.vault_password_create_open
-                    && !self.vault_runtime_prompt_open
-                    && !self.inventory_editor_open
-                    && !self.inventory_edit_mode_open
-                    && !self.runtime_prompt_open
-                    && !(self.current_view() == View::Settings && self.global_settings_text_mode)
-                {
-                    self.clear_log_select_mode_for_view_change();
-                    self.view_idx = (self.view_idx + View::all().len() - 1) % View::all().len();
-                    if self.current_view() == View::Playbooks {
-                        self.playbooks_focus_runs = false;
-                        self.sync_run_selection_to_selected_playbook();
-                    } else if self.current_view() == View::Templates {
-                        self.templates_focus_runs = false;
-                        self.sync_run_selection_to_selected_template();
-                    }
-                }
-            }
-            Action::SettingsIncrease => {
-                if self.vault_runtime_prompt_open {
-                    self.vault_runtime_prompt_field_idx = min(
-                        self.vault_runtime_prompt_field_idx + 1,
-                        self.vault_runtime_prompt_last_field_idx(),
-                    );
-                } else if self.template_editor_open {
-                    self.adjust_template_editor_field(1);
-                } else if self.settings_editor_open {
-                    self.adjust_settings_field(1);
-                } else if self.project_ssh_open {
-                    self.adjust_project_ssh_field(1);
-                } else if self.inventory_edit_mode_open {
-                    self.move_inventory_edit_mode_selection(1);
-                } else if self.current_view() == View::Inventory
-                    && matches!(
-                        self.inventory_sub_tab,
-                        InventorySubTab::Hosts | InventorySubTab::Groups
-                    )
-                {
-                    match self.inventory_sub_tab {
-                        InventorySubTab::Hosts => self.handle_hosts_subtab_char('l'),
-                        InventorySubTab::Groups => self.handle_groups_subtab_char('l'),
-                        _ => {}
-                    }
-                } else if self.current_view() == View::Playbooks && !self.runtime_prompt_open {
-                    self.playbooks_focus_runs = true;
-                } else if self.current_view() == View::Templates && !self.runtime_prompt_open {
-                    self.templates_focus_runs = true;
-                    self.sync_run_selection_to_selected_template();
-                } else {
-                    self.adjust_global_settings_field(1);
-                }
-            }
-            Action::SettingsDecrease => {
-                if self.vault_runtime_prompt_open {
-                    self.vault_runtime_prompt_field_idx =
-                        self.vault_runtime_prompt_field_idx.saturating_sub(1);
-                } else if self.template_editor_open {
-                    self.adjust_template_editor_field(-1);
-                } else if self.settings_editor_open {
-                    self.adjust_settings_field(-1);
-                } else if self.project_ssh_open {
-                    self.adjust_project_ssh_field(-1);
-                } else if self.inventory_edit_mode_open {
-                    self.move_inventory_edit_mode_selection(-1);
-                } else if self.current_view() == View::Inventory
-                    && matches!(
-                        self.inventory_sub_tab,
-                        InventorySubTab::Hosts | InventorySubTab::Groups
-                    )
-                {
-                    match self.inventory_sub_tab {
-                        InventorySubTab::Hosts => self.handle_hosts_subtab_char('h'),
-                        InventorySubTab::Groups => self.handle_groups_subtab_char('h'),
-                        _ => {}
-                    }
-                } else if self.current_view() == View::Playbooks && !self.runtime_prompt_open {
-                    self.playbooks_focus_runs = false;
-                } else if self.current_view() == View::Templates && !self.runtime_prompt_open {
-                    self.templates_focus_runs = false;
-                } else {
-                    self.adjust_global_settings_field(-1);
-                }
-            }
-            Action::MoveUp => {
-                if self.vault_runtime_prompt_open {
-                    self.vault_runtime_prompt_field_idx =
-                        self.vault_runtime_prompt_field_idx.saturating_sub(1);
-                } else if self.template_editor_open {
-                    if !self.template_editor_text_mode {
-                        self.template_editor_field_idx =
-                            self.template_editor_field_idx.saturating_sub(1);
-                    }
-                } else if self.settings_editor_open {
-                    if !self.settings_editor_text_mode {
-                        self.settings_editor_field_idx =
-                            self.settings_editor_field_idx.saturating_sub(1);
-                    }
-                } else if self.project_ssh_open {
-                    self.project_ssh_field_idx = self.project_ssh_field_idx.saturating_sub(1);
-                } else if self.vault_create_open {
-                    self.vault_create_field_idx = self.vault_create_field_idx.saturating_sub(1);
-                } else if self.vault_edit_open {
-                    self.vault_edit_field_idx = self.vault_edit_field_idx.saturating_sub(1);
-                } else if self.vault_password_create_open {
-                    self.vault_password_create_field_idx =
-                        self.vault_password_create_field_idx.saturating_sub(1);
-                } else if self.project_create_open {
-                    self.project_create_field_idx = self.project_create_field_idx.saturating_sub(1);
-                } else if self.inventory_create_open {
-                } else if self.inventory_editor_open {
-                } else if self.inventory_edit_mode_open {
-                    self.move_inventory_edit_mode_selection(-1);
-                } else if self.runtime_prompt_open {
-                    self.runtime_candidate_idx = self.runtime_candidate_idx.saturating_sub(1);
-                } else if self.current_view() == View::Inventory
-                    && matches!(
-                        self.inventory_sub_tab,
-                        InventorySubTab::Hosts | InventorySubTab::Groups
-                    )
-                {
-                    match self.inventory_sub_tab {
-                        InventorySubTab::Hosts => self.handle_hosts_subtab_char('k'),
-                        InventorySubTab::Groups => self.handle_groups_subtab_char('k'),
-                        _ => {}
-                    }
-                } else if self.current_view() == View::Settings {
-                    if !self.global_settings_text_mode {
-                        self.global_settings_field_idx =
-                            self.global_settings_field_idx.saturating_sub(1);
-                    }
-                } else if self.log_select_mode {
-                    self.move_log_cursor_up();
-                } else {
-                    self.move_selection_up();
-                }
-            }
-            Action::MoveDown => {
-                if self.vault_runtime_prompt_open {
-                    self.vault_runtime_prompt_field_idx = min(
-                        self.vault_runtime_prompt_field_idx + 1,
-                        self.vault_runtime_prompt_last_field_idx(),
-                    );
-                } else if self.template_editor_open {
-                    if !self.template_editor_text_mode {
-                        self.template_editor_field_idx = min(
-                            self.template_editor_field_idx + 1,
-                            TEMPLATE_EDITOR_FIELD_COUNT - 1,
-                        );
-                    }
-                } else if self.settings_editor_open {
-                    if !self.settings_editor_text_mode {
-                        self.settings_editor_field_idx = min(
-                            self.settings_editor_field_idx + 1,
-                            PLAYBOOK_SETTINGS_FIELD_COUNT - 1,
-                        );
-                    }
-                } else if self.project_ssh_open {
-                    self.project_ssh_field_idx = min(
-                        self.project_ssh_field_idx + 1,
-                        PROJECT_SECRET_FIELD_COUNT - 1,
-                    );
-                } else if self.vault_create_open {
-                    self.vault_create_field_idx = min(self.vault_create_field_idx + 1, 1);
-                } else if self.vault_edit_open {
-                    self.vault_edit_field_idx = min(self.vault_edit_field_idx + 1, 1);
-                } else if self.vault_password_create_open {
-                    self.vault_password_create_field_idx =
-                        min(self.vault_password_create_field_idx + 1, 2);
-                } else if self.project_create_open {
-                    self.project_create_field_idx = min(
-                        self.project_create_field_idx + 1,
-                        self.project_create_last_field_idx(),
-                    );
-                } else if self.inventory_create_open {
-                } else if self.inventory_editor_open {
-                } else if self.inventory_edit_mode_open {
-                    self.move_inventory_edit_mode_selection(1);
-                } else if self.runtime_prompt_open {
-                    if !self.runtime_candidates.is_empty() {
-                        self.runtime_candidate_idx = min(
-                            self.runtime_candidate_idx + 1,
-                            self.runtime_candidates.len() - 1,
-                        );
-                    }
-                } else if self.current_view() == View::Inventory
-                    && matches!(
-                        self.inventory_sub_tab,
-                        InventorySubTab::Hosts | InventorySubTab::Groups
-                    )
-                {
-                    match self.inventory_sub_tab {
-                        InventorySubTab::Hosts => self.handle_hosts_subtab_char('j'),
-                        InventorySubTab::Groups => self.handle_groups_subtab_char('j'),
-                        _ => {}
-                    }
-                } else if self.current_view() == View::Settings {
-                    if !self.global_settings_text_mode {
-                        self.global_settings_field_idx = min(
-                            self.global_settings_field_idx + 1,
-                            GLOBAL_SETTINGS_FIELD_COUNT - 1,
-                        );
-                    }
-                } else if self.log_select_mode {
-                    self.move_log_cursor_down();
-                } else {
-                    self.move_selection_down();
-                }
-            }
+            Action::NextView => self.handle_next_view_action(),
+            Action::PrevView => self.handle_prev_view_action(),
+            Action::SettingsIncrease => self.handle_settings_increase_action(),
+            Action::SettingsDecrease => self.handle_settings_decrease_action(),
+            Action::MoveUp => self.handle_move_up_action(),
+            Action::MoveDown => self.handle_move_down_action(),
             Action::ToggleLogSelectMode => self.toggle_log_select_mode(),
             Action::MarkLogSelection => self.mark_log_selection(),
             Action::CopyLogSelection => self.copy_log_selection(),
@@ -1098,7 +960,10 @@ impl App {
             }
             Action::OpenRuntimePrompt => self.open_runtime_prompt(),
             Action::CloseRuntimePrompt => {
-                if self.vault_runtime_prompt_open {
+                if self.help_overlay_open {
+                    self.help_overlay_open = false;
+                    self.status_line = String::from("Keyboard help closed");
+                } else if self.vault_runtime_prompt_open {
                     self.cancel_vault_runtime_prompt();
                 } else if self.template_editor_open {
                     if self.template_editor_text_mode {
@@ -1146,6 +1011,10 @@ impl App {
                     }
                 } else if self.current_view() == View::Settings && self.global_settings_text_mode {
                     self.cancel_global_settings_text_edit();
+                } else if self.log_select_mode
+                    && matches!(self.current_view(), View::Playbooks | View::Templates)
+                {
+                    self.toggle_log_select_mode();
                 } else {
                     self.runtime_prompt_open = false;
                 }
@@ -1184,6 +1053,16 @@ impl App {
                     self.select_runtime_candidate();
                 } else if self.current_view() == View::Projects {
                     self.activate_selected_project();
+                } else if self.current_view() == View::Playbooks && !self.log_select_mode {
+                    self.playbooks_focus_runs = !self.playbooks_focus_runs;
+                    if self.playbooks_focus_runs {
+                        self.sync_run_selection_to_selected_playbook();
+                    }
+                } else if self.current_view() == View::Templates && !self.log_select_mode {
+                    self.templates_focus_runs = !self.templates_focus_runs;
+                    if self.templates_focus_runs {
+                        self.sync_run_selection_to_selected_template();
+                    }
                 } else if self.current_view() == View::Settings {
                     self.confirm_global_settings_editor();
                 }
@@ -1381,7 +1260,253 @@ impl App {
         }
     }
 
+    fn can_cycle_views_from_global(&self) -> bool {
+        !self.settings_editor_open
+            && !self.template_editor_open
+            && !self.inventory_create_open
+            && !self.project_create_open
+            && !self.project_ssh_open
+            && !self.vault_create_open
+            && !self.vault_edit_open
+            && !self.vault_password_create_open
+            && !self.vault_runtime_prompt_open
+            && !self.inventory_editor_open
+            && !self.inventory_edit_mode_open
+            && !self.runtime_prompt_open
+            && !(self.current_view() == View::Settings && self.global_settings_text_mode)
+    }
+
+    fn handle_next_view_action(&mut self) {
+        if self.vault_runtime_prompt_open {
+            self.vault_runtime_prompt_field_idx = min(
+                self.vault_runtime_prompt_field_idx + 1,
+                self.vault_runtime_prompt_last_field_idx(),
+            );
+        } else if self.inventory_edit_mode_open {
+            self.move_inventory_edit_mode_selection(1);
+        } else if self.can_cycle_views_from_global() {
+            self.switch_view(1);
+        }
+    }
+
+    fn handle_prev_view_action(&mut self) {
+        if self.vault_runtime_prompt_open {
+            self.vault_runtime_prompt_field_idx =
+                self.vault_runtime_prompt_field_idx.saturating_sub(1);
+        } else if self.inventory_edit_mode_open {
+            self.move_inventory_edit_mode_selection(-1);
+        } else if self.can_cycle_views_from_global() {
+            self.switch_view(-1);
+        }
+    }
+
+    fn handle_settings_increase_action(&mut self) {
+        if self.vault_runtime_prompt_open {
+            self.vault_runtime_prompt_field_idx = min(
+                self.vault_runtime_prompt_field_idx + 1,
+                self.vault_runtime_prompt_last_field_idx(),
+            );
+        } else if self.template_editor_open {
+            self.adjust_template_editor_field(1);
+        } else if self.settings_editor_open {
+            self.adjust_settings_field(1);
+        } else if self.project_ssh_open {
+            self.adjust_project_ssh_field(1);
+        } else if self.inventory_edit_mode_open {
+            self.move_inventory_edit_mode_selection(1);
+        } else if self.current_view() == View::Inventory
+            && matches!(
+                self.inventory_sub_tab,
+                InventorySubTab::Hosts | InventorySubTab::Groups
+            )
+        {
+            match self.inventory_sub_tab {
+                InventorySubTab::Hosts => self.handle_hosts_subtab_char('l'),
+                InventorySubTab::Groups => self.handle_groups_subtab_char('l'),
+                _ => {}
+            }
+        } else if self.current_view() == View::Playbooks && !self.runtime_prompt_open {
+            self.playbooks_focus_runs = true;
+        } else if self.current_view() == View::Templates && !self.runtime_prompt_open {
+            self.templates_focus_runs = true;
+            self.sync_run_selection_to_selected_template();
+        } else {
+            self.adjust_global_settings_field(1);
+        }
+    }
+
+    fn handle_settings_decrease_action(&mut self) {
+        if self.vault_runtime_prompt_open {
+            self.vault_runtime_prompt_field_idx =
+                self.vault_runtime_prompt_field_idx.saturating_sub(1);
+        } else if self.template_editor_open {
+            self.adjust_template_editor_field(-1);
+        } else if self.settings_editor_open {
+            self.adjust_settings_field(-1);
+        } else if self.project_ssh_open {
+            self.adjust_project_ssh_field(-1);
+        } else if self.inventory_edit_mode_open {
+            self.move_inventory_edit_mode_selection(-1);
+        } else if self.current_view() == View::Inventory
+            && matches!(
+                self.inventory_sub_tab,
+                InventorySubTab::Hosts | InventorySubTab::Groups
+            )
+        {
+            match self.inventory_sub_tab {
+                InventorySubTab::Hosts => self.handle_hosts_subtab_char('h'),
+                InventorySubTab::Groups => self.handle_groups_subtab_char('h'),
+                _ => {}
+            }
+        } else if self.current_view() == View::Playbooks && !self.runtime_prompt_open {
+            self.playbooks_focus_runs = false;
+        } else if self.current_view() == View::Templates && !self.runtime_prompt_open {
+            self.templates_focus_runs = false;
+        } else {
+            self.adjust_global_settings_field(-1);
+        }
+    }
+
+    fn handle_move_up_action(&mut self) {
+        if self.vault_runtime_prompt_open {
+            self.vault_runtime_prompt_field_idx =
+                self.vault_runtime_prompt_field_idx.saturating_sub(1);
+        } else if self.template_editor_open {
+            if !self.template_editor_text_mode {
+                self.template_editor_field_idx = self.template_editor_field_idx.saturating_sub(1);
+            }
+        } else if self.settings_editor_open {
+            if !self.settings_editor_text_mode {
+                self.settings_editor_field_idx = self.settings_editor_field_idx.saturating_sub(1);
+            }
+        } else if self.project_ssh_open {
+            self.project_ssh_field_idx = self.project_ssh_field_idx.saturating_sub(1);
+        } else if self.vault_create_open {
+            self.vault_create_field_idx = self.vault_create_field_idx.saturating_sub(1);
+        } else if self.vault_edit_open {
+            self.vault_edit_field_idx = self.vault_edit_field_idx.saturating_sub(1);
+        } else if self.vault_password_create_open {
+            self.vault_password_create_field_idx =
+                self.vault_password_create_field_idx.saturating_sub(1);
+        } else if self.project_create_open {
+            self.project_create_field_idx = self.project_create_field_idx.saturating_sub(1);
+        } else if self.inventory_create_open {
+        } else if self.inventory_editor_open {
+        } else if self.inventory_edit_mode_open {
+            self.move_inventory_edit_mode_selection(-1);
+        } else if self.runtime_prompt_open {
+            self.runtime_candidate_idx = self.runtime_candidate_idx.saturating_sub(1);
+        } else if self.current_view() == View::Inventory
+            && matches!(
+                self.inventory_sub_tab,
+                InventorySubTab::Hosts | InventorySubTab::Groups
+            )
+        {
+            match self.inventory_sub_tab {
+                InventorySubTab::Hosts => self.handle_hosts_subtab_char('k'),
+                InventorySubTab::Groups => self.handle_groups_subtab_char('k'),
+                _ => {}
+            }
+        } else if self.current_view() == View::Settings {
+            if !self.global_settings_text_mode {
+                self.global_settings_field_idx = self.global_settings_field_idx.saturating_sub(1);
+            }
+        } else if self.log_select_mode {
+            self.move_log_cursor_up();
+        } else {
+            self.move_selection_up();
+        }
+    }
+
+    fn handle_move_down_action(&mut self) {
+        if self.vault_runtime_prompt_open {
+            self.vault_runtime_prompt_field_idx = min(
+                self.vault_runtime_prompt_field_idx + 1,
+                self.vault_runtime_prompt_last_field_idx(),
+            );
+        } else if self.template_editor_open {
+            if !self.template_editor_text_mode {
+                self.template_editor_field_idx = min(
+                    self.template_editor_field_idx + 1,
+                    TEMPLATE_EDITOR_FIELD_COUNT - 1,
+                );
+            }
+        } else if self.settings_editor_open {
+            if !self.settings_editor_text_mode {
+                self.settings_editor_field_idx = min(
+                    self.settings_editor_field_idx + 1,
+                    PLAYBOOK_SETTINGS_FIELD_COUNT - 1,
+                );
+            }
+        } else if self.project_ssh_open {
+            self.project_ssh_field_idx = min(
+                self.project_ssh_field_idx + 1,
+                PROJECT_SECRET_FIELD_COUNT - 1,
+            );
+        } else if self.vault_create_open {
+            self.vault_create_field_idx = min(self.vault_create_field_idx + 1, 1);
+        } else if self.vault_edit_open {
+            self.vault_edit_field_idx = min(self.vault_edit_field_idx + 1, 1);
+        } else if self.vault_password_create_open {
+            self.vault_password_create_field_idx = min(self.vault_password_create_field_idx + 1, 2);
+        } else if self.project_create_open {
+            self.project_create_field_idx = min(
+                self.project_create_field_idx + 1,
+                self.project_create_last_field_idx(),
+            );
+        } else if self.inventory_create_open {
+        } else if self.inventory_editor_open {
+        } else if self.inventory_edit_mode_open {
+            self.move_inventory_edit_mode_selection(1);
+        } else if self.runtime_prompt_open {
+            if !self.runtime_candidates.is_empty() {
+                self.runtime_candidate_idx = min(
+                    self.runtime_candidate_idx + 1,
+                    self.runtime_candidates.len() - 1,
+                );
+            }
+        } else if self.current_view() == View::Inventory
+            && matches!(
+                self.inventory_sub_tab,
+                InventorySubTab::Hosts | InventorySubTab::Groups
+            )
+        {
+            match self.inventory_sub_tab {
+                InventorySubTab::Hosts => self.handle_hosts_subtab_char('j'),
+                InventorySubTab::Groups => self.handle_groups_subtab_char('j'),
+                _ => {}
+            }
+        } else if self.current_view() == View::Settings {
+            if !self.global_settings_text_mode {
+                self.global_settings_field_idx = min(
+                    self.global_settings_field_idx + 1,
+                    GLOBAL_SETTINGS_FIELD_COUNT - 1,
+                );
+            }
+        } else if self.log_select_mode {
+            self.move_log_cursor_down();
+        } else {
+            self.move_selection_down();
+        }
+    }
+
     fn handle_char_input(&mut self, ch: char, tx: &UnboundedSender<Action>) {
+        if self.help_overlay_open {
+            match ch {
+                '?' => {
+                    self.help_overlay_open = false;
+                    self.status_line = String::from("Keyboard help closed");
+                }
+                'q' => self.request_quit(),
+                _ => {}
+            }
+            return;
+        }
+        if ch == '?' && !self.is_text_entry_mode_active() {
+            self.help_overlay_open = true;
+            self.status_line = String::from("Keyboard help opened (Esc or ? to close)");
+            return;
+        }
         if self.vault_runtime_prompt_open {
             self.push_vault_runtime_prompt_char(ch);
             return;
@@ -1431,6 +1556,21 @@ impl App {
             return;
         }
 
+        self.clear_pending_deletes_for_char(ch);
+
+        if ch == 'q' {
+            self.request_quit();
+            return;
+        }
+
+        if self.route_char_by_focus_context(self.content_focus_context(), ch, tx) {
+            return;
+        }
+
+        self.handle_global_char_input(ch, tx);
+    }
+
+    fn clear_pending_deletes_for_char(&mut self, ch: char) {
         if self.current_view() == View::Inventory
             && self.pending_inventory_delete.is_some()
             && ch != 'D'
@@ -1449,344 +1589,375 @@ impl App {
         {
             self.pending_template_delete = None;
         }
+    }
 
-        if ch == 'q' {
-            self.request_quit();
-            return;
+    fn route_char_by_focus_context(
+        &mut self,
+        focus: FocusContext,
+        ch: char,
+        tx: &UnboundedSender<Action>,
+    ) -> bool {
+        match focus {
+            FocusContext::RuntimePrompt => {
+                self.handle_runtime_prompt_char(ch, tx);
+                true
+            }
+            FocusContext::Modal => self.handle_modal_focus_char(ch, tx),
+            FocusContext::Projects => self.handle_projects_context_char(ch, tx),
+            FocusContext::InventoryFiles
+            | FocusContext::InventoryHostsList
+            | FocusContext::InventoryHostDetails
+            | FocusContext::InventoryGroupsTree
+            | FocusContext::InventoryGroupsGroups
+            | FocusContext::InventoryGroupsHosts => self.handle_inventory_context_char(ch, tx),
+            FocusContext::PlaybooksList
+            | FocusContext::PlaybooksRuns
+            | FocusContext::PlaybooksLogSelect => self.handle_playbooks_context_char(ch),
+            FocusContext::TemplatesList
+            | FocusContext::TemplatesRuns
+            | FocusContext::TemplatesLogSelect => self.handle_templates_context_char(ch, tx),
+            FocusContext::Settings => {
+                self.handle_settings_view_char(ch, tx);
+                true
+            }
+            FocusContext::Dashboard => false,
         }
+    }
 
+    fn handle_modal_focus_char(&mut self, ch: char, tx: &UnboundedSender<Action>) -> bool {
         if self.settings_editor_open {
-            match ch {
-                'j' => {
-                    self.settings_editor_field_idx = min(
-                        self.settings_editor_field_idx + 1,
-                        PLAYBOOK_SETTINGS_FIELD_COUNT - 1,
-                    );
-                }
-                'k' => {
-                    self.settings_editor_field_idx =
-                        self.settings_editor_field_idx.saturating_sub(1);
-                }
-                'h' => self.adjust_settings_field(-1),
-                'l' => self.adjust_settings_field(1),
-                ' ' => self.toggle_settings_boolean_field(),
-                'e' => self.begin_settings_text_edit(),
-                't' => self.close_playbook_settings(),
-                _ => {}
-            }
-            return;
+            self.handle_settings_editor_char(ch);
+            return true;
         }
-
-        if self.runtime_prompt_open {
-            match ch {
-                'j' => {
-                    if !self.runtime_candidates.is_empty() {
-                        self.runtime_candidate_idx = min(
-                            self.runtime_candidate_idx + 1,
-                            self.runtime_candidates.len() - 1,
-                        );
-                    }
-                }
-                'k' => {
-                    self.runtime_candidate_idx = self.runtime_candidate_idx.saturating_sub(1);
-                }
-                'b' => self.bootstrap_managed_runtime(tx),
-                _ => {}
-            }
-            return;
-        }
-
-        if self.current_view() == View::Inventory {
-            // Handle groups sub-tab add-group input (reuses add_var prompt)
-            if self.inventory_sub_tab == InventorySubTab::Groups && self.hosts_subtab_add_var_open {
-                match ch {
-                    '\n' => {
-                        let name = self.hosts_subtab_add_var_buffer.trim().to_string();
-                        if !name.is_empty()
-                            && is_valid_inventory_key(&name)
-                            && !is_reserved_inventory_group(&name)
-                        {
-                            if let Some(ref mut state) = self.inventory_edit_state {
-                                if !state.groups.contains(&name) {
-                                    state.groups.push(name.clone());
-                                    state.assignments.entry(name.clone()).or_default();
-                                    state.group_children.entry(name).or_default();
-                                    state.dirty = true;
-                                }
-                            }
-                        }
-                        self.hosts_subtab_add_var_open = false;
-                        self.hosts_subtab_add_var_buffer.clear();
-                    }
-                    _ if ch == '\x08' || ch == '\x7f' => {
-                        self.hosts_subtab_add_var_buffer.pop();
-                    }
-                    _ if !ch.is_control() => {
-                        self.hosts_subtab_add_var_buffer.push(ch);
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            // Handle groups sub-tab add-host input
-            if self.inventory_sub_tab == InventorySubTab::Groups && self.hosts_subtab_add_host_open
-            {
-                match ch {
-                    '\n' => {
-                        let name = self.hosts_subtab_add_host_buffer.trim().to_string();
-                        if !name.is_empty() && is_valid_inventory_key(&name) {
-                            if let Some(ref mut state) = self.inventory_edit_state {
-                                if !state.hosts.contains(&name) {
-                                    state.hosts.push(name.clone());
-                                    state.host_vars.entry(name).or_default();
-                                    state.dirty = true;
-                                }
-                            }
-                        }
-                        self.hosts_subtab_add_host_open = false;
-                        self.hosts_subtab_add_host_buffer.clear();
-                    }
-                    _ if ch == '\x08' || ch == '\x7f' => {
-                        self.hosts_subtab_add_host_buffer.pop();
-                    }
-                    _ if !ch.is_control() => {
-                        self.hosts_subtab_add_host_buffer.push(ch);
-                    }
-                    _ => {}
-                }
-                return;
-            }
-
-            // Sub-tab switching
-            let inventory_input_mode_active = self.hosts_subtab_add_var_open
+        if self.current_view() == View::Inventory
+            && (self.hosts_subtab_add_var_open
                 || self.hosts_subtab_add_host_open
-                || self.hosts_subtab_editing;
-            if !inventory_input_mode_active {
-                match ch {
-                    '1' => {
-                        self.inventory_sub_tab = InventorySubTab::Files;
-                        return;
-                    }
-                    '2' => {
-                        if self.selected_inventory_is_yaml() {
-                            self.inventory_sub_tab = InventorySubTab::Hosts;
-                            self.load_inventory_edit_state();
-                        } else {
-                            self.status_line = String::from(
-                                "Hosts sub-tab is only available for YAML inventories",
-                            );
-                        }
-                        return;
-                    }
-                    '3' => {
-                        if self.selected_inventory_is_yaml() {
-                            self.inventory_sub_tab = InventorySubTab::Groups;
-                            self.load_inventory_edit_state();
-                        } else {
-                            self.status_line = String::from(
-                                "Groups sub-tab is only available for YAML inventories",
-                            );
-                        }
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-
-            if ch == 'p'
-                && !inventory_input_mode_active
-                && matches!(
-                    self.inventory_sub_tab,
-                    InventorySubTab::Hosts | InventorySubTab::Groups
-                )
-            {
-                self.start_inventory_ping_run(tx);
-                return;
-            }
-
-            // Dispatch to sub-tab handlers
-            match self.inventory_sub_tab {
-                InventorySubTab::Hosts => {
-                    self.handle_hosts_subtab_char(ch);
-                    return;
-                }
-                InventorySubTab::Groups => {
-                    self.handle_groups_subtab_char(ch);
-                    return;
-                }
-                InventorySubTab::Files => {}
-            }
-
-            match ch {
-                'n' => {
-                    self.open_inventory_create_prompt();
-                    return;
-                }
-                'e' => {
-                    self.open_inventory_edit_mode_prompt();
-                    return;
-                }
-                'D' => {
-                    self.request_inventory_delete();
-                    return;
-                }
-                'r' => {
-                    self.status_line = String::from("Use Templates tab to run a selected template");
-                    return;
-                }
-                _ => {}
-            }
+                || self.hosts_subtab_editing)
+        {
+            return self.handle_inventory_context_char(ch, tx);
         }
+        false
+    }
 
-        if self.current_view() == View::Projects {
-            match ch {
-                'n' => {
-                    self.open_project_create_prompt(ProjectCreateMode::New);
-                    return;
-                }
-                'f' => {
-                    self.open_project_create_prompt(ProjectCreateMode::ExistingFs);
-                    return;
-                }
-                'g' => {
-                    self.open_project_create_prompt(ProjectCreateMode::Git);
-                    return;
-                }
-                'a' => {
-                    self.activate_selected_project();
-                    return;
-                }
-                'e' => {
-                    self.open_project_ssh_prompt();
-                    return;
-                }
-                'V' => {
-                    self.open_vault_create_prompt();
-                    return;
-                }
-                'E' => {
-                    self.open_vault_edit_prompt(tx);
-                    return;
-                }
-                'P' => {
-                    self.open_vault_password_create_prompt();
-                    return;
-                }
-                'D' => {
-                    self.request_project_delete();
-                    return;
-                }
-                'i' => {
-                    self.start_project_sync(ProjectSyncKind::Inventory, tx);
-                    return;
-                }
-                'v' => {
-                    self.start_project_sync(ProjectSyncKind::Vars, tx);
-                    return;
-                }
-                _ => {}
+    fn handle_settings_editor_char(&mut self, ch: char) {
+        match ch {
+            'j' => {
+                self.settings_editor_field_idx = min(
+                    self.settings_editor_field_idx + 1,
+                    PLAYBOOK_SETTINGS_FIELD_COUNT - 1,
+                );
             }
-        }
-
-        if self.current_view() == View::Playbooks {
-            match ch {
-                'i' => {
-                    self.cycle_playbook_inventory(1);
-                    return;
-                }
-                'I' => {
-                    self.cycle_playbook_inventory(-1);
-                    return;
-                }
-                _ => {}
+            'k' => {
+                self.settings_editor_field_idx = self.settings_editor_field_idx.saturating_sub(1);
             }
+            'h' => self.adjust_settings_field(-1),
+            'l' => self.adjust_settings_field(1),
+            ' ' => self.toggle_settings_boolean_field(),
+            'e' => self.begin_settings_text_edit(),
+            't' => self.close_playbook_settings(),
+            _ => {}
         }
+    }
 
-        if self.current_view() == View::Templates {
-            match ch {
-                'n' => {
-                    self.open_template_editor_new();
-                    return;
-                }
-                'e' => {
-                    self.open_template_editor_edit();
-                    return;
-                }
-                't' => {
-                    self.open_template_editor_edit();
-                    return;
-                }
-                'D' => {
-                    self.delete_selected_template();
-                    return;
-                }
-                'r' => {
-                    self.start_template_run(tx);
-                    return;
-                }
-                'h' => {
-                    self.templates_focus_runs = false;
-                    return;
-                }
-                'l' => {
-                    self.templates_focus_runs = true;
-                    self.sync_run_selection_to_selected_template();
-                    return;
-                }
-                'v' => {
-                    self.toggle_log_select_mode();
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        if self.current_view() == View::Settings {
-            match ch {
-                'j' => {
-                    self.global_settings_field_idx = min(
-                        self.global_settings_field_idx + 1,
-                        GLOBAL_SETTINGS_FIELD_COUNT - 1,
+    fn handle_runtime_prompt_char(&mut self, ch: char, tx: &UnboundedSender<Action>) {
+        match ch {
+            'j' => {
+                if !self.runtime_candidates.is_empty() {
+                    self.runtime_candidate_idx = min(
+                        self.runtime_candidate_idx + 1,
+                        self.runtime_candidates.len() - 1,
                     );
                 }
-                'k' => {
-                    self.global_settings_field_idx =
-                        self.global_settings_field_idx.saturating_sub(1);
+            }
+            'k' => {
+                self.runtime_candidate_idx = self.runtime_candidate_idx.saturating_sub(1);
+            }
+            'b' => self.bootstrap_managed_runtime(tx),
+            _ => {}
+        }
+    }
+
+    fn handle_inventory_context_char(&mut self, ch: char, tx: &UnboundedSender<Action>) -> bool {
+        if self.current_view() != View::Inventory {
+            return false;
+        }
+        if self.inventory_sub_tab == InventorySubTab::Groups && self.hosts_subtab_add_var_open {
+            match ch {
+                '\n' => {
+                    let name = self.hosts_subtab_add_var_buffer.trim().to_string();
+                    if !name.is_empty()
+                        && is_valid_inventory_key(&name)
+                        && !is_reserved_inventory_group(&name)
+                    {
+                        if let Some(ref mut state) = self.inventory_edit_state {
+                            if !state.groups.contains(&name) {
+                                state.groups.push(name.clone());
+                                state.assignments.entry(name.clone()).or_default();
+                                state.group_children.entry(name).or_default();
+                                state.dirty = true;
+                            }
+                        }
+                    }
+                    self.hosts_subtab_add_var_open = false;
+                    self.hosts_subtab_add_var_buffer.clear();
                 }
-                'h' => self.adjust_global_settings_field(-1),
-                'l' => self.adjust_global_settings_field(1),
-                ' ' => self.toggle_global_settings_boolean_field(),
-                'e' => self.begin_global_settings_text_edit(),
-                'u' => self.open_runtime_prompt(),
-                'b' => self.bootstrap_managed_runtime(tx),
+                _ if ch == '\x08' || ch == '\x7f' => {
+                    self.hosts_subtab_add_var_buffer.pop();
+                }
+                _ if !ch.is_control() => {
+                    self.hosts_subtab_add_var_buffer.push(ch);
+                }
                 _ => {}
             }
-            return;
+            return true;
+        }
+        if self.inventory_sub_tab == InventorySubTab::Groups && self.hosts_subtab_add_host_open {
+            match ch {
+                '\n' => {
+                    let name = self.hosts_subtab_add_host_buffer.trim().to_string();
+                    if !name.is_empty() && is_valid_inventory_key(&name) {
+                        if let Some(ref mut state) = self.inventory_edit_state {
+                            if !state.hosts.contains(&name) {
+                                state.hosts.push(name.clone());
+                                state.host_vars.entry(name).or_default();
+                                state.dirty = true;
+                            }
+                        }
+                    }
+                    self.hosts_subtab_add_host_open = false;
+                    self.hosts_subtab_add_host_buffer.clear();
+                }
+                _ if ch == '\x08' || ch == '\x7f' => {
+                    self.hosts_subtab_add_host_buffer.pop();
+                }
+                _ if !ch.is_control() => {
+                    self.hosts_subtab_add_host_buffer.push(ch);
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        let inventory_input_mode_active = self.hosts_subtab_add_var_open
+            || self.hosts_subtab_add_host_open
+            || self.hosts_subtab_editing;
+        if !inventory_input_mode_active {
+            match ch {
+                '1' => {
+                    self.inventory_sub_tab = InventorySubTab::Files;
+                    return true;
+                }
+                '2' => {
+                    if self.selected_inventory_is_yaml() {
+                        self.inventory_sub_tab = InventorySubTab::Hosts;
+                        self.load_inventory_edit_state();
+                    } else {
+                        self.status_line =
+                            String::from("Hosts sub-tab is only available for YAML inventories");
+                    }
+                    return true;
+                }
+                '3' => {
+                    if self.selected_inventory_is_yaml() {
+                        self.inventory_sub_tab = InventorySubTab::Groups;
+                        self.load_inventory_edit_state();
+                    } else {
+                        self.status_line =
+                            String::from("Groups sub-tab is only available for YAML inventories");
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        if ch == 'p'
+            && !inventory_input_mode_active
+            && matches!(
+                self.inventory_sub_tab,
+                InventorySubTab::Hosts | InventorySubTab::Groups
+            )
+        {
+            self.start_inventory_ping_run(tx);
+            return true;
+        }
+
+        match self.inventory_sub_tab {
+            InventorySubTab::Hosts => {
+                self.handle_hosts_subtab_char(ch);
+                return true;
+            }
+            InventorySubTab::Groups => {
+                self.handle_groups_subtab_char(ch);
+                return true;
+            }
+            InventorySubTab::Files => {}
         }
 
         match ch {
+            'n' => {
+                self.open_inventory_create_prompt();
+                true
+            }
+            'e' => {
+                self.open_inventory_edit_mode_prompt();
+                true
+            }
+            'D' => {
+                self.request_inventory_delete();
+                true
+            }
+            'r' => {
+                self.status_line = String::from("Use Templates tab to run a selected template");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_projects_context_char(&mut self, ch: char, tx: &UnboundedSender<Action>) -> bool {
+        if self.current_view() != View::Projects {
+            return false;
+        }
+        match ch {
+            'n' => {
+                self.open_project_create_prompt(ProjectCreateMode::New);
+                true
+            }
+            'f' => {
+                self.open_project_create_prompt(ProjectCreateMode::ExistingFs);
+                true
+            }
+            'g' => {
+                self.open_project_create_prompt(ProjectCreateMode::Git);
+                true
+            }
+            'a' => {
+                self.activate_selected_project();
+                true
+            }
+            'e' => {
+                self.open_project_ssh_prompt();
+                true
+            }
+            'V' => {
+                self.open_vault_create_prompt();
+                true
+            }
+            'E' => {
+                self.open_vault_edit_prompt(tx);
+                true
+            }
+            'P' => {
+                self.open_vault_password_create_prompt();
+                true
+            }
+            'D' => {
+                self.request_project_delete();
+                true
+            }
+            'i' => {
+                self.start_project_sync(ProjectSyncKind::Inventory, tx);
+                true
+            }
+            'v' => {
+                self.start_project_sync(ProjectSyncKind::Vars, tx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_playbooks_context_char(&mut self, ch: char) -> bool {
+        if self.current_view() != View::Playbooks {
+            return false;
+        }
+        match ch {
+            'i' => {
+                self.cycle_playbook_inventory(1);
+                true
+            }
+            'I' => {
+                self.cycle_playbook_inventory(-1);
+                true
+            }
             'h' => {
-                self.clear_log_select_mode_for_view_change();
-                self.view_idx = (self.view_idx + View::all().len() - 1) % View::all().len();
-                if self.current_view() == View::Playbooks {
-                    self.playbooks_focus_runs = false;
-                    self.sync_run_selection_to_selected_playbook();
-                } else if self.current_view() == View::Templates {
-                    self.templates_focus_runs = false;
-                    self.sync_run_selection_to_selected_template();
-                }
+                self.playbooks_focus_runs = false;
+                self.sync_run_selection_to_selected_playbook();
+                true
             }
             'l' => {
-                self.clear_log_select_mode_for_view_change();
-                self.view_idx = (self.view_idx + 1) % View::all().len();
-                if self.current_view() == View::Playbooks {
-                    self.playbooks_focus_runs = false;
-                    self.sync_run_selection_to_selected_playbook();
-                } else if self.current_view() == View::Templates {
-                    self.templates_focus_runs = false;
-                    self.sync_run_selection_to_selected_template();
-                }
+                self.playbooks_focus_runs = true;
+                self.sync_run_selection_to_selected_playbook();
+                true
             }
+            _ => false,
+        }
+    }
+
+    fn handle_templates_context_char(&mut self, ch: char, tx: &UnboundedSender<Action>) -> bool {
+        if self.current_view() != View::Templates {
+            return false;
+        }
+        match ch {
+            'n' => {
+                self.open_template_editor_new();
+                true
+            }
+            'e' | 't' => {
+                self.open_template_editor_edit();
+                true
+            }
+            'D' => {
+                self.delete_selected_template();
+                true
+            }
+            'r' => {
+                self.start_template_run(tx);
+                true
+            }
+            'h' => {
+                self.templates_focus_runs = false;
+                true
+            }
+            'l' => {
+                self.templates_focus_runs = true;
+                self.sync_run_selection_to_selected_template();
+                true
+            }
+            'v' => {
+                self.toggle_log_select_mode();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_settings_view_char(&mut self, ch: char, tx: &UnboundedSender<Action>) {
+        match ch {
+            'j' => {
+                self.global_settings_field_idx = min(
+                    self.global_settings_field_idx + 1,
+                    GLOBAL_SETTINGS_FIELD_COUNT - 1,
+                );
+            }
+            'k' => {
+                self.global_settings_field_idx = self.global_settings_field_idx.saturating_sub(1);
+            }
+            'h' => self.adjust_global_settings_field(-1),
+            'l' => self.adjust_global_settings_field(1),
+            ' ' => self.toggle_global_settings_boolean_field(),
+            'e' => self.begin_global_settings_text_edit(),
+            'u' => self.open_runtime_prompt(),
+            'b' => self.bootstrap_managed_runtime(tx),
+            _ => {}
+        }
+    }
+
+    fn handle_global_char_input(&mut self, ch: char, tx: &UnboundedSender<Action>) {
+        match ch {
+            'h' => self.switch_view(-1),
+            'l' => self.switch_view(1),
             'j' => {
                 if self.log_select_mode {
                     self.move_log_cursor_down();
@@ -1846,6 +2017,23 @@ impl App {
             'R' => self.refresh_project(),
             _ => {}
         }
+    }
+
+    fn is_text_entry_mode_active(&self) -> bool {
+        self.vault_runtime_prompt_open
+            || (self.settings_editor_open && self.settings_editor_text_mode)
+            || (self.template_editor_open && self.template_editor_text_mode)
+            || self.project_ssh_open
+            || self.vault_create_open
+            || self.vault_edit_open
+            || self.vault_password_create_open
+            || self.project_create_open
+            || self.inventory_create_open
+            || self.inventory_editor_open
+            || self.hosts_subtab_editing
+            || self.hosts_subtab_add_host_open
+            || self.hosts_subtab_add_var_open
+            || (self.current_view() == View::Settings && self.global_settings_text_mode)
     }
 
     fn handle_backspace(&mut self) {
@@ -2346,6 +2534,23 @@ impl App {
         self.sync_log_cursor_to_selected_run();
     }
 
+    fn switch_view(&mut self, delta: i8) {
+        self.clear_log_select_mode_for_view_change();
+        let len = View::all().len();
+        if delta >= 0 {
+            self.view_idx = (self.view_idx + 1) % len;
+        } else {
+            self.view_idx = (self.view_idx + len - 1) % len;
+        }
+        if self.current_view() == View::Playbooks {
+            self.playbooks_focus_runs = false;
+            self.sync_run_selection_to_selected_playbook();
+        } else if self.current_view() == View::Templates {
+            self.templates_focus_runs = false;
+            self.sync_run_selection_to_selected_template();
+        }
+    }
+
     fn mark_log_selection(&mut self) {
         if !self.log_select_mode {
             return;
@@ -2412,7 +2617,10 @@ impl App {
     }
 
     fn log_mouse_drag(&mut self, row: u16, viewport_height: u16) {
-        if self.current_view() != View::Playbooks || !self.log_select_mode || self.runs.is_empty() {
+        if !matches!(self.current_view(), View::Playbooks | View::Templates)
+            || !self.log_select_mode
+            || self.runs.is_empty()
+        {
             return;
         }
         let Some(idx) = self.log_index_from_view_row(row, viewport_height) else {
@@ -2422,7 +2630,7 @@ impl App {
     }
 
     fn log_mouse_up(&mut self) {
-        if self.current_view() != View::Playbooks
+        if !matches!(self.current_view(), View::Playbooks | View::Templates)
             || !self.log_select_mode
             || self.log_anchor.is_none()
         {
@@ -5542,8 +5750,6 @@ impl App {
             .join(key)
     }
 
-
-
     fn request_quit(&mut self) {
         self.persist_all_runs();
         self.should_quit = true;
@@ -7686,6 +7892,13 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
+
+    fn make_test_app(name: &str) -> App {
+        let cwd = std::env::temp_dir().join(format!("ansible_tui_help_tests_{name}"));
+        let _ = fs::create_dir_all(&cwd);
+        App::new(cwd)
+    }
 
     #[test]
     fn parse_group_host_vars_into_host_detail_state() {
@@ -7735,5 +7948,217 @@ all:
     fn parse_extra_vars_file_refs_rejects_plaintext_values() {
         assert!(parse_extra_vars_file_refs("{\"password\":\"secret\"}").is_err());
         assert!(parse_extra_vars_file_refs("foo=bar").is_err());
+    }
+
+    #[test]
+    fn keyboard_help_toggle_opens_and_closes() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("toggle");
+
+        app.update(Action::CharInput('?'), &tx);
+        assert!(app.help_overlay_open);
+
+        app.update(Action::CloseRuntimePrompt, &tx);
+        assert!(!app.help_overlay_open);
+    }
+
+    #[test]
+    fn keyboard_help_blocks_navigation_actions() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("navigation");
+
+        let initial_view = app.view_idx;
+        app.update(Action::CharInput('?'), &tx);
+        assert!(app.help_overlay_open);
+
+        app.update(Action::NextView, &tx);
+        assert_eq!(app.view_idx, initial_view);
+    }
+
+    #[test]
+    fn question_mark_still_types_in_text_input_mode() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("text_mode");
+        app.inventory_create_open = true;
+
+        app.update(Action::CharInput('?'), &tx);
+
+        assert!(!app.help_overlay_open);
+        assert_eq!(app.inventory_create_buffer, "?");
+    }
+
+    #[test]
+    fn escape_exits_log_select_mode_in_playbooks() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("esc_log_select");
+        app.view_idx = 3;
+        app.log_select_mode = true;
+
+        app.update(Action::CloseRuntimePrompt, &tx);
+
+        assert!(!app.log_select_mode);
+    }
+
+    #[test]
+    fn playbooks_hl_switches_local_focus() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("playbooks_hl");
+        app.view_idx = 3;
+        app.runtime_prompt_open = false;
+        app.playbooks_focus_runs = false;
+
+        app.update(Action::CharInput('l'), &tx);
+        assert!(app.playbooks_focus_runs);
+
+        app.update(Action::CharInput('h'), &tx);
+        assert!(!app.playbooks_focus_runs);
+    }
+
+    #[test]
+    fn dashboard_hl_still_switches_views() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("dashboard_hl");
+        app.view_idx = 0;
+        app.runtime_prompt_open = false;
+
+        app.update(Action::CharInput('l'), &tx);
+        assert_eq!(app.view_idx, 1);
+    }
+
+    #[test]
+    fn content_focus_context_reports_playbooks_log_select() {
+        let mut app = make_test_app("focus_playbooks_log");
+        app.view_idx = 3;
+        app.runtime_prompt_open = false;
+        app.log_select_mode = true;
+        assert_eq!(
+            app.content_focus_context(),
+            FocusContext::PlaybooksLogSelect
+        );
+    }
+
+    #[test]
+    fn content_focus_context_runtime_prompt_has_precedence() {
+        let mut app = make_test_app("focus_runtime");
+        app.view_idx = 3;
+        app.runtime_prompt_open = true;
+        assert_eq!(app.content_focus_context(), FocusContext::RuntimePrompt);
+    }
+
+    #[test]
+    fn content_focus_context_modal_has_precedence() {
+        let mut app = make_test_app("focus_modal");
+        app.view_idx = 0;
+        app.runtime_prompt_open = false;
+        app.inventory_create_open = true;
+        assert_eq!(app.content_focus_context(), FocusContext::Modal);
+    }
+
+    #[test]
+    fn content_focus_context_ignores_help_overlay() {
+        let mut app = make_test_app("focus_content_overlay");
+        app.view_idx = 3;
+        app.runtime_prompt_open = false;
+        app.log_select_mode = true;
+        app.help_overlay_open = true;
+
+        assert_eq!(
+            app.content_focus_context(),
+            FocusContext::PlaybooksLogSelect
+        );
+    }
+
+    #[test]
+    fn enter_toggles_focus_in_playbooks() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("enter_playbooks_focus");
+        app.view_idx = 3;
+        app.runtime_prompt_open = false;
+        app.playbooks_focus_runs = false;
+        app.log_select_mode = false;
+
+        app.update(Action::SelectRuntimeCandidate, &tx);
+        assert!(app.playbooks_focus_runs);
+        app.update(Action::SelectRuntimeCandidate, &tx);
+        assert!(!app.playbooks_focus_runs);
+    }
+
+    #[test]
+    fn enter_toggles_focus_in_templates() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("enter_templates_focus");
+        app.view_idx = 4;
+        app.runtime_prompt_open = false;
+        app.templates_focus_runs = false;
+        app.log_select_mode = false;
+
+        app.update(Action::SelectRuntimeCandidate, &tx);
+        assert!(app.templates_focus_runs);
+        app.update(Action::SelectRuntimeCandidate, &tx);
+        assert!(!app.templates_focus_runs);
+    }
+
+    #[test]
+    fn focus_router_handles_projects_shortcuts() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("router_projects");
+        app.view_idx = 1;
+        app.runtime_prompt_open = false;
+        app.project_create_open = false;
+
+        app.update(Action::CharInput('n'), &tx);
+
+        assert!(app.project_create_open);
+    }
+
+    #[test]
+    fn focus_router_handles_settings_shortcuts() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("router_settings");
+        app.view_idx = 5;
+        app.runtime_prompt_open = false;
+        app.global_settings_field_idx = 0;
+
+        app.update(Action::CharInput('j'), &tx);
+
+        assert_eq!(app.global_settings_field_idx, 1);
+    }
+
+    #[test]
+    fn next_view_cycles_when_no_modal_blocks() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("next_view_cycle");
+        app.view_idx = 0;
+        app.runtime_prompt_open = false;
+
+        app.update(Action::NextView, &tx);
+
+        assert_eq!(app.view_idx, 1);
+    }
+
+    #[test]
+    fn next_view_blocked_during_modal() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("next_view_blocked");
+        app.view_idx = 0;
+        app.runtime_prompt_open = false;
+        app.project_create_open = true;
+
+        app.update(Action::NextView, &tx);
+
+        assert_eq!(app.view_idx, 0);
+    }
+
+    #[test]
+    fn settings_increase_focuses_playbook_runs() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("settings_inc_playbooks");
+        app.view_idx = 3;
+        app.runtime_prompt_open = false;
+        app.playbooks_focus_runs = false;
+
+        app.update(Action::SettingsIncrease, &tx);
+
+        assert!(app.playbooks_focus_runs);
     }
 }

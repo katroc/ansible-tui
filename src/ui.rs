@@ -11,11 +11,648 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    display_path, App, GroupsFocus, InventorySubTab, ProjectCreateMode, RunStatus, View,
+    display_path, App, FocusContext, InventorySubTab, ProjectCreateMode, RunStatus, View,
 };
 use crate::playbook_settings::PlaybookSettings;
 use crate::run::playbook_bin_available;
 use crate::theme as th;
+
+#[derive(Clone, Copy)]
+struct HintBinding {
+    key: &'static str,
+    desc: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct HelpModel {
+    title: &'static str,
+    hints: &'static [HintBinding],
+}
+
+const HINTS_RUNTIME_PROMPT: [HintBinding; 4] = [
+    HintBinding {
+        key: "j/k, Up/Down",
+        desc: "select runtime",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "use selected runtime",
+    },
+    HintBinding {
+        key: "b",
+        desc: "bootstrap managed runtime",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "close picker",
+    },
+];
+const HINTS_VAULT_PROMPT_CONFIRM: [HintBinding; 5] = [
+    HintBinding {
+        key: "Type",
+        desc: "enter password text",
+    },
+    HintBinding {
+        key: "Tab/Shift+Tab",
+        desc: "switch field",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "next/confirm",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "continue action",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_VAULT_PROMPT_SIMPLE: [HintBinding; 4] = [
+    HintBinding {
+        key: "Type",
+        desc: "enter password text",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "confirm",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "continue action",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_INVENTORY_CREATE: [HintBinding; 4] = [
+    HintBinding {
+        key: "Type",
+        desc: "inventory filename",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "create file",
+    },
+    HintBinding {
+        key: "Backspace",
+        desc: "edit text",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_PROJECT_CREATE: [HintBinding; 5] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit current field",
+    },
+    HintBinding {
+        key: "Up/Down",
+        desc: "change field",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "next/save",
+    },
+    HintBinding {
+        key: "Backspace",
+        desc: "edit text",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_PROJECT_SECRETS: [HintBinding; 5] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit current field",
+    },
+    HintBinding {
+        key: "Up/Down",
+        desc: "change field",
+    },
+    HintBinding {
+        key: "h/l",
+        desc: "cycle vault source",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "save settings",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_VAULT_CREATE: [HintBinding; 5] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit path/content",
+    },
+    HintBinding {
+        key: "Up/Down",
+        desc: "switch field",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "next/newline",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "encrypt and save",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_VAULT_EDIT: [HintBinding; 5] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit path/content",
+    },
+    HintBinding {
+        key: "Up/Down",
+        desc: "switch field",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "reload/newline",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "re-encrypt and save",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_VAULT_PASSWORD_CREATE: [HintBinding; 5] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit fields",
+    },
+    HintBinding {
+        key: "Up/Down",
+        desc: "switch field",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "next field",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "create file",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_INVENTORY_EDIT_MODE: [HintBinding; 5] = [
+    HintBinding {
+        key: "j/k, Up/Down",
+        desc: "select mode",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "confirm mode",
+    },
+    HintBinding {
+        key: "1/2, e/t",
+        desc: "quick select",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+    HintBinding {
+        key: "Tab/h/l",
+        desc: "switch view",
+    },
+];
+const HINTS_INVENTORY_EDITOR: [HintBinding; 5] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit text",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "newline",
+    },
+    HintBinding {
+        key: "Backspace",
+        desc: "delete char",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "save",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "close editor",
+    },
+];
+const HINTS_SETTINGS_EDITOR: [HintBinding; 5] = [
+    HintBinding {
+        key: "j/k",
+        desc: "move field",
+    },
+    HintBinding {
+        key: "h/l, <-/->",
+        desc: "adjust value",
+    },
+    HintBinding {
+        key: "Enter/e",
+        desc: "edit text field",
+    },
+    HintBinding {
+        key: "Space",
+        desc: "toggle boolean",
+    },
+    HintBinding {
+        key: "Esc/t",
+        desc: "close",
+    },
+];
+const HINTS_SETTINGS_EDITOR_TEXT: [HintBinding; 5] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit text",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "save/newline",
+    },
+    HintBinding {
+        key: "Backspace",
+        desc: "delete char",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "save",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_TEMPLATE_EDITOR: [HintBinding; 5] = [
+    HintBinding {
+        key: "j/k",
+        desc: "move field",
+    },
+    HintBinding {
+        key: "h/l, <-/->",
+        desc: "adjust value",
+    },
+    HintBinding {
+        key: "Enter/e",
+        desc: "edit text field",
+    },
+    HintBinding {
+        key: "Space",
+        desc: "toggle boolean",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "save template",
+    },
+];
+const HINTS_TEMPLATE_EDITOR_TEXT: [HintBinding; 5] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit text",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "save/newline",
+    },
+    HintBinding {
+        key: "Backspace",
+        desc: "delete char",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "save",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel",
+    },
+];
+const HINTS_DASHBOARD: [HintBinding; 5] = [
+    HintBinding {
+        key: "Tab/h/l",
+        desc: "switch view",
+    },
+    HintBinding {
+        key: "r",
+        desc: "run selected playbook",
+    },
+    HintBinding {
+        key: "u",
+        desc: "open runtime picker",
+    },
+    HintBinding {
+        key: "Shift+R",
+        desc: "refresh project discovery",
+    },
+    HintBinding {
+        key: "q",
+        desc: "quit",
+    },
+];
+const HINTS_PROJECTS: [HintBinding; 7] = [
+    HintBinding {
+        key: "j/k, Up/Down",
+        desc: "select project",
+    },
+    HintBinding {
+        key: "Enter/a",
+        desc: "activate selected",
+    },
+    HintBinding {
+        key: "n/f/g",
+        desc: "new/import/clone project",
+    },
+    HintBinding {
+        key: "e",
+        desc: "project secret settings",
+    },
+    HintBinding {
+        key: "Shift+V/E/P",
+        desc: "create/edit vault, create password file",
+    },
+    HintBinding {
+        key: "i/v",
+        desc: "sync inventory/vars",
+    },
+    HintBinding {
+        key: "Shift+D",
+        desc: "delete selected project",
+    },
+];
+const HINTS_INVENTORY_FILES: [HintBinding; 6] = [
+    HintBinding {
+        key: "j/k, Up/Down",
+        desc: "select inventory",
+    },
+    HintBinding {
+        key: "n",
+        desc: "new inventory",
+    },
+    HintBinding {
+        key: "e",
+        desc: "edit selected inventory",
+    },
+    HintBinding {
+        key: "Shift+D",
+        desc: "delete selected inventory",
+    },
+    HintBinding {
+        key: "2/3",
+        desc: "switch to Hosts/Groups",
+    },
+    HintBinding {
+        key: "Tab/h/l",
+        desc: "switch view",
+    },
+];
+const HINTS_INVENTORY_HOSTS: [HintBinding; 7] = [
+    HintBinding {
+        key: "h/l",
+        desc: "focus list/detail",
+    },
+    HintBinding {
+        key: "j/k",
+        desc: "navigate focused panel",
+    },
+    HintBinding {
+        key: "e, Enter",
+        desc: "edit selected field",
+    },
+    HintBinding {
+        key: "n/a",
+        desc: "add host / variable",
+    },
+    HintBinding {
+        key: "D",
+        desc: "delete host or variable",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "save inventory",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "back to inventory files",
+    },
+];
+const HINTS_INVENTORY_GROUPS: [HintBinding; 7] = [
+    HintBinding {
+        key: "h/l",
+        desc: "focus tree/groups/hosts",
+    },
+    HintBinding {
+        key: "j/k",
+        desc: "navigate focused list",
+    },
+    HintBinding {
+        key: "Space",
+        desc: "toggle attach/detach",
+    },
+    HintBinding {
+        key: "n",
+        desc: "add group/host",
+    },
+    HintBinding {
+        key: "d, D",
+        desc: "detach / delete",
+    },
+    HintBinding {
+        key: "Ctrl+S",
+        desc: "save inventory",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "back to inventory files",
+    },
+];
+const HINTS_PLAYBOOKS: [HintBinding; 7] = [
+    HintBinding {
+        key: "<-/->, h/l, Enter",
+        desc: "focus playbooks/runs",
+    },
+    HintBinding {
+        key: "j/k",
+        desc: "move focused list",
+    },
+    HintBinding {
+        key: "i/I",
+        desc: "cycle inventory target",
+    },
+    HintBinding {
+        key: "r",
+        desc: "run selected playbook",
+    },
+    HintBinding {
+        key: "t",
+        desc: "playbook settings",
+    },
+    HintBinding {
+        key: "v",
+        desc: "log-select mode",
+    },
+    HintBinding {
+        key: "PgUp/PgDn, End",
+        desc: "scroll/follow logs",
+    },
+];
+const HINTS_PLAYBOOKS_LOG_SELECT: [HintBinding; 7] = [
+    HintBinding {
+        key: "j/k, Up/Down",
+        desc: "move log cursor",
+    },
+    HintBinding {
+        key: "Space",
+        desc: "set/clear selection mark",
+    },
+    HintBinding {
+        key: "y",
+        desc: "copy selected log lines",
+    },
+    HintBinding {
+        key: "v",
+        desc: "exit log-select mode",
+    },
+    HintBinding {
+        key: "PgUp/PgDn, End",
+        desc: "scroll/follow logs",
+    },
+    HintBinding {
+        key: "<-/->",
+        desc: "focus playbooks/runs",
+    },
+    HintBinding {
+        key: "r",
+        desc: "run selected playbook",
+    },
+];
+const HINTS_TEMPLATES: [HintBinding; 7] = [
+    HintBinding {
+        key: "<-/->, h/l, Enter",
+        desc: "focus templates/runs",
+    },
+    HintBinding {
+        key: "j/k",
+        desc: "move focused list",
+    },
+    HintBinding {
+        key: "n",
+        desc: "new template",
+    },
+    HintBinding {
+        key: "t/e",
+        desc: "edit template",
+    },
+    HintBinding {
+        key: "r",
+        desc: "run selected template",
+    },
+    HintBinding {
+        key: "Shift+D",
+        desc: "delete selected template",
+    },
+    HintBinding {
+        key: "v",
+        desc: "log-select mode",
+    },
+];
+const HINTS_TEMPLATES_LOG_SELECT: [HintBinding; 6] = [
+    HintBinding {
+        key: "j/k, Up/Down",
+        desc: "move log cursor",
+    },
+    HintBinding {
+        key: "Space",
+        desc: "set/clear selection mark",
+    },
+    HintBinding {
+        key: "y",
+        desc: "copy selected log lines",
+    },
+    HintBinding {
+        key: "v",
+        desc: "exit log-select mode",
+    },
+    HintBinding {
+        key: "<-/->",
+        desc: "focus templates/runs",
+    },
+    HintBinding {
+        key: "r",
+        desc: "run selected template",
+    },
+];
+const HINTS_SETTINGS: [HintBinding; 6] = [
+    HintBinding {
+        key: "j/k",
+        desc: "select field",
+    },
+    HintBinding {
+        key: "h/l, <-/->",
+        desc: "adjust selected value",
+    },
+    HintBinding {
+        key: "Space",
+        desc: "toggle boolean",
+    },
+    HintBinding {
+        key: "Enter/e",
+        desc: "edit text field",
+    },
+    HintBinding {
+        key: "u",
+        desc: "open runtime picker",
+    },
+    HintBinding {
+        key: "Tab",
+        desc: "switch view",
+    },
+];
+const HINTS_SETTINGS_TEXT: [HintBinding; 6] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit text value",
+    },
+    HintBinding {
+        key: "Backspace",
+        desc: "delete char",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "save value",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "cancel edit",
+    },
+    HintBinding {
+        key: "j/k",
+        desc: "move field",
+    },
+    HintBinding {
+        key: "Tab",
+        desc: "switch view",
+    },
+];
 
 pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(
@@ -73,6 +710,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.runtime_prompt_open {
         render_runtime_prompt(frame, app);
     }
+    if app.help_overlay_open {
+        render_help_overlay(frame, app);
+    }
 }
 
 fn render_body(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -106,7 +746,7 @@ fn render_tabs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .style(Style::default().bg(th::MANTLE).fg(th::SUBTEXT1))
                 .title("Ansible TUI"),
         )
@@ -259,7 +899,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Runtime Health"),
         )
         .label(if runtime_ready {
@@ -282,7 +922,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Success Rate"),
         )
         .label(Span::styled(
@@ -298,7 +938,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Playbook Coverage"),
         )
         .label(Span::styled(
@@ -324,7 +964,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Job Status Breakdown"),
         )
         .bar_width(8)
@@ -348,7 +988,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Run Outcomes (40)"),
         )
         .style(Style::default().fg(th::GREEN))
@@ -361,7 +1001,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Run Volume (14d)"),
         )
         .style(Style::default().fg(th::YELLOW))
@@ -422,7 +1062,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Projects"),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
@@ -436,11 +1076,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(16),
-            Constraint::Min(6),
-            Constraint::Length(2),
-        ])
+        .constraints([Constraint::Length(16), Constraint::Min(6)])
         .split(chunks[1]);
 
     let rows = if let Some(project) = app.selected_project() {
@@ -536,23 +1172,14 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             (String::from("inventories"), String::from("0")),
         ]
     };
-    let table_rows = rows
-        .into_iter()
-        .map(|(property, value)| Row::new(vec![Cell::from(property), Cell::from(value)]))
-        .collect::<Vec<_>>();
-    let details = Table::new(table_rows, [Constraint::Length(18), Constraint::Min(10)])
-        .header(
-            Row::new(vec!["Property", "Value"]).style(
-                Style::default()
-                    .fg(th::SUBTEXT1)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .column_spacing(1)
+    let (detail_cols, detail_spacing) = key_value_table_layout(right[0], 20);
+    let details = Table::new(styled_key_value_rows(rows), detail_cols)
+        .column_spacing(detail_spacing)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
+                .style(Style::default().bg(th::BASE))
                 .title("Project Details"),
         );
     frame.render_widget(details, right[0]);
@@ -578,18 +1205,12 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 .border_style(if app.project_sync_running {
                     Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(th::SURFACE1)
+                    neutral_border_style()
                 })
                 .title("Project Sync Logs"),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(logs, right[1]);
-
-    let hint = Paragraph::new(
-        "n new | f import path | g clone git | e secret settings | Shift+V create new vault | Shift+E edit vault | Shift+P create vault password | a/Enter activate | Shift+D delete | i inventory sync | v vars sync | j/k select",
-    )
-    .style(Style::default().fg(th::SUBTEXT0));
-    frame.render_widget(hint, right[2]);
 }
 
 fn render_inventory(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -655,7 +1276,7 @@ fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::R
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Inventories"),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
@@ -669,32 +1290,22 @@ fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::R
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(9),
-            Constraint::Min(5),
-            Constraint::Length(2),
-        ])
+        .constraints([Constraint::Length(9), Constraint::Min(5)])
         .split(chunks[1]);
 
-    let rows = inventory_detail_rows(app)
-        .into_iter()
-        .map(|(property, value)| Row::new(vec![Cell::from(property), Cell::from(value)]))
-        .collect::<Vec<_>>();
-    let details = Table::new(rows, [Constraint::Length(16), Constraint::Min(10)])
-        .header(
-            Row::new(vec!["Property", "Value"]).style(
-                Style::default()
-                    .fg(th::SUBTEXT1)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .column_spacing(1)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
-                .title("Inventory Details"),
-        );
+    let (detail_cols, detail_spacing) = key_value_table_layout(right[0], 18);
+    let details = Table::new(
+        styled_key_value_rows(inventory_detail_rows(app)),
+        detail_cols,
+    )
+    .column_spacing(detail_spacing)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(neutral_border_style())
+            .style(Style::default().bg(th::BASE))
+            .title("Inventory Details"),
+    );
     frame.render_widget(details, right[0]);
 
     let preview = Paragraph::new(inventory_preview_text(
@@ -704,18 +1315,11 @@ fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::R
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(th::SURFACE1))
+            .border_style(neutral_border_style())
             .title("File Preview"),
     )
     .wrap(Wrap { trim: false });
     frame.render_widget(preview, right[1]);
-
-    let hint = Paragraph::new(
-        "n new inventory | e edit selected (choose mode) | Shift+D delete selected | j/k select | 2 Hosts | 3 Groups",
-    )
-    .style(Style::default().fg(th::SUBTEXT0))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(hint, right[2]);
 }
 
 fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -726,15 +1330,10 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
         return;
     };
 
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(2)])
-        .split(area);
-
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(layout[0]);
+        .split(area);
 
     // Host list (left panel)
     let list_items: Vec<ListItem> = if state.hosts.is_empty() {
@@ -747,10 +1346,12 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
             .collect()
     };
     let dirty_marker = if state.dirty { " [*]" } else { "" };
-    let list_border = if !app.hosts_subtab_focus_detail {
+    let focus_ctx = app.content_focus_context();
+    let detail_focused = matches!(focus_ctx, FocusContext::InventoryHostDetails);
+    let list_border = if matches!(focus_ctx, FocusContext::InventoryHostsList) {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(th::SURFACE1)
+        neutral_border_style()
     };
     let host_list = List::new(list_items)
         .block(
@@ -769,10 +1370,10 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
     frame.render_stateful_widget(host_list, cols[0], &mut list_state);
 
     // Host detail (right panel)
-    let detail_border = if app.hosts_subtab_focus_detail {
+    let detail_border = if detail_focused {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(th::SURFACE1)
+        neutral_border_style()
     };
 
     if let Some(host) = state.hosts.get(app.hosts_subtab_idx) {
@@ -863,26 +1464,25 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
                     .border_style(detail_border)
                     .title(format!("Host: {host}")),
             )
-            .row_highlight_style(if app.hosts_subtab_focus_detail {
+            .row_highlight_style(if detail_focused {
                 Style::default().fg(th::YELLOW)
             } else {
                 Style::default()
             });
-        let mut table_state =
-            TableState::default().with_selected(if app.hosts_subtab_focus_detail {
-                Some(if let Some(v) = vars {
-                    if !v.custom_vars.is_empty() && app.hosts_subtab_field_idx >= 4 {
-                        // account for the separator row
-                        app.hosts_subtab_field_idx + 1
-                    } else {
-                        app.hosts_subtab_field_idx
-                    }
+        let mut table_state = TableState::default().with_selected(if detail_focused {
+            Some(if let Some(v) = vars {
+                if !v.custom_vars.is_empty() && app.hosts_subtab_field_idx >= 4 {
+                    // account for the separator row
+                    app.hosts_subtab_field_idx + 1
                 } else {
                     app.hosts_subtab_field_idx
-                })
+                }
             } else {
-                None
-            });
+                app.hosts_subtab_field_idx
+            })
+        } else {
+            None
+        });
         frame.render_stateful_widget(detail_table, cols[1], &mut table_state);
     } else {
         let empty = Paragraph::new("Select a host from the list")
@@ -932,13 +1532,6 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
         );
         frame.render_widget(input, prompt_area);
     }
-
-    let hint = Paragraph::new(
-        "h/l focus | j/k nav | e edit | p ping host | n add host | a add var | D delete | Ctrl+S save | Esc back",
-    )
-    .style(Style::default().fg(th::SUBTEXT0))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(hint, layout[1]);
 }
 
 fn host_field_placeholder(key: &str) -> &'static str {
@@ -959,11 +1552,6 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         return;
     };
 
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(2)])
-        .split(area);
-
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -971,7 +1559,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
             Constraint::Percentage(35),
             Constraint::Percentage(35),
         ])
-        .split(layout[0]);
+        .split(area);
 
     // Group tree (left) with box-drawing connectors
     let tree_nodes = app.groups_subtab_tree_nodes();
@@ -1028,10 +1616,11 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
             })
             .collect()
     };
-    let tree_border = if app.groups_subtab_focus == GroupsFocus::Tree {
+    let focus_ctx = app.content_focus_context();
+    let tree_border = if matches!(focus_ctx, FocusContext::InventoryGroupsTree) {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(th::SURFACE1)
+        neutral_border_style()
     };
     let dirty_marker = if state.dirty { " [*]" } else { "" };
     let tree = List::new(tree_items)
@@ -1049,6 +1638,8 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         Some(app.groups_subtab_tree_idx)
     });
     frame.render_stateful_widget(tree, cols[0], &mut tree_state);
+
+    let target_label = app.groups_subtab_target_group.as_deref().unwrap_or("all");
 
     // Groups list (middle)
     let candidate_groups = app.groups_subtab_candidate_groups();
@@ -1084,17 +1675,17 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
             })
             .collect()
     };
-    let groups_border = if app.groups_subtab_focus == GroupsFocus::Groups {
+    let groups_border = if matches!(focus_ctx, FocusContext::InventoryGroupsGroups) {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(th::SURFACE1)
+        neutral_border_style()
     };
     let groups_list = List::new(group_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(groups_border)
-                .title("Groups"),
+                .title(format!("Groups (target: {target_label})")),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
         .highlight_symbol(">> ");
@@ -1139,10 +1730,10 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
             })
             .collect()
     };
-    let hosts_border = if app.groups_subtab_focus == GroupsFocus::Hosts {
+    let hosts_border = if matches!(focus_ctx, FocusContext::InventoryGroupsHosts) {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(th::SURFACE1)
+        neutral_border_style()
     };
     let hosts_list = List::new(host_items)
         .block(
@@ -1196,14 +1787,6 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         );
         frame.render_widget(input, prompt_area);
     }
-
-    let target_label = app.groups_subtab_target_group.as_deref().unwrap_or("all");
-    let hint = Paragraph::new(format!(
-        "Target: {target_label} | h/l focus | j/k nav | Space toggle | p ping target | n add | d detach | D delete | Ctrl+S save | Esc back",
-    ))
-    .style(Style::default().fg(th::SUBTEXT0))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(hint, layout[1]);
 }
 
 fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -1226,10 +1809,16 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .map(|p| ListItem::new(display_path(app.active_project_root(), p)))
             .collect::<Vec<_>>()
     };
-    let playbooks_border_style = if app.playbooks_focus_runs {
-        Style::default().fg(th::SURFACE1)
-    } else {
+    let focus_ctx = app.content_focus_context();
+    let playbooks_border_style = if matches!(focus_ctx, FocusContext::PlaybooksList) {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+    } else {
+        neutral_border_style()
+    };
+    let runs_border_style = if matches!(focus_ctx, FocusContext::PlaybooksRuns) {
+        Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
+    } else {
+        neutral_border_style()
     };
     let list = List::new(items)
         .block(
@@ -1275,11 +1864,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(if app.playbooks_focus_runs {
-                    Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(th::SURFACE1)
-                })
+                .border_style(runs_border_style)
                 .title(format!(
                     "Runs For Selected Playbook ({})",
                     app.active_project_name()
@@ -1298,38 +1883,22 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let selected_inventory = app
             .selected_inventory_display_for_current_playbook()
             .unwrap_or_else(|| String::from("(none)"));
-        let bottom_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(1)])
-            .split(chunks[1]);
-        let rows = settings_preview_rows(&selected, &selected_inventory, &settings)
-            .into_iter()
-            .map(|(property, value)| Row::new(vec![Cell::from(property), Cell::from(value)]))
-            .collect::<Vec<_>>();
-        let table = Table::new(rows, [Constraint::Length(20), Constraint::Min(10)])
-            .header(
-                Row::new(vec!["Property", "Value"]).style(
-                    Style::default()
-                        .fg(th::SUBTEXT1)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            )
-            .column_spacing(1)
+        let rows = styled_key_value_rows(settings_preview_rows(
+            &selected,
+            &selected_inventory,
+            &settings,
+        ));
+        let (detail_cols, detail_spacing) = key_value_table_layout(chunks[1], 22);
+        let table = Table::new(rows, detail_cols)
+            .column_spacing(detail_spacing)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(th::SURFACE1))
+                    .border_style(neutral_border_style())
+                    .style(Style::default().bg(th::BASE))
                     .title("Playbook Settings"),
             );
-        frame.render_widget(table, bottom_chunks[0]);
-
-        frame.render_widget(
-            Paragraph::new(
-                "Press t to edit settings | i/I cycle inventory target | PgUp/PgDn scroll logs | End follow latest | <-/-> focus Playbooks/Runs | Up/Down move focused list",
-            )
-            .style(Style::default().fg(th::SUBTEXT0)),
-            bottom_chunks[1],
-        );
+        frame.render_widget(table, chunks[1]);
     } else {
         let paragraph = Paragraph::new(vec![
             Line::raw("No playbook selected"),
@@ -1338,7 +1907,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Playbook Settings"),
         );
         frame.render_widget(paragraph, chunks[1]);
@@ -1379,14 +1948,15 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .collect::<Vec<_>>()
     };
 
+    let focus_ctx = app.content_focus_context();
     let template_list = List::new(template_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(if app.templates_focus_runs {
-                    Style::default().fg(th::SURFACE1)
-                } else {
+                .border_style(if matches!(focus_ctx, FocusContext::TemplatesList) {
                     Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                } else {
+                    neutral_border_style()
                 })
                 .title("Templates"),
         )
@@ -1426,10 +1996,10 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(if app.templates_focus_runs {
+                .border_style(if matches!(focus_ctx, FocusContext::TemplatesRuns) {
                     Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(th::SURFACE1)
+                    neutral_border_style()
                 })
                 .title("Runs For Selected Template"),
         )
@@ -1462,39 +2032,17 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             (String::from("ssh_key_inline"), String::from("unset")),
         ]
     };
-    let bottom_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(1)])
-        .split(chunks[1]);
-
-    let table = Table::new(
-        rows.into_iter()
-            .map(|(k, v)| Row::new(vec![Cell::from(k), Cell::from(v)]))
-            .collect::<Vec<_>>(),
-        [Constraint::Length(20), Constraint::Min(10)],
-    )
-    .header(
-        Row::new(vec!["Property", "Value"]).style(
-            Style::default()
-                .fg(th::SUBTEXT1)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .column_spacing(1)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(th::SURFACE1))
-            .title("Template Settings"),
-    );
-    frame.render_widget(table, bottom_chunks[0]);
-
-    let hint = Paragraph::new(
-        "r run | t/e edit template | n new | Shift+D delete | <-/-> focus templates/runs",
-    )
-    .style(Style::default().fg(th::SUBTEXT0))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(hint, bottom_chunks[1]);
+    let (detail_cols, detail_spacing) = key_value_table_layout(chunks[1], 22);
+    let table = Table::new(styled_key_value_rows(rows), detail_cols)
+        .column_spacing(detail_spacing)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(neutral_border_style())
+                .style(Style::default().bg(th::BASE))
+                .title("Template Settings"),
+        );
+    frame.render_widget(table, chunks[1]);
 }
 
 fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -1563,19 +2111,30 @@ fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         })
         .unwrap_or_else(|| Text::from(empty_message));
 
+    let focus_ctx = app.content_focus_context();
     let (title, border_style) = if app.current_view() == View::Templates {
         (
             "Template Run Logs",
-            if app.templates_focus_runs {
+            if matches!(focus_ctx, FocusContext::TemplatesLogSelect) {
+                Style::default()
+                    .fg(th::FOCUS_BORDER)
+                    .add_modifier(Modifier::BOLD)
+            } else if matches!(focus_ctx, FocusContext::TemplatesRuns) {
                 Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(th::SURFACE1)
+                neutral_border_style()
             },
         )
     } else {
         (
             "Live Logs (Selected Run)",
-            Style::default().fg(th::SURFACE1),
+            if matches!(focus_ctx, FocusContext::PlaybooksLogSelect) {
+                Style::default()
+                    .fg(th::FOCUS_BORDER)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                neutral_border_style()
+            },
         )
     };
 
@@ -1592,30 +2151,244 @@ fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn render_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let runtime_required = !playbook_bin_available(&app.run_options.ansible_bin);
-    let style = if app.runtime_prompt_open && !app.runtime_bootstrapping && runtime_required {
-        Style::default().fg(th::CRUST).bg(th::RED)
-    } else {
-        Style::default().fg(th::TEXT).bg(th::MANTLE)
-    };
+    let style = status_line_style(app, runtime_required);
     let status = Paragraph::new(app.status_line.clone()).style(style);
     frame.render_widget(status, area);
 }
 
 fn render_help(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let helper = Paragraph::new(active_help_text(app))
-        .style(Style::default().fg(th::TEXT).bg(th::SURFACE1))
-        .wrap(Wrap { trim: true });
+    let helper = Paragraph::new(compact_help_line(app)).style(hint_bar_style());
     frame.render_widget(helper, area);
+}
+
+fn render_help_overlay(frame: &mut Frame, app: &App) {
+    let model = active_help_model(app);
+    let hints = active_hint_bindings(app);
+    let focus_label = focus_context_label(app.content_focus_context());
+
+    let area = centered_rect(86, 82, frame.area());
+    frame.render_widget(Clear, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(6),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    let header = Paragraph::new(format!(
+        "Context: {}  |  Focus: {}",
+        model.title, focus_label
+    ))
+    .style(
+        Style::default()
+            .fg(th::TEXT)
+            .bg(th::SURFACE1)
+            .add_modifier(Modifier::BOLD),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(th::FOCUS_BORDER))
+            .style(Style::default().bg(th::MANTLE))
+            .title("Keyboard Help"),
+    );
+    frame.render_widget(header, layout[0]);
+
+    let mut lines = hints
+        .iter()
+        .map(|hint| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<18}", hint.key),
+                    Style::default()
+                        .fg(th::HINT_KEY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(hint.desc, Style::default().fg(th::TEXT)),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    let max_rows = layout[1].height.saturating_sub(2) as usize;
+    if lines.len() > max_rows {
+        lines.truncate(max_rows);
+    }
+
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(neutral_border_style())
+            .style(Style::default().bg(th::BASE)),
+    );
+    frame.render_widget(body, layout[1]);
+
+    let footer = Paragraph::new("Esc or ? close help").style(hint_bar_style());
+    frame.render_widget(footer, layout[2]);
+}
+
+fn compact_help_line(app: &App) -> Line<'static> {
+    let hints = active_hint_bindings(app);
+    let mut spans = vec![
+        Span::styled(
+            format!("{} ", focus_context_label(app.content_focus_context())),
+            Style::default().fg(th::SUBTEXT1),
+        ),
+        Span::styled("| ", Style::default().fg(th::SUBTEXT1)),
+    ];
+    spans.extend(hint_spans_from_bindings(&hints, 5));
+    Line::from(spans)
+}
+
+fn hint_line_from_bindings(bindings: &[HintBinding], max_items: usize) -> Line<'static> {
+    Line::from(hint_spans_from_bindings(bindings, max_items))
+}
+
+fn hint_spans_from_bindings(bindings: &[HintBinding], max_items: usize) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (idx, hint) in bindings.iter().take(max_items).enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled("  |  ", Style::default().fg(th::SUBTEXT1)));
+        }
+        spans.push(Span::styled(
+            hint.key.to_string(),
+            Style::default()
+                .fg(th::HINT_KEY)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {}", hint.desc),
+            Style::default().fg(th::HINT_TEXT),
+        ));
+    }
+    spans
+}
+
+fn hint_bar_style() -> Style {
+    Style::default().fg(th::HINT_TEXT).bg(th::HINT_BG)
+}
+
+fn neutral_border_style() -> Style {
+    Style::default()
+        .fg(th::SURFACE0)
+        .add_modifier(Modifier::DIM)
+}
+
+fn focus_context_label(context: FocusContext) -> &'static str {
+    match context {
+        FocusContext::RuntimePrompt => "runtime picker",
+        FocusContext::Modal => "modal",
+        FocusContext::Dashboard => "dashboard",
+        FocusContext::Projects => "projects list",
+        FocusContext::InventoryFiles => "inventory files",
+        FocusContext::InventoryHostsList => "hosts list",
+        FocusContext::InventoryHostDetails => "host details",
+        FocusContext::InventoryGroupsTree => "groups tree",
+        FocusContext::InventoryGroupsGroups => "candidate groups",
+        FocusContext::InventoryGroupsHosts => "candidate hosts",
+        FocusContext::PlaybooksList => "playbooks list",
+        FocusContext::PlaybooksRuns => "playbook runs",
+        FocusContext::PlaybooksLogSelect => "playbook logs",
+        FocusContext::TemplatesList => "templates list",
+        FocusContext::TemplatesRuns => "template runs",
+        FocusContext::TemplatesLogSelect => "template logs",
+        FocusContext::Settings => "settings",
+    }
+}
+
+fn status_line_style(app: &App, runtime_required: bool) -> Style {
+    if app.runtime_prompt_open && !app.runtime_bootstrapping && runtime_required {
+        return Style::default().fg(th::CRUST).bg(th::RED);
+    }
+    let lowered = app.status_line.to_lowercase();
+    if lowered.starts_with("error:")
+        || lowered.contains(" failed")
+        || lowered.contains("failed:")
+        || lowered.contains("failed ")
+    {
+        return Style::default().fg(th::TEXT).bg(th::SURFACE0);
+    }
+    if lowered.contains("saved")
+        || lowered.contains("updated")
+        || lowered.contains("ready")
+        || lowered.contains("started")
+        || lowered.contains("succeeded")
+    {
+        return Style::default().fg(th::GREEN).bg(th::MANTLE);
+    }
+    Style::default().fg(th::TEXT).bg(th::MANTLE)
+}
+
+fn key_value_value_style(value: &str) -> Style {
+    let lowered = value.trim().to_ascii_lowercase();
+    if lowered == "true" {
+        return Style::default().fg(th::GREEN);
+    }
+    if lowered == "false" {
+        return Style::default().fg(th::SUBTEXT0);
+    }
+    if lowered == "unset" || lowered == "none" || lowered == "(none)" {
+        return Style::default()
+            .fg(th::SUBTEXT0)
+            .add_modifier(Modifier::ITALIC);
+    }
+    Style::default().fg(th::TEXT)
+}
+
+fn styled_key_value_rows(rows: Vec<(String, String)>) -> Vec<Row<'static>> {
+    rows.into_iter()
+        .map(|(property, value)| {
+            Row::new(vec![
+                Cell::from(Line::from(Span::styled(
+                    property,
+                    Style::default().fg(th::SUBTEXT1),
+                ))),
+                Cell::from(Line::from(Span::styled(
+                    value.clone(),
+                    key_value_value_style(&value),
+                ))),
+            ])
+        })
+        .collect()
+}
+
+fn key_value_table_layout(
+    area: ratatui::layout::Rect,
+    preferred_key_width: u16,
+) -> ([Constraint; 2], u16) {
+    let width = area.width.saturating_sub(2);
+    if width <= 46 {
+        ([Constraint::Percentage(44), Constraint::Percentage(56)], 1)
+    } else if width <= 62 {
+        (
+            [
+                Constraint::Length(preferred_key_width.saturating_sub(8).max(14)),
+                Constraint::Min(10),
+            ],
+            1,
+        )
+    } else if width <= 84 {
+        (
+            [
+                Constraint::Length(preferred_key_width.saturating_sub(4).max(16)),
+                Constraint::Min(10),
+            ],
+            1,
+        )
+    } else {
+        (
+            [Constraint::Length(preferred_key_width), Constraint::Min(10)],
+            2,
+        )
+    }
 }
 
 fn render_settings(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(8),
-            Constraint::Length(2),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(8)])
         .split(area);
 
     let mode_line = if app.global_settings_text_mode {
@@ -1630,40 +2403,28 @@ fn render_settings(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     };
     frame.render_widget(mode_line, chunks[0]);
 
-    let rows = global_settings_rows(app)
-        .into_iter()
-        .map(|(property, value)| Row::new(vec![Cell::from(property), Cell::from(value)]))
-        .collect::<Vec<_>>();
-    let table = Table::new(rows, [Constraint::Length(28), Constraint::Min(10)])
-        .header(
-            Row::new(vec!["Property", "Value"]).style(
-                Style::default()
-                    .fg(th::SUBTEXT1)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .column_spacing(1)
-        .row_highlight_style(
-            Style::default()
-                .fg(th::CRUST)
-                .bg(th::YELLOW)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ")
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
-                .title("Global Settings"),
-        );
+    let (detail_cols, detail_spacing) = key_value_table_layout(chunks[1], 30);
+    let table = Table::new(
+        styled_key_value_rows(global_settings_rows(app)),
+        detail_cols,
+    )
+    .column_spacing(detail_spacing)
+    .row_highlight_style(
+        Style::default()
+            .fg(th::CRUST)
+            .bg(th::YELLOW)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol(">> ")
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(neutral_border_style())
+            .style(Style::default().bg(th::BASE))
+            .title("Global Settings"),
+    );
     let mut state = TableState::default().with_selected(Some(app.global_settings_field_idx));
     frame.render_stateful_widget(table, chunks[1], &mut state);
-
-    let hints = Paragraph::new(
-        "j/k field | space toggle bool | h/l or <-/-> adjust | Enter or e edit text | saved to ansible.cfg | u runtime picker",
-    )
-    .style(Style::default().fg(th::SUBTEXT0));
-    frame.render_widget(hints, chunks[2]);
 }
 
 fn global_settings_rows(app: &App) -> Vec<(String, String)> {
@@ -1861,7 +2622,7 @@ fn render_runtime_prompt(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Candidates"),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
@@ -1873,10 +2634,8 @@ fn render_runtime_prompt(frame: &mut Frame, app: &App) {
     });
     frame.render_stateful_widget(candidates, chunks[2], &mut state);
 
-    let hints = Paragraph::new(
-        "Keys: j/k move  Enter select runtime  b bootstrap managed runtime  Esc close",
-    )
-    .style(Style::default().fg(th::SUBTEXT0));
+    let hints =
+        Paragraph::new(hint_line_from_bindings(&HINTS_RUNTIME_PROMPT, 6)).style(hint_bar_style());
     frame.render_widget(hints, chunks[3]);
 
     let runtime_logs = if app.runtime_logs.is_empty() {
@@ -1896,7 +2655,7 @@ fn render_runtime_prompt(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Setup Logs"),
         )
         .wrap(Wrap { trim: false });
@@ -2003,7 +2762,7 @@ fn render_project_create_prompt(frame: &mut Frame, app: &App) {
             .border_style(if focused {
                 Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(th::SURFACE1)
+                neutral_border_style()
             })
             .title(*label);
         frame.render_widget(
@@ -2015,10 +2774,7 @@ fn render_project_create_prompt(frame: &mut Frame, app: &App) {
     }
 
     frame.render_widget(
-        Paragraph::new(
-            "Type value | Up/Down field | Enter next/save | Backspace edit | Esc cancel",
-        )
-        .style(Style::default().fg(th::SUBTEXT0)),
+        Paragraph::new(hint_line_from_bindings(&HINTS_PROJECT_CREATE, 6)).style(hint_bar_style()),
         chunks[chunks.len() - 1],
     );
 }
@@ -2082,7 +2838,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if file_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("SSH Key File Path"),
             )
@@ -2114,7 +2870,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if inline_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Inline SSH Private Key"),
             )
@@ -2140,7 +2896,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
                 .border_style(if source_focused {
                     Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(th::SURFACE1)
+                    neutral_border_style()
                 })
                 .title("Vault Source Type"),
         )
@@ -2168,7 +2924,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if vault_file_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Vault Password File"),
             )
@@ -2196,7 +2952,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if vault_id_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Vault ID Label"),
             )
@@ -2205,10 +2961,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
     );
 
     frame.render_widget(
-        Paragraph::new(
-            "Type text | Up/Down field | h/l cycle source | Enter next/newline | Ctrl+S save | Backspace edit | Esc cancel",
-        )
-        .style(Style::default().fg(th::SUBTEXT0)),
+        Paragraph::new(hint_line_from_bindings(&HINTS_PROJECT_SECRETS, 6)).style(hint_bar_style()),
         chunks[6],
     );
 }
@@ -2271,7 +3024,7 @@ fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if path_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Vault File Path"),
             )
@@ -2303,7 +3056,7 @@ fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if content_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Vault YAML Content"),
             )
@@ -2337,7 +3090,7 @@ fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(th::SURFACE1))
+                    .border_style(neutral_border_style())
                     .title("Auth Source (from Project Secret Settings)"),
             )
             .style(Style::default().fg(th::SUBTEXT1).bg(th::BASE))
@@ -2346,10 +3099,7 @@ fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
     );
 
     frame.render_widget(
-        Paragraph::new(
-            "Type text | Up/Down field | Enter next/newline | Ctrl+S create+encrypt | Backspace edit | Esc cancel",
-        )
-        .style(Style::default().fg(th::SUBTEXT0)),
+        Paragraph::new(hint_line_from_bindings(&HINTS_VAULT_CREATE, 6)).style(hint_bar_style()),
         chunks[4],
     );
 }
@@ -2412,7 +3162,7 @@ fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if path_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Password File Path"),
             )
@@ -2438,7 +3188,7 @@ fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if password_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Vault Password"),
             )
@@ -2464,7 +3214,7 @@ fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if confirm_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Confirm Password"),
             )
@@ -2473,10 +3223,8 @@ fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
     );
 
     frame.render_widget(
-        Paragraph::new(
-            "Type text | Up/Down field | Enter next | Ctrl+S create file | Backspace edit | Esc cancel",
-        )
-        .style(Style::default().fg(th::SUBTEXT0)),
+        Paragraph::new(hint_line_from_bindings(&HINTS_VAULT_PASSWORD_CREATE, 6))
+            .style(hint_bar_style()),
         chunks[4],
     );
 }
@@ -2539,7 +3287,7 @@ fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if path_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Vault File Path"),
             )
@@ -2571,7 +3319,7 @@ fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if content_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Decrypted Vault YAML Content"),
             )
@@ -2612,7 +3360,7 @@ fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
                 .border_style(if app.vault_edit_loading {
                     Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(th::SURFACE1)
+                    neutral_border_style()
                 })
                 .title("Auth Source (from Project Secret Settings)"),
         )
@@ -2622,10 +3370,7 @@ fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
     );
 
     frame.render_widget(
-        Paragraph::new(
-            "Type text | Up/Down field | Enter on path reloads | Enter in content newline | Ctrl+S save+encrypt | Backspace edit | Esc cancel",
-        )
-        .style(Style::default().fg(th::SUBTEXT0)),
+        Paragraph::new(hint_line_from_bindings(&HINTS_VAULT_EDIT, 6)).style(hint_bar_style()),
         chunks[4],
     );
 }
@@ -2691,7 +3436,7 @@ fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
                     .border_style(if password_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(th::SURFACE1)
+                        neutral_border_style()
                     })
                     .title("Vault Password"),
             )
@@ -2718,7 +3463,7 @@ fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
                         .border_style(if confirm_focused {
                             Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(th::SURFACE1)
+                            neutral_border_style()
                         })
                         .title("Confirm Password"),
                 )
@@ -2729,12 +3474,16 @@ fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
 
     frame.render_widget(
         Paragraph::new(if confirm_required {
-            "Type text | Tab/Shift+Tab or Up/Down field | Enter next/confirm | Ctrl+S continue | Backspace | Esc cancel"
+            hint_line_from_bindings(&HINTS_VAULT_PROMPT_CONFIRM, 6)
         } else {
-            "Type text | Enter confirm | Ctrl+S continue | Backspace | Esc cancel"
+            hint_line_from_bindings(&HINTS_VAULT_PROMPT_SIMPLE, 6)
         })
-        .style(Style::default().fg(th::SUBTEXT0)),
-        if confirm_required { chunks[3] } else { chunks[2] },
+        .style(hint_bar_style()),
+        if confirm_required {
+            chunks[3]
+        } else {
+            chunks[2]
+        },
     );
 }
 
@@ -2781,8 +3530,8 @@ fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(th::TEXT).bg(th::BASE));
     frame.render_widget(input, chunks[1]);
 
-    let hint = Paragraph::new("Enter create | Backspace edit | Esc cancel")
-        .style(Style::default().fg(th::SUBTEXT0));
+    let hint =
+        Paragraph::new(hint_line_from_bindings(&HINTS_INVENTORY_CREATE, 4)).style(hint_bar_style());
     frame.render_widget(hint, chunks[2]);
 }
 
@@ -2827,7 +3576,7 @@ fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Choose Mode"),
         )
         .highlight_style(Style::default().fg(th::CRUST).bg(th::YELLOW))
@@ -2835,9 +3584,8 @@ fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
     let mut state = ListState::default().with_selected(Some(app.inventory_edit_mode_idx));
     frame.render_stateful_widget(list, chunks[1], &mut state);
 
-    let hint =
-        Paragraph::new("Enter confirm | j/k or Up/Down select | 1/2 quick select | e external | t text | Esc cancel")
-            .style(Style::default().fg(th::SUBTEXT0));
+    let hint = Paragraph::new(hint_line_from_bindings(&HINTS_INVENTORY_EDIT_MODE, 6))
+        .style(hint_bar_style());
     frame.render_widget(hint, chunks[2]);
 }
 
@@ -2884,7 +3632,7 @@ fn render_inventory_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1)),
+                .border_style(neutral_border_style()),
         )
         .style(Style::default().fg(th::TEXT).bg(th::BASE));
     frame.render_widget(file_info, chunks[0]);
@@ -2898,15 +3646,14 @@ fn render_inventory_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Content"),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(editor, chunks[1]);
 
     let hint =
-        Paragraph::new("Type to edit | Enter newline | Backspace delete | Ctrl+S save | Esc close")
-            .style(Style::default().fg(th::SUBTEXT0));
+        Paragraph::new(hint_line_from_bindings(&HINTS_INVENTORY_EDITOR, 6)).style(hint_bar_style());
     frame.render_widget(hint, chunks[2]);
 }
 
@@ -2962,41 +3709,16 @@ fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1)),
+                .border_style(neutral_border_style()),
         )
         .style(Style::default().fg(th::TEXT).bg(th::BASE));
     frame.render_widget(header, chunks[1]);
 
     let settings = app.selected_playbook_settings().unwrap_or_default();
     let rows = settings_rows(app, &settings);
-    let table_rows = rows
-        .iter()
-        .enumerate()
-        .map(|(idx, (property, value))| {
-            let style = if idx == app.settings_editor_field_idx {
-                Style::default()
-                    .fg(th::CRUST)
-                    .bg(th::YELLOW)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(th::TEXT)
-            };
-            Row::new(vec![
-                Cell::from(property.clone()),
-                Cell::from(value.clone()),
-            ])
-            .style(style)
-        })
-        .collect::<Vec<_>>();
-    let fields = Table::new(table_rows, [Constraint::Length(28), Constraint::Min(10)])
-        .header(
-            Row::new(vec!["Property", "Value"]).style(
-                Style::default()
-                    .fg(th::SUBTEXT1)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .column_spacing(1)
+    let (detail_cols, detail_spacing) = key_value_table_layout(chunks[2], 30);
+    let fields = Table::new(styled_key_value_rows(rows), detail_cols)
+        .column_spacing(detail_spacing)
         .row_highlight_style(
             Style::default()
                 .fg(th::CRUST)
@@ -3007,7 +3729,7 @@ fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .style(Style::default().fg(th::TEXT).bg(th::BASE))
                 .title("Fields"),
         );
@@ -3015,11 +3737,11 @@ fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(fields, chunks[2], &mut fields_state);
 
     let hint = Paragraph::new(if app.settings_text_mode_is_multiline() {
-        "j/k field | h/l or <-/-> adjust | Enter newline | Ctrl+S save | Esc cancel | t close"
+        hint_line_from_bindings(&HINTS_SETTINGS_EDITOR_TEXT, 6)
     } else {
-        "j/k field | h/l or <-/-> adjust | Enter edit/save | e edit text | Esc cancel/close | t close"
+        hint_line_from_bindings(&HINTS_SETTINGS_EDITOR, 6)
     })
-    .style(Style::default().fg(th::SUBTEXT0));
+    .style(hint_bar_style());
     frame.render_widget(hint, chunks[3]);
 }
 
@@ -3089,40 +3811,15 @@ fn render_template_editor(frame: &mut Frame, app: &App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(th::SURFACE1)),
+            .border_style(neutral_border_style()),
     )
     .style(Style::default().fg(th::TEXT).bg(th::BASE));
     frame.render_widget(header, chunks[1]);
 
     let rows = template_editor_rows(app);
-    let table_rows = rows
-        .iter()
-        .enumerate()
-        .map(|(idx, (property, value))| {
-            let style = if idx == app.template_editor_field_idx {
-                Style::default()
-                    .fg(th::CRUST)
-                    .bg(th::YELLOW)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(th::TEXT)
-            };
-            Row::new(vec![
-                Cell::from(property.clone()),
-                Cell::from(value.clone()),
-            ])
-            .style(style)
-        })
-        .collect::<Vec<_>>();
-    let fields = Table::new(table_rows, [Constraint::Length(34), Constraint::Min(10)])
-        .header(
-            Row::new(vec!["Property", "Value"]).style(
-                Style::default()
-                    .fg(th::SUBTEXT1)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )
-        .column_spacing(1)
+    let (detail_cols, detail_spacing) = key_value_table_layout(chunks[2], 34);
+    let fields = Table::new(styled_key_value_rows(rows), detail_cols)
+        .column_spacing(detail_spacing)
         .row_highlight_style(
             Style::default()
                 .fg(th::CRUST)
@@ -3133,19 +3830,21 @@ fn render_template_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .style(Style::default().fg(th::TEXT).bg(th::BASE))
                 .title("Template Fields"),
         );
     let mut fields_state = TableState::default().with_selected(Some(app.template_editor_field_idx));
     frame.render_stateful_widget(fields, chunks[2], &mut fields_state);
 
-    let hint = Paragraph::new(if app.template_editor_text_mode && app.template_editor_is_multiline_field() {
-        "j/k field | h/l or <-/-> adjust | Enter newline | Ctrl+S save | Esc cancel | Esc close editor"
-    } else {
-        "j/k field | h/l or <-/-> adjust | Enter edit/save | e edit text | space toggle | Ctrl+S save template | Esc cancel/close"
-    })
-    .style(Style::default().fg(th::SUBTEXT0));
+    let hint = Paragraph::new(
+        if app.template_editor_text_mode && app.template_editor_is_multiline_field() {
+            hint_line_from_bindings(&HINTS_TEMPLATE_EDITOR_TEXT, 6)
+        } else {
+            hint_line_from_bindings(&HINTS_TEMPLATE_EDITOR, 6)
+        },
+    )
+    .style(hint_bar_style());
     frame.render_widget(hint, chunks[3]);
 }
 
@@ -3404,143 +4103,219 @@ fn inventory_preview_text(app: &App, max_lines: usize) -> Text<'static> {
     Text::from(lines)
 }
 
-fn active_help_text(app: &App) -> String {
+fn active_help_model(app: &App) -> HelpModel {
     if app.runtime_prompt_open {
-        return String::from(
-            "Keys: j/k or Up/Down candidate | Enter select runtime | b bootstrap managed runtime | Esc close",
-        );
+        return HelpModel {
+            title: "Runtime Picker",
+            hints: &HINTS_RUNTIME_PROMPT,
+        };
     }
     if app.vault_runtime_prompt_open {
         return if app.vault_runtime_prompt_confirm_required() {
-            String::from(
-                "Keys: Type text | Tab/Shift+Tab or Up/Down field | Enter next/confirm | Ctrl+S continue | Backspace edit | Esc cancel",
-            )
+            HelpModel {
+                title: "Vault Password Prompt",
+                hints: &HINTS_VAULT_PROMPT_CONFIRM,
+            }
         } else {
-            String::from(
-                "Keys: Type text | Enter confirm | Ctrl+S continue | Backspace edit | Esc cancel",
-            )
+            HelpModel {
+                title: "Vault Password Prompt",
+                hints: &HINTS_VAULT_PROMPT_SIMPLE,
+            }
         };
     }
     if app.inventory_create_open {
-        return String::from("Keys: Type filename | Enter create | Backspace edit | Esc cancel");
+        return HelpModel {
+            title: "Inventory Create",
+            hints: &HINTS_INVENTORY_CREATE,
+        };
     }
     if app.project_create_open {
-        return String::from(
-            "Keys: Type text | Up/Down field | Enter next/save | Backspace edit | Esc cancel (mode from n/f/g)",
-        );
+        return HelpModel {
+            title: "Project Create",
+            hints: &HINTS_PROJECT_CREATE,
+        };
     }
     if app.project_ssh_open {
-        return String::from(
-            "Keys: Type text | Up/Down field | h/l cycle source | Enter next/newline | Ctrl+S save | Backspace edit | Esc cancel",
-        );
+        return HelpModel {
+            title: "Project Secret Settings",
+            hints: &HINTS_PROJECT_SECRETS,
+        };
     }
     if app.vault_create_open {
-        return String::from(
-            "Keys: Type text | Up/Down field | Enter next/newline | Ctrl+S create+encrypt | Backspace edit | Esc cancel",
-        );
+        return HelpModel {
+            title: "Vault Create",
+            hints: &HINTS_VAULT_CREATE,
+        };
     }
     if app.vault_edit_open {
-        return String::from(
-            "Keys: Type text | Up/Down field | Enter on path reload | Enter in content newline | Ctrl+S save+encrypt | Backspace edit | Esc cancel",
-        );
+        return HelpModel {
+            title: "Vault Edit",
+            hints: &HINTS_VAULT_EDIT,
+        };
     }
     if app.vault_password_create_open {
-        return String::from(
-            "Keys: Type text | Up/Down field | Enter next | Ctrl+S create file | Backspace edit | Esc cancel",
-        );
+        return HelpModel {
+            title: "Vault Password Helper",
+            hints: &HINTS_VAULT_PASSWORD_CREATE,
+        };
     }
     if app.inventory_edit_mode_open {
-        return String::from(
-            "Keys: j/k or Up/Down select mode | Enter confirm | 1/2 quick select | e external | t text | Esc cancel",
-        );
+        return HelpModel {
+            title: "Inventory Edit Mode Picker",
+            hints: &HINTS_INVENTORY_EDIT_MODE,
+        };
     }
     if app.inventory_editor_open {
-        return String::from(
-            "Keys: Type text | Enter newline | Backspace edit | Ctrl+S save | Esc close",
-        );
+        return HelpModel {
+            title: "Inventory Editor",
+            hints: &HINTS_INVENTORY_EDITOR,
+        };
+    }
+    if app.current_view() == View::Settings && app.global_settings_text_mode {
+        return HelpModel {
+            title: "Global Settings Text Edit",
+            hints: &HINTS_SETTINGS_TEXT,
+        };
     }
     if app.settings_editor_open {
-        if app.settings_editor_text_mode {
-            return if app.settings_text_mode_is_multiline() {
-                String::from(
-                    "Keys: Type text | Enter newline | Ctrl+S save | Backspace edit | Esc cancel | t close",
-                )
-            } else {
-                String::from("Keys: Type text | Backspace edit | Enter save | Esc cancel | t close")
-            };
-        }
-        return String::from(
-            "Keys: j/k field | h/l or <-/-> adjust | Enter or e edit text | space toggle | Esc or t close",
-        );
+        return if app.settings_editor_text_mode {
+            HelpModel {
+                title: "Playbook Settings Text Edit",
+                hints: &HINTS_SETTINGS_EDITOR_TEXT,
+            }
+        } else {
+            HelpModel {
+                title: "Playbook Settings Editor",
+                hints: &HINTS_SETTINGS_EDITOR,
+            }
+        };
     }
     if app.template_editor_open {
-        if app.template_editor_text_mode {
-            return if app.template_editor_is_multiline_field() {
-                String::from(
-                    "Keys: Type text | Enter newline | Ctrl+S save | Backspace edit | Esc cancel",
-                )
-            } else {
-                String::from(
-                    "Keys: Type text | Enter save | Ctrl+S save template | Backspace edit | Esc cancel",
-                )
-            };
-        }
-        return String::from(
-            "Keys: j/k field | h/l or <-/-> adjust | Enter or e edit text | space toggle | Ctrl+S save | Esc close",
-        );
+        return if app.template_editor_text_mode {
+            HelpModel {
+                title: "Template Editor Text Edit",
+                hints: &HINTS_TEMPLATE_EDITOR_TEXT,
+            }
+        } else {
+            HelpModel {
+                title: "Template Editor",
+                hints: &HINTS_TEMPLATE_EDITOR,
+            }
+        };
     }
-    match app.current_view() {
-        View::Dashboard => {
-            String::from("Keys: Tab/h/l views | r run selected playbook | u runtime picker | q quit")
-        }
-        View::Projects => String::from(
-            "Keys: j/k or Up/Down select project | Enter/a activate | n new | f import path | g clone git | e secret settings | Shift+V create new vault | Shift+E edit vault | Shift+P create vault password | Shift+D delete selected (confirm) | i inventory sync | v vars sync | Tab/h/l views | q quit",
-        ),
-        View::Inventory => match app.inventory_sub_tab {
-            InventorySubTab::Files => String::from(
-                "Keys: j/k or Up/Down select inventory | n new | e edit selected (choose mode) | Shift+D delete selected | 2 hosts | 3 groups | PgUp/PgDn scroll logs | End follow latest | Tab/h/l views | q quit",
-            ),
-            InventorySubTab::Hosts => String::from(
-                "Keys: h/l focus | j/k nav | e/Enter edit | p ping selected host | n add host | a add var | Shift+D delete | Ctrl+S save | Esc back | Tab/h/l views | q quit",
-            ),
-            InventorySubTab::Groups => String::from(
-                "Keys: h/l focus | j/k nav | Space toggle attach | p ping selected target | n add group/host | d detach | Shift+D delete | Ctrl+S save | Esc back | Tab/h/l views | q quit",
-            ),
+
+    match app.content_focus_context() {
+        FocusContext::Dashboard => HelpModel {
+            title: "Dashboard",
+            hints: &HINTS_DASHBOARD,
         },
-        View::Playbooks => {
-            if app.log_select_mode {
-                String::from(
-                    "Keys: j/k or Up/Down select log lines | PgUp/PgDn scroll logs | End follow latest | space mark | y copy | v exit log-select | <-/-> focus playbooks/runs | i/I inventory target | r run | t playbook settings | Tab/h/l views | q quit",
-                )
-            } else {
-                String::from(
-                    "Keys: j/k or Up/Down move focused list | PgUp/PgDn scroll logs | End follow latest | <-/-> focus playbooks/runs | Shift+J/K switch runs | i/I inventory target | r run | t playbook settings | v log-select | Tab/h/l views | q quit",
-                )
-            }
-        }
-        View::Templates => {
-            if app.log_select_mode {
-                String::from(
-                    "Keys: j/k select log lines | PgUp/PgDn scroll logs | End follow latest | space mark | y copy | v exit log-select | Left/Right focus templates/runs | Shift+J/K switch runs | r run | t/e edit | n new | Shift+D delete | q quit",
-                )
-            } else {
-                String::from(
-                    "Keys: j/k move focused list | PgUp/PgDn scroll logs | End follow latest | Left/Right focus templates/runs | Shift+J/K switch runs | r run | t/e edit | n new | Shift+D delete | v log-select | q quit",
-                )
-            }
-        }
-        View::Settings => {
-            if app.global_settings_text_mode {
-                String::from(
-                    "Keys: Type text | Backspace edit | Enter save | Esc cancel | j/k field | PgUp/PgDn scroll logs | End follow latest | Tab views | q quit",
-                )
-            } else {
-                String::from(
-                    "Keys: j/k field | h/l or <-/-> adjust | Enter or e edit text | space toggle | u runtime picker | PgUp/PgDn scroll logs | End follow latest | Tab views | q quit",
-                )
-            }
+        FocusContext::Projects => HelpModel {
+            title: "Projects",
+            hints: &HINTS_PROJECTS,
+        },
+        FocusContext::InventoryFiles => HelpModel {
+            title: "Inventory Files",
+            hints: &HINTS_INVENTORY_FILES,
+        },
+        FocusContext::InventoryHostsList | FocusContext::InventoryHostDetails => HelpModel {
+            title: "Inventory Hosts",
+            hints: &HINTS_INVENTORY_HOSTS,
+        },
+        FocusContext::InventoryGroupsTree
+        | FocusContext::InventoryGroupsGroups
+        | FocusContext::InventoryGroupsHosts => HelpModel {
+            title: "Inventory Groups",
+            hints: &HINTS_INVENTORY_GROUPS,
+        },
+        FocusContext::PlaybooksList | FocusContext::PlaybooksRuns => HelpModel {
+            title: "Playbooks",
+            hints: &HINTS_PLAYBOOKS,
+        },
+        FocusContext::PlaybooksLogSelect => HelpModel {
+            title: "Playbooks (Log Select)",
+            hints: &HINTS_PLAYBOOKS_LOG_SELECT,
+        },
+        FocusContext::TemplatesList | FocusContext::TemplatesRuns => HelpModel {
+            title: "Templates",
+            hints: &HINTS_TEMPLATES,
+        },
+        FocusContext::TemplatesLogSelect => HelpModel {
+            title: "Templates (Log Select)",
+            hints: &HINTS_TEMPLATES_LOG_SELECT,
+        },
+        FocusContext::Settings => HelpModel {
+            title: "Global Settings",
+            hints: &HINTS_SETTINGS,
+        },
+        FocusContext::RuntimePrompt => HelpModel {
+            title: "Runtime Picker",
+            hints: &HINTS_RUNTIME_PROMPT,
+        },
+        FocusContext::Modal => match app.current_view() {
+            View::Settings => HelpModel {
+                title: "Global Settings",
+                hints: &HINTS_SETTINGS,
+            },
+            View::Templates => HelpModel {
+                title: "Templates",
+                hints: &HINTS_TEMPLATES,
+            },
+            View::Playbooks => HelpModel {
+                title: "Playbooks",
+                hints: &HINTS_PLAYBOOKS,
+            },
+            View::Inventory => HelpModel {
+                title: "Inventory",
+                hints: &HINTS_INVENTORY_FILES,
+            },
+            View::Projects => HelpModel {
+                title: "Projects",
+                hints: &HINTS_PROJECTS,
+            },
+            View::Dashboard => HelpModel {
+                title: "Dashboard",
+                hints: &HINTS_DASHBOARD,
+            },
+        },
+    }
+}
+
+fn active_hint_bindings(app: &App) -> Vec<HintBinding> {
+    let model = active_help_model(app);
+    let mut hints = model.hints.to_vec();
+    if help_toggle_available(app) {
+        hints.push(HintBinding {
+            key: "?",
+            desc: "toggle keyboard help",
+        });
+    }
+
+    let mut deduped = Vec::with_capacity(hints.len());
+    let mut seen = HashSet::new();
+    for hint in hints {
+        let marker = format!("{}::{}", hint.key, hint.desc);
+        if seen.insert(marker) {
+            deduped.push(hint);
         }
     }
+    deduped
+}
+
+fn help_toggle_available(app: &App) -> bool {
+    !(app.vault_runtime_prompt_open
+        || (app.settings_editor_open && app.settings_editor_text_mode)
+        || (app.template_editor_open && app.template_editor_text_mode)
+        || app.project_ssh_open
+        || app.vault_create_open
+        || app.vault_edit_open
+        || app.vault_password_create_open
+        || app.project_create_open
+        || app.inventory_create_open
+        || app.inventory_editor_open
+        || app.hosts_subtab_editing
+        || app.hosts_subtab_add_host_open
+        || app.hosts_subtab_add_var_open
+        || (app.current_view() == View::Settings && app.global_settings_text_mode))
 }
 
 fn settings_preview_rows(
@@ -3845,7 +4620,7 @@ fn dashboard_stat_card(
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(th::SURFACE1)),
+            .border_style(neutral_border_style()),
     )
 }
 
@@ -3913,7 +4688,7 @@ fn render_ranked_bar_panel(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title(title),
         )
         .wrap(Wrap { trim: false });
@@ -3960,7 +4735,7 @@ fn render_project_summary_panel(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(th::SURFACE1))
+                .border_style(neutral_border_style())
                 .title("Project Summary"),
         )
         .wrap(Wrap { trim: false });
@@ -4031,4 +4806,45 @@ fn centered_rect(
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+
+    fn make_test_app(name: &str) -> App {
+        let cwd = std::env::temp_dir().join(format!("ansible_tui_ui_tests_{name}"));
+        let _ = std::fs::create_dir_all(&cwd);
+        App::new(cwd)
+    }
+
+    #[test]
+    fn hint_bindings_include_help_toggle_when_available() {
+        let app = make_test_app("help_toggle_on");
+        let hints = active_hint_bindings(&app);
+        assert!(hints
+            .iter()
+            .any(|hint| hint.key == "?" && hint.desc == "toggle keyboard help"));
+    }
+
+    #[test]
+    fn hint_bindings_hide_help_toggle_in_text_mode() {
+        let mut app = make_test_app("help_toggle_off");
+        app.inventory_create_open = true;
+        let hints = active_hint_bindings(&app);
+        assert!(!hints.iter().any(|hint| hint.key == "?"));
+    }
+
+    #[test]
+    fn focus_context_label_for_playbooks_runs() {
+        let mut app = make_test_app("focus_label");
+        app.runtime_prompt_open = false;
+        app.view_idx = 3;
+        app.playbooks_focus_runs = true;
+        assert_eq!(
+            focus_context_label(app.content_focus_context()),
+            "playbook runs"
+        );
+    }
 }
