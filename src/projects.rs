@@ -2,6 +2,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use rusqlite::params;
+
+use crate::db::{global_db_path, open_db, sqlite_to_io};
+use crate::secrets::VaultSourceType;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectDefinition {
     pub name: String,
@@ -10,6 +15,9 @@ pub struct ProjectDefinition {
     pub vars_sync_cmd: Option<String>,
     pub ssh_private_key_file: Option<String>,
     pub ssh_private_key_inline: Option<String>,
+    pub vault_source_type: Option<VaultSourceType>,
+    pub vault_password_file: Option<String>,
+    pub vault_id_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -19,54 +27,48 @@ pub struct ProjectRegistry {
 }
 
 const CONFIG_DIR: &str = ".ansible-tui";
-const PROJECTS_FILE: &str = "projects.tsv";
+const LEGACY_PROJECTS_FILE: &str = "projects.tsv";
 
 pub fn load_projects(cwd: &Path) -> io::Result<ProjectRegistry> {
-    let path = projects_path(cwd);
-    let data = match fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(ProjectRegistry {
-                projects: vec![default_project(cwd)],
-                active_idx: 0,
-            });
-        }
-        Err(err) => return Err(err),
-    };
+    let conn = open_projects_db(cwd)?;
+    migrate_from_tsv_if_needed(cwd, &conn)?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT idx, name, root, inventory_sync_cmd, vars_sync_cmd, \
+             ssh_private_key_file, ssh_private_key_inline, \
+             vault_source_type, vault_password_file, vault_id_label, is_active \
+             FROM projects ORDER BY idx ASC",
+        )
+        .map_err(sqlite_to_io)?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })
+        .map_err(sqlite_to_io)?;
 
     let mut projects = Vec::new();
     let mut active_idx = 0usize;
     let mut saw_active = false;
 
-    for line in data.lines() {
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            continue;
-        }
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() < 2 {
-            continue;
-        }
+    for row in rows {
+        let (_idx, name, root_str, inv_sync, vars_sync, ssh_key_file, ssh_key_inline, vault_type, vault_pass, vault_label, is_active) =
+            row.map_err(sqlite_to_io)?;
 
-        let name = sanitize_loaded(fields[0]);
-        let root = resolve_root(cwd, fields[1]);
-        let inventory_sync_cmd = fields.get(2).and_then(|v| to_opt_text(v));
-        let vars_sync_cmd = fields.get(3).and_then(|v| to_opt_text(v));
-        let ssh_private_key_file = if fields.len() >= 7 {
-            fields.get(4).and_then(|v| to_opt_text(v))
-        } else {
-            None
-        };
-        let ssh_private_key_inline = if fields.len() >= 7 {
-            fields.get(5).and_then(|v| to_opt_multiline_text(v))
-        } else {
-            None
-        };
-        let active_field_idx = if fields.len() >= 7 { 6 } else { 4 };
-        let is_active = fields
-            .get(active_field_idx)
-            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-
+        let root = resolve_root(cwd, &root_str);
         let inferred_name = if name.is_empty() {
             root.file_name()
                 .and_then(|v| v.to_str())
@@ -80,13 +82,16 @@ pub fn load_projects(cwd: &Path) -> io::Result<ProjectRegistry> {
         projects.push(ProjectDefinition {
             name: inferred_name,
             root,
-            inventory_sync_cmd,
-            vars_sync_cmd,
-            ssh_private_key_file,
-            ssh_private_key_inline,
+            inventory_sync_cmd: inv_sync,
+            vars_sync_cmd: vars_sync,
+            ssh_private_key_file: ssh_key_file,
+            ssh_private_key_inline: ssh_key_inline,
+            vault_source_type: vault_type.as_deref().and_then(VaultSourceType::from_str),
+            vault_password_file: vault_pass,
+            vault_id_label: vault_label,
         });
 
-        if is_active && !saw_active {
+        if is_active != 0 && !saw_active {
             active_idx = projects.len().saturating_sub(1);
             saw_active = true;
         }
@@ -106,46 +111,42 @@ pub fn load_projects(cwd: &Path) -> io::Result<ProjectRegistry> {
 }
 
 pub fn save_projects(cwd: &Path, registry: &ProjectRegistry) -> io::Result<()> {
-    let dir = cwd.join(CONFIG_DIR);
-    fs::create_dir_all(dir)?;
+    let conn = open_projects_db(cwd)?;
+    let tx = conn.unchecked_transaction().map_err(sqlite_to_io)?;
+    tx.execute("DELETE FROM projects", []).map_err(sqlite_to_io)?;
 
-    let mut out = String::new();
+    let mut insert = tx
+        .prepare(
+            "INSERT INTO projects (idx, name, root, inventory_sync_cmd, vars_sync_cmd, \
+             ssh_private_key_file, ssh_private_key_inline, \
+             vault_source_type, vault_password_file, vault_id_label, is_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .map_err(sqlite_to_io)?;
+
     for (idx, project) in registry.projects.iter().enumerate() {
         let root = store_root(cwd, &project.root);
-        let inventory_sync_cmd = project
-            .inventory_sync_cmd
-            .as_deref()
-            .map(sanitize_field)
-            .unwrap_or_default();
-        let vars_sync_cmd = project
-            .vars_sync_cmd
-            .as_deref()
-            .map(sanitize_field)
-            .unwrap_or_default();
-        let ssh_private_key_file = project
-            .ssh_private_key_file
-            .as_deref()
-            .map(sanitize_field)
-            .unwrap_or_default();
-        let ssh_private_key_inline = project
-            .ssh_private_key_inline
-            .as_deref()
-            .map(escape_multiline_field)
-            .unwrap_or_default();
-        let active = if idx == registry.active_idx { "1" } else { "0" };
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            sanitize_field(&project.name),
-            root,
-            inventory_sync_cmd,
-            vars_sync_cmd,
-            ssh_private_key_file,
-            ssh_private_key_inline,
-            active
-        ));
+        let is_active: i64 = if idx == registry.active_idx { 1 } else { 0 };
+        insert
+            .execute(params![
+                idx as i64,
+                project.name,
+                root,
+                project.inventory_sync_cmd,
+                project.vars_sync_cmd,
+                project.ssh_private_key_file,
+                project.ssh_private_key_inline,
+                project.vault_source_type.map(|v| v.as_str().to_string()),
+                project.vault_password_file,
+                project.vault_id_label,
+                is_active,
+            ])
+            .map_err(sqlite_to_io)?;
     }
 
-    fs::write(projects_path(cwd), out)
+    drop(insert);
+    tx.commit().map_err(sqlite_to_io)?;
+    Ok(())
 }
 
 pub fn default_project(cwd: &Path) -> ProjectDefinition {
@@ -156,22 +157,155 @@ pub fn default_project(cwd: &Path) -> ProjectDefinition {
         vars_sync_cmd: None,
         ssh_private_key_file: None,
         ssh_private_key_inline: None,
+        vault_source_type: None,
+        vault_password_file: None,
+        vault_id_label: None,
     }
 }
 
-fn projects_path(cwd: &Path) -> PathBuf {
-    cwd.join(CONFIG_DIR).join(PROJECTS_FILE)
+// --- private helpers ---
+
+fn open_projects_db(cwd: &Path) -> io::Result<rusqlite::Connection> {
+    let conn = open_db(&global_db_path(cwd))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS projects (
+            idx INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            root TEXT NOT NULL,
+            inventory_sync_cmd TEXT,
+            vars_sync_cmd TEXT,
+            ssh_private_key_file TEXT,
+            ssh_private_key_inline TEXT,
+            vault_source_type TEXT,
+            vault_password_file TEXT,
+            vault_id_label TEXT,
+            is_active INTEGER NOT NULL DEFAULT 0
+         )",
+    )
+    .map_err(sqlite_to_io)?;
+    Ok(conn)
 }
 
-fn sanitize_loaded(value: &str) -> String {
-    value.trim().to_string()
-}
+fn migrate_from_tsv_if_needed(cwd: &Path, conn: &rusqlite::Connection) -> io::Result<()> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .map_err(sqlite_to_io)?;
+    if count > 0 {
+        return Ok(());
+    }
 
-fn sanitize_field(value: &str) -> String {
-    value
-        .replace('\t', " ")
-        .replace('\n', " ")
-        .replace('\r', "")
+    let tsv_path = cwd.join(CONFIG_DIR).join(LEGACY_PROJECTS_FILE);
+    let data = match fs::read_to_string(tsv_path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    let mut projects = Vec::new();
+    let mut active_idx = 0usize;
+    let mut saw_active = false;
+
+    for line in data.lines() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 2 {
+            continue;
+        }
+
+        let name = fields[0].trim().to_string();
+        let root_str = fields[1].trim().to_string();
+        let inventory_sync_cmd = fields.get(2).and_then(|v| to_opt_text(v));
+        let vars_sync_cmd = fields.get(3).and_then(|v| to_opt_text(v));
+        let ssh_private_key_file = if fields.len() >= 7 {
+            fields.get(4).and_then(|v| to_opt_text(v))
+        } else {
+            None
+        };
+        let ssh_private_key_inline = if fields.len() >= 7 {
+            fields.get(5).and_then(|v| to_opt_multiline_text(v))
+        } else {
+            None
+        };
+        let (vault_source_type, vault_password_file, vault_id_label) = if fields.len() >= 10 {
+            (
+                fields
+                    .get(6)
+                    .and_then(|v| VaultSourceType::from_str(v.trim())),
+                fields.get(7).and_then(|v| to_opt_text(v)),
+                fields.get(8).and_then(|v| to_opt_text(v)),
+            )
+        } else {
+            (None, None, None)
+        };
+        let active_field_idx = if fields.len() >= 10 {
+            9
+        } else if fields.len() >= 7 {
+            6
+        } else {
+            4
+        };
+        let is_active = fields
+            .get(active_field_idx)
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        projects.push((
+            name,
+            root_str,
+            inventory_sync_cmd,
+            vars_sync_cmd,
+            ssh_private_key_file,
+            ssh_private_key_inline,
+            vault_source_type.map(|v| v.as_str().to_string()),
+            vault_password_file,
+            vault_id_label,
+            is_active,
+        ));
+
+        if is_active && !saw_active {
+            active_idx = projects.len().saturating_sub(1);
+            saw_active = true;
+        }
+    }
+
+    if projects.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction().map_err(sqlite_to_io)?;
+    let mut insert = tx
+        .prepare(
+            "INSERT OR IGNORE INTO projects (idx, name, root, inventory_sync_cmd, vars_sync_cmd, \
+             ssh_private_key_file, ssh_private_key_inline, \
+             vault_source_type, vault_password_file, vault_id_label, is_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .map_err(sqlite_to_io)?;
+
+    for (idx, proj) in projects.iter().enumerate() {
+        let is_active_val: i64 = if idx == active_idx { 1 } else { 0 };
+        insert
+            .execute(params![
+                idx as i64,
+                proj.0,
+                proj.1,
+                proj.2,
+                proj.3,
+                proj.4,
+                proj.5,
+                proj.6,
+                proj.7,
+                proj.8,
+                is_active_val,
+            ])
+            .map_err(sqlite_to_io)?;
+    }
+
+    drop(insert);
+    tx.commit().map_err(sqlite_to_io)?;
+    Ok(())
 }
 
 fn to_opt_text(value: &str) -> Option<String> {
@@ -190,13 +324,6 @@ fn to_opt_multiline_text(value: &str) -> Option<String> {
     } else {
         Some(unescaped)
     }
-}
-
-fn escape_multiline_field(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\t', "\\t")
-        .replace('\n', "\\n")
 }
 
 fn unescape_multiline_field(raw: &str) -> String {
@@ -247,4 +374,78 @@ fn store_root(cwd: &Path, root: &Path) -> String {
             }
         })
         .unwrap_or_else(|_| root.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_cwd(name: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ansible_tui_projects_{name}_{suffix}"))
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let cwd = temp_cwd("round_trip_db");
+        let registry = ProjectRegistry {
+            projects: vec![ProjectDefinition {
+                name: String::from("Ops"),
+                root: cwd.clone(),
+                inventory_sync_cmd: Some(String::from("./sync-inventory.sh")),
+                vars_sync_cmd: Some(String::from("./sync-vars.sh")),
+                ssh_private_key_file: Some(String::from(".keys/ops.pem")),
+                ssh_private_key_inline: None,
+                vault_source_type: Some(VaultSourceType::File),
+                vault_password_file: Some(String::from(".secrets/vault-pass.txt")),
+                vault_id_label: Some(String::from("ops")),
+            }],
+            active_idx: 0,
+        };
+
+        save_projects(&cwd, &registry).expect("save projects");
+        let loaded = load_projects(&cwd).expect("load projects");
+        assert_eq!(loaded.projects.len(), 1);
+        let project = &loaded.projects[0];
+        assert_eq!(project.name, "Ops");
+        assert_eq!(project.root, cwd);
+        assert_eq!(project.vault_source_type, Some(VaultSourceType::File));
+        assert_eq!(
+            project.vault_password_file.as_deref(),
+            Some(".secrets/vault-pass.txt")
+        );
+        assert_eq!(project.vault_id_label.as_deref(), Some("ops"));
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn migrate_from_legacy_tsv() {
+        let cwd = temp_cwd("migrate_tsv");
+        let settings_dir = cwd.join(".ansible-tui");
+        fs::create_dir_all(&settings_dir).expect("create settings dir");
+        let content = "Local\t.\t\t\t\t\t1\n";
+        fs::write(settings_dir.join("projects.tsv"), content).expect("write projects.tsv");
+
+        let registry = load_projects(&cwd).expect("load projects");
+        assert_eq!(registry.projects.len(), 1);
+        let project = &registry.projects[0];
+        assert_eq!(project.name, "Local");
+        assert_eq!(project.root, cwd);
+        assert_eq!(project.vault_source_type, None);
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn empty_dir_returns_default_project() {
+        let cwd = temp_cwd("empty");
+        let registry = load_projects(&cwd).expect("load projects");
+        assert_eq!(registry.projects.len(), 1);
+        assert_eq!(registry.projects[0].name, "Local");
+        let _ = fs::remove_dir_all(&cwd);
+    }
 }

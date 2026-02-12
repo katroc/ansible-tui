@@ -2,7 +2,11 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use rusqlite::params;
+
+use crate::db::{open_db, project_db_path, sqlite_to_io};
 use crate::run::RunOptions;
+use crate::secrets::VaultSourceType;
 
 #[derive(Debug, Clone)]
 pub struct JobTemplate {
@@ -22,6 +26,9 @@ pub struct JobTemplate {
     pub extra_args: Option<String>,
     pub ssh_private_key_file: Option<String>,
     pub ssh_private_key_inline: Option<String>,
+    pub vault_source_type: Option<VaultSourceType>,
+    pub vault_password_file: Option<String>,
+    pub vault_id_label: Option<String>,
 }
 
 impl JobTemplate {
@@ -43,6 +50,9 @@ impl JobTemplate {
             extra_args: None,
             ssh_private_key_file: None,
             ssh_private_key_inline: None,
+            vault_source_type: None,
+            vault_password_file: None,
+            vault_id_label: None,
         }
     }
 
@@ -62,6 +72,9 @@ impl JobTemplate {
             extra_args: self.extra_args.clone(),
             ssh_private_key_file: self.ssh_private_key_file.clone(),
             ssh_private_key_inline: self.ssh_private_key_inline.clone(),
+            vault_source_type: self.vault_source_type,
+            vault_password_file: self.vault_password_file.clone(),
+            vault_id_label: self.vault_id_label.clone(),
         }
     }
 }
@@ -92,91 +105,230 @@ fn generate_id(name: &str) -> String {
 }
 
 const SETTINGS_DIR: &str = ".ansible-tui";
-const TEMPLATES_FILE: &str = "job_templates.tsv";
+const LEGACY_TEMPLATES_FILE: &str = "job_templates.tsv";
 
 pub fn load_job_templates(cwd: &Path) -> io::Result<Vec<JobTemplate>> {
-    let path = cwd.join(SETTINGS_DIR).join(TEMPLATES_FILE);
-    let data = match fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err),
-    };
+    let conn = open_templates_db(cwd)?;
+    migrate_from_tsv_if_needed(cwd, &conn)?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, playbook, inventory, \
+             \"check\", diff, become_enabled, verbosity, \
+             forks, timeout, \"limit\", tags, extra_vars, extra_args, \
+             ssh_private_key_file, ssh_private_key_inline, \
+             vault_source_type, vault_password_file, vault_id_label \
+             FROM job_templates ORDER BY rowid ASC",
+        )
+        .map_err(sqlite_to_io)?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(JobTemplate {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                playbook: row.get(2)?,
+                inventory: row.get(3)?,
+                check: row.get::<_, i64>(4)? != 0,
+                diff: row.get::<_, i64>(5)? != 0,
+                become_enabled: row.get::<_, i64>(6)? != 0,
+                verbosity: row.get::<_, i64>(7)?.min(4) as u8,
+                forks: row.get::<_, Option<i64>>(8)?.map(|v| v as u16),
+                timeout: row.get::<_, Option<i64>>(9)?.map(|v| v as u16),
+                limit: row.get(10)?,
+                tags: row.get(11)?,
+                extra_vars: row.get(12)?,
+                extra_args: row.get(13)?,
+                ssh_private_key_file: row.get(14)?,
+                ssh_private_key_inline: row.get(15)?,
+                vault_source_type: row
+                    .get::<_, Option<String>>(16)?
+                    .as_deref()
+                    .and_then(VaultSourceType::from_str),
+                vault_password_file: row.get(17)?,
+                vault_id_label: row.get(18)?,
+            })
+        })
+        .map_err(sqlite_to_io)?;
 
     let mut out = Vec::new();
-    for line in data.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(template) = parse_line(line) {
-            out.push(template);
-        }
+    for row in rows {
+        out.push(row.map_err(sqlite_to_io)?);
     }
     Ok(out)
 }
 
 pub fn save_job_templates(cwd: &Path, templates: &[JobTemplate]) -> io::Result<()> {
-    let dir = cwd.join(SETTINGS_DIR);
-    fs::create_dir_all(&dir)?;
-    let path = dir.join(TEMPLATES_FILE);
+    let conn = open_templates_db(cwd)?;
+    let tx = conn.unchecked_transaction().map_err(sqlite_to_io)?;
+    tx.execute("DELETE FROM job_templates", [])
+        .map_err(sqlite_to_io)?;
 
-    let mut out = String::new();
-    for template in templates {
-        out.push_str(&format_line(template));
-        out.push('\n');
+    let mut insert = tx
+        .prepare(
+            "INSERT INTO job_templates \
+             (id, name, playbook, inventory, \
+              \"check\", diff, become_enabled, verbosity, \
+              forks, timeout, \"limit\", tags, extra_vars, extra_args, \
+              ssh_private_key_file, ssh_private_key_inline, \
+              vault_source_type, vault_password_file, vault_id_label) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+        )
+        .map_err(sqlite_to_io)?;
+
+    for t in templates {
+        insert
+            .execute(params![
+                t.id,
+                t.name,
+                t.playbook,
+                t.inventory,
+                t.check as i64,
+                t.diff as i64,
+                t.become_enabled as i64,
+                t.verbosity as i64,
+                t.forks.map(|v| v as i64),
+                t.timeout.map(|v| v as i64),
+                t.limit,
+                t.tags,
+                t.extra_vars,
+                t.extra_args,
+                t.ssh_private_key_file,
+                t.ssh_private_key_inline,
+                t.vault_source_type.map(|v| v.as_str().to_string()),
+                t.vault_password_file,
+                t.vault_id_label,
+            ])
+            .map_err(sqlite_to_io)?;
     }
-    fs::write(path, out)
+
+    drop(insert);
+    tx.commit().map_err(sqlite_to_io)?;
+    Ok(())
 }
 
-// TSV format (16 fields):
-// id, name, playbook, inventory,
-// check, diff, become_enabled, verbosity,
-// forks, timeout, limit, tags, extra_vars, extra_args,
-// ssh_private_key_file, ssh_private_key_inline
+// --- private helpers ---
 
-fn format_line(t: &JobTemplate) -> String {
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        escape(&t.id),
-        escape(&t.name),
-        escape(&t.playbook),
-        escape(&t.inventory),
-        bool_to_u8(t.check),
-        bool_to_u8(t.diff),
-        bool_to_u8(t.become_enabled),
-        t.verbosity,
-        t.forks.map(|v| v.to_string()).unwrap_or_default(),
-        t.timeout.map(|v| v.to_string()).unwrap_or_default(),
-        escape_opt(&t.limit),
-        escape_opt(&t.tags),
-        escape_opt(&t.extra_vars),
-        escape_opt(&t.extra_args),
-        escape_opt(&t.ssh_private_key_file),
-        escape_opt(&t.ssh_private_key_inline),
+fn open_templates_db(cwd: &Path) -> io::Result<rusqlite::Connection> {
+    let conn = open_db(&project_db_path(cwd))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS job_templates (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            playbook TEXT NOT NULL,
+            inventory TEXT NOT NULL,
+            \"check\" INTEGER NOT NULL DEFAULT 0,
+            diff INTEGER NOT NULL DEFAULT 0,
+            become_enabled INTEGER NOT NULL DEFAULT 0,
+            verbosity INTEGER NOT NULL DEFAULT 0,
+            forks INTEGER,
+            timeout INTEGER,
+            \"limit\" TEXT,
+            tags TEXT,
+            extra_vars TEXT,
+            extra_args TEXT,
+            ssh_private_key_file TEXT,
+            ssh_private_key_inline TEXT,
+            vault_source_type TEXT,
+            vault_password_file TEXT,
+            vault_id_label TEXT
+         )",
     )
+    .map_err(sqlite_to_io)?;
+    Ok(conn)
 }
 
-fn parse_line(line: &str) -> Option<JobTemplate> {
+fn migrate_from_tsv_if_needed(cwd: &Path, conn: &rusqlite::Connection) -> io::Result<()> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM job_templates", [], |row| row.get(0))
+        .map_err(sqlite_to_io)?;
+    if count > 0 {
+        return Ok(());
+    }
+
+    let tsv_path = cwd.join(SETTINGS_DIR).join(LEGACY_TEMPLATES_FILE);
+    let data = match fs::read_to_string(tsv_path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    let tx = conn.unchecked_transaction().map_err(sqlite_to_io)?;
+    let mut insert = tx
+        .prepare(
+            "INSERT OR IGNORE INTO job_templates \
+             (id, name, playbook, inventory, \
+              \"check\", diff, become_enabled, verbosity, \
+              forks, timeout, \"limit\", tags, extra_vars, extra_args, \
+              ssh_private_key_file, ssh_private_key_inline, \
+              vault_source_type, vault_password_file, vault_id_label) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+        )
+        .map_err(sqlite_to_io)?;
+
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(t) = parse_tsv_line(line) {
+            insert
+                .execute(params![
+                    t.id,
+                    t.name,
+                    t.playbook,
+                    t.inventory,
+                    t.check as i64,
+                    t.diff as i64,
+                    t.become_enabled as i64,
+                    t.verbosity as i64,
+                    t.forks.map(|v| v as i64),
+                    t.timeout.map(|v| v as i64),
+                    t.limit,
+                    t.tags,
+                    t.extra_vars,
+                    t.extra_args,
+                    t.ssh_private_key_file,
+                    t.ssh_private_key_inline,
+                    t.vault_source_type.map(|v| v.as_str().to_string()),
+                    t.vault_password_file,
+                    t.vault_id_label,
+                ])
+                .map_err(sqlite_to_io)?;
+        }
+    }
+
+    drop(insert);
+    tx.commit().map_err(sqlite_to_io)?;
+    Ok(())
+}
+
+// --- TSV legacy parsing ---
+
+fn parse_tsv_line(line: &str) -> Option<JobTemplate> {
     let fields = line.split('\t').collect::<Vec<_>>();
     if fields.len() < 16 {
         return None;
     }
 
-    let mut idx = 0;
-    let id = unescape(fields.get(idx).copied().unwrap_or_default());
+    let mut idx = 0usize;
+    let id = tsv_unescape(fields.get(idx).copied().unwrap_or_default());
     idx += 1;
     if id.is_empty() {
         return None;
     }
-    let name = unescape(fields.get(idx).copied().unwrap_or_default());
+    let name = tsv_unescape(fields.get(idx).copied().unwrap_or_default());
     idx += 1;
-    let playbook = unescape(fields.get(idx).copied().unwrap_or_default());
+    let playbook = tsv_unescape(fields.get(idx).copied().unwrap_or_default());
     idx += 1;
-    let inventory = unescape(fields.get(idx).copied().unwrap_or_default());
+    let inventory = tsv_unescape(fields.get(idx).copied().unwrap_or_default());
     idx += 1;
 
     // Backward compatibility: legacy rows included an `environment` field after inventory.
-    if fields.len() >= 17 {
+    if !is_bool_like(fields.get(idx).copied().unwrap_or_default()) {
         idx += 1;
+    }
+    if fields.len() < idx + 12 {
+        return None;
     }
 
     let check = parse_bool(fields.get(idx).copied().unwrap_or_default());
@@ -207,6 +359,14 @@ fn parse_line(line: &str) -> Option<JobTemplate> {
     let ssh_private_key_file = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
     idx += 1;
     let ssh_private_key_inline = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let vault_source_type = fields
+        .get(idx)
+        .and_then(|raw| VaultSourceType::from_str(raw.trim()));
+    idx += 1;
+    let vault_password_file = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
+    idx += 1;
+    let vault_id_label = parse_opt_string(fields.get(idx).copied().unwrap_or_default());
 
     Some(JobTemplate {
         id,
@@ -225,19 +385,18 @@ fn parse_line(line: &str) -> Option<JobTemplate> {
         extra_args,
         ssh_private_key_file,
         ssh_private_key_inline,
+        vault_source_type,
+        vault_password_file,
+        vault_id_label,
     })
+}
+
+fn is_bool_like(raw: &str) -> bool {
+    matches!(raw.trim(), "1" | "0" | "true" | "false" | "yes" | "no")
 }
 
 fn parse_bool(raw: &str) -> bool {
     matches!(raw.trim(), "1" | "true" | "yes")
-}
-
-fn bool_to_u8(value: bool) -> u8 {
-    if value {
-        1
-    } else {
-        0
-    }
 }
 
 fn parse_opt_u16(raw: &str) -> Option<u16> {
@@ -249,13 +408,17 @@ fn parse_opt_u16(raw: &str) -> Option<u16> {
     }
 }
 
-fn escape(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('\t', "\\t")
-        .replace('\n', "\\n")
+fn parse_opt_string(raw: &str) -> Option<String> {
+    let raw = tsv_unescape(raw);
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
 }
 
-fn unescape(raw: &str) -> String {
+fn tsv_unescape(raw: &str) -> String {
     let mut out = String::new();
     let mut chars = raw.chars();
     while let Some(ch) = chars.next() {
@@ -277,26 +440,22 @@ fn unescape(raw: &str) -> String {
     out
 }
 
-fn escape_opt(value: &Option<String>) -> String {
-    value.as_deref().map(escape).unwrap_or_default()
-}
-
-fn parse_opt_string(raw: &str) -> Option<String> {
-    let raw = unescape(raw);
-    let raw = raw.trim().to_string();
-    if raw.is_empty() {
-        None
-    } else {
-        Some(raw)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn temp_cwd(name: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ansible_tui_templates_{name}_{suffix}"))
+    }
 
     #[test]
-    fn test_job_template_tsv_round_trip() {
+    fn save_and_load_round_trip() {
+        let cwd = temp_cwd("round_trip");
         let templates = vec![
             JobTemplate {
                 id: String::from("deploy-web-123456"),
@@ -315,6 +474,9 @@ mod tests {
                 extra_args: Some(String::from("--force-handlers")),
                 ssh_private_key_file: Some(String::from("~/.ssh/deploy_key")),
                 ssh_private_key_inline: None,
+                vault_source_type: Some(VaultSourceType::Prompt),
+                vault_password_file: None,
+                vault_id_label: Some(String::from("prod")),
             },
             JobTemplate {
                 id: String::from("simple-000001"),
@@ -333,44 +495,17 @@ mod tests {
                 extra_args: None,
                 ssh_private_key_file: None,
                 ssh_private_key_inline: None,
-            },
-            JobTemplate {
-                id: String::from("special-chars-999"),
-                name: String::from("Has\ttab\nand\nnewline"),
-                playbook: String::from("play\tbook.yml"),
-                inventory: String::from("inv\\entory"),
-                check: true,
-                diff: false,
-                become_enabled: false,
-                verbosity: 4,
-                forks: None,
-                timeout: None,
-                limit: None,
-                tags: None,
-                extra_vars: None,
-                extra_args: None,
-                ssh_private_key_file: None,
-                ssh_private_key_inline: Some(String::from(
-                    "-----BEGIN KEY-----\ndata\n-----END KEY-----",
-                )),
+                vault_source_type: None,
+                vault_password_file: Some(String::from("~/.vault-pass")),
+                vault_id_label: None,
             },
         ];
 
-        let mut serialized = String::new();
-        for t in &templates {
-            serialized.push_str(&format_line(t));
-            serialized.push('\n');
-        }
+        save_job_templates(&cwd, &templates).expect("save");
+        let loaded = load_job_templates(&cwd).expect("load");
+        assert_eq!(loaded.len(), 2);
 
-        let mut parsed = Vec::new();
-        for line in serialized.lines() {
-            if let Some(t) = parse_line(line) {
-                parsed.push(t);
-            }
-        }
-
-        assert_eq!(parsed.len(), templates.len());
-        for (original, restored) in templates.iter().zip(parsed.iter()) {
+        for (original, restored) in templates.iter().zip(loaded.iter()) {
             assert_eq!(original.id, restored.id);
             assert_eq!(original.name, restored.name);
             assert_eq!(original.playbook, restored.playbook);
@@ -390,44 +525,12 @@ mod tests {
                 original.ssh_private_key_inline,
                 restored.ssh_private_key_inline
             );
+            assert_eq!(original.vault_source_type, restored.vault_source_type);
+            assert_eq!(original.vault_password_file, restored.vault_password_file);
+            assert_eq!(original.vault_id_label, restored.vault_id_label);
         }
-    }
 
-    #[test]
-    fn test_parse_legacy_environment_field() {
-        let legacy = [
-            "legacy-1",
-            "Legacy Template",
-            "playbooks/site.yml",
-            "inventories/prod.yml",
-            "prod",
-            "1",
-            "0",
-            "1",
-            "3",
-            "20",
-            "90",
-            "web",
-            "deploy",
-            "{\"dry_run\":false}",
-            "--check",
-            "~/.ssh/key",
-            "inline-key",
-        ]
-        .join("\t");
-
-        let parsed = parse_line(&legacy).expect("legacy row should parse");
-        assert_eq!(parsed.id, "legacy-1");
-        assert_eq!(parsed.name, "Legacy Template");
-        assert_eq!(parsed.inventory, "inventories/prod.yml");
-        assert!(parsed.check);
-        assert!(!parsed.diff);
-        assert!(parsed.become_enabled);
-        assert_eq!(parsed.verbosity, 3);
-        assert_eq!(parsed.forks, Some(20));
-        assert_eq!(parsed.timeout, Some(90));
-        assert_eq!(parsed.ssh_private_key_file.as_deref(), Some("~/.ssh/key"));
-        assert_eq!(parsed.ssh_private_key_inline.as_deref(), Some("inline-key"));
+        let _ = fs::remove_dir_all(&cwd);
     }
 
     #[test]

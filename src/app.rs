@@ -29,19 +29,26 @@ use crate::projects::{
 };
 use crate::run::{
     discover_runtime_candidates, playbook_bin_available, spawn_ansible_run,
-    spawn_bootstrap_managed_runtime, spawn_git_clone, spawn_project_sync, RunOptions, RunRequest,
-    RuntimeCandidate,
+    spawn_ansible_vault_create_file, spawn_ansible_vault_update_file,
+    spawn_ansible_vault_view_file, spawn_bootstrap_managed_runtime, spawn_git_clone,
+    spawn_project_sync, RunOptions, RunRequest, RuntimeCandidate,
 };
-use crate::run_store::{load_runs, save_run, take_legacy_environment_migration_notice};
+use crate::run_store::{
+    load_runs, migrate_unstable_hash_history, save_run,
+    take_legacy_environment_migration_notice,
+};
+use crate::secrets::{SecretEnforcementMode, VaultSourceType};
 
 const MAX_LOG_LINES: usize = 1_000;
 const MAX_RUNTIME_LOG_LINES: usize = 120;
 const AUTO_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const PLAYBOOK_SETTINGS_FIELD_COUNT: usize = 12;
 const PLAYBOOK_SETTINGS_TEXT_FIELD_START: usize = 6;
-const GLOBAL_SETTINGS_FIELD_COUNT: usize = 12;
-const TEMPLATE_EDITOR_FIELD_COUNT: usize = 16;
+const GLOBAL_SETTINGS_FIELD_COUNT: usize = 13;
+const TEMPLATE_EDITOR_FIELD_COUNT: usize = 19;
+const PROJECT_SECRET_FIELD_COUNT: usize = 5;
 const MAX_PROJECT_SYNC_LOG_LINES: usize = 400;
+const RUN_LOG_PERSIST_EVERY: usize = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -115,6 +122,48 @@ struct PendingGitProject {
     root: PathBuf,
     inventory_sync_cmd: Option<String>,
     vars_sync_cmd: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum PendingVaultPromptAction {
+    Create {
+        project_root: PathBuf,
+        target_path: PathBuf,
+        content: String,
+        vault_id_label: Option<String>,
+    },
+    EditLoad {
+        project_root: PathBuf,
+        target_path: PathBuf,
+        vault_id_label: Option<String>,
+    },
+    EditSave {
+        project_root: PathBuf,
+        target_path: PathBuf,
+        content: String,
+        vault_id_label: Option<String>,
+    },
+    Run {
+        request: RunRequest,
+        status_line: String,
+    },
+}
+
+impl PendingVaultPromptAction {
+    fn project_root(&self) -> &Path {
+        match self {
+            PendingVaultPromptAction::Create { project_root, .. }
+            | PendingVaultPromptAction::EditLoad { project_root, .. }
+            | PendingVaultPromptAction::EditSave { project_root, .. } => project_root,
+            PendingVaultPromptAction::Run { request, .. } => &request.cwd,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VaultPromptPasswordCache {
+    project_root: PathBuf,
+    password: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +280,8 @@ pub struct TemplateEffectiveContext {
     pub ssh_private_key_file: Option<String>,
     pub has_inline_ssh_key: bool,
     pub ssh_key_source: String,
+    pub vault_source: String,
+    pub vault_id_label: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -240,6 +291,7 @@ struct ResolvedTemplateRunContext {
     options: RunOptions,
     inventory_source: String,
     ssh_key_source: String,
+    vault_source: String,
     warnings: Vec<String>,
 }
 
@@ -302,6 +354,34 @@ pub struct App {
     pub project_ssh_field_idx: usize,
     pub project_ssh_buffer_file: String,
     pub project_ssh_buffer_inline: String,
+    pub project_vault_source_type: Option<VaultSourceType>,
+    pub project_vault_password_file_buffer: String,
+    pub project_vault_id_label_buffer: String,
+    pub vault_create_open: bool,
+    pub vault_create_field_idx: usize,
+    pub vault_create_buffer_path: String,
+    pub vault_create_buffer_content: String,
+    pub vault_edit_open: bool,
+    pub vault_edit_field_idx: usize,
+    pub vault_edit_buffer_path: String,
+    pub vault_edit_buffer_content: String,
+    pub vault_edit_loading: bool,
+    vault_edit_target_root: Option<PathBuf>,
+    pub vault_runtime_prompt_open: bool,
+    pub vault_runtime_prompt_field_idx: usize,
+    pub vault_runtime_prompt_password: String,
+    pub vault_runtime_prompt_confirm: String,
+    pending_vault_prompt_action: Option<PendingVaultPromptAction>,
+    vault_prompt_password_cache: Option<VaultPromptPasswordCache>,
+    pending_vault_prompt_project_root: Option<PathBuf>,
+    vault_temp_password_files: Vec<PathBuf>,
+    vault_temp_password_files_by_run: BTreeMap<u64, Vec<PathBuf>>,
+    pub vault_password_create_open: bool,
+    pub vault_password_create_field_idx: usize,
+    pub vault_password_create_buffer_path: String,
+    pub vault_password_create_buffer_password: String,
+    pub vault_password_create_buffer_confirm: String,
+    vault_password_create_target_root: Option<PathBuf>,
     pub project_sync_running: bool,
     pub project_sync_logs: Vec<String>,
     project_ssh_target_root: Option<PathBuf>,
@@ -318,6 +398,7 @@ pub struct App {
     pub global_settings_field_idx: usize,
     pub global_settings_text_mode: bool,
     pub global_settings_text_buffer: String,
+    pub secret_enforcement_mode: SecretEnforcementMode,
     // Template state
     pub job_templates: Vec<JobTemplate>,
     pub template_idx: usize,
@@ -334,6 +415,9 @@ pub struct App {
     pub template_editor_playbook_idx: usize,
     pub template_editor_inventory_idx: usize,
     pub template_editor_settings: PlaybookSettings,
+    pub template_editor_vault_source_type: Option<VaultSourceType>,
+    pub template_editor_vault_password_file: String,
+    pub template_editor_vault_id_label: String,
 
     pub should_quit: bool,
     needs_full_redraw: bool,
@@ -346,9 +430,14 @@ pub struct App {
 impl App {
     pub fn new(cwd: PathBuf) -> Self {
         let mut run_options = RunOptions::from_env();
+        let mut secret_enforcement_mode = SecretEnforcementMode::Strict;
         let mut status_line = String::from("Ready. Press r to run selected template.");
         match load_app_config(&cwd) {
-            Ok(config) => Self::apply_loaded_global_config(&mut run_options, config),
+            Ok(config) => Self::apply_loaded_global_config(
+                &mut run_options,
+                &mut secret_enforcement_mode,
+                config,
+            ),
             Err(err) => {
                 status_line = format!("config load failed: {err}");
             }
@@ -413,6 +502,34 @@ impl App {
             project_ssh_field_idx: 0,
             project_ssh_buffer_file: String::new(),
             project_ssh_buffer_inline: String::new(),
+            project_vault_source_type: None,
+            project_vault_password_file_buffer: String::new(),
+            project_vault_id_label_buffer: String::new(),
+            vault_create_open: false,
+            vault_create_field_idx: 0,
+            vault_create_buffer_path: String::new(),
+            vault_create_buffer_content: String::new(),
+            vault_edit_open: false,
+            vault_edit_field_idx: 0,
+            vault_edit_buffer_path: String::new(),
+            vault_edit_buffer_content: String::new(),
+            vault_edit_loading: false,
+            vault_edit_target_root: None,
+            vault_runtime_prompt_open: false,
+            vault_runtime_prompt_field_idx: 0,
+            vault_runtime_prompt_password: String::new(),
+            vault_runtime_prompt_confirm: String::new(),
+            pending_vault_prompt_action: None,
+            vault_prompt_password_cache: None,
+            pending_vault_prompt_project_root: None,
+            vault_temp_password_files: Vec::new(),
+            vault_temp_password_files_by_run: BTreeMap::new(),
+            vault_password_create_open: false,
+            vault_password_create_field_idx: 0,
+            vault_password_create_buffer_path: String::new(),
+            vault_password_create_buffer_password: String::new(),
+            vault_password_create_buffer_confirm: String::new(),
+            vault_password_create_target_root: None,
             project_sync_running: false,
             project_sync_logs: Vec::new(),
             project_ssh_target_root: None,
@@ -429,6 +546,7 @@ impl App {
             global_settings_field_idx: 0,
             global_settings_text_mode: false,
             global_settings_text_buffer: String::new(),
+            secret_enforcement_mode,
             job_templates: Vec::new(),
             template_idx: 0,
             templates_focus_runs: false,
@@ -442,6 +560,9 @@ impl App {
             template_editor_playbook_idx: 0,
             template_editor_inventory_idx: 0,
             template_editor_settings: PlaybookSettings::default(),
+            template_editor_vault_source_type: None,
+            template_editor_vault_password_file: String::new(),
+            template_editor_vault_id_label: String::new(),
             should_quit: false,
             needs_full_redraw: false,
             pending_project_delete: None,
@@ -466,7 +587,11 @@ impl App {
         requested
     }
 
-    fn apply_loaded_global_config(run_options: &mut RunOptions, config: AppConfig) {
+    fn apply_loaded_global_config(
+        run_options: &mut RunOptions,
+        secret_enforcement_mode: &mut SecretEnforcementMode,
+        config: AppConfig,
+    ) {
         if std::env::var("ANSIBLE_TUI_PLAYBOOK_BIN").is_err() {
             if let Some(bin) = config.ansible_bin {
                 run_options.ansible_bin = bin;
@@ -504,6 +629,9 @@ impl App {
         if std::env::var("ANSIBLE_TUI_EXTRA_ARGS").is_err() {
             run_options.extra_args = config.extra_args;
         }
+        if let Some(mode) = config.secret_enforcement_mode {
+            *secret_enforcement_mode = mode;
+        }
     }
 
     pub fn active_project_root(&self) -> &Path {
@@ -534,6 +662,21 @@ impl App {
 
     pub fn settings_text_mode_is_multiline(&self) -> bool {
         self.settings_editor_text_mode && self.settings_editor_field_idx == 11
+    }
+
+    pub fn vault_runtime_prompt_confirm_required(&self) -> bool {
+        matches!(
+            self.pending_vault_prompt_action,
+            Some(PendingVaultPromptAction::Create { .. })
+        )
+    }
+
+    fn vault_runtime_prompt_last_field_idx(&self) -> usize {
+        if self.vault_runtime_prompt_confirm_required() {
+            1
+        } else {
+            0
+        }
     }
 
     fn restore_projects(&mut self) {
@@ -577,10 +720,40 @@ impl App {
         self.pending_template_delete = None;
         self.template_idx = 0;
         self.template_editor_open = false;
+        self.template_editor_vault_source_type = None;
+        self.template_editor_vault_password_file.clear();
+        self.template_editor_vault_id_label.clear();
         self.project_ssh_open = false;
         self.project_ssh_field_idx = 0;
         self.project_ssh_buffer_file.clear();
         self.project_ssh_buffer_inline.clear();
+        self.project_vault_source_type = None;
+        self.project_vault_password_file_buffer.clear();
+        self.project_vault_id_label_buffer.clear();
+        self.vault_create_open = false;
+        self.vault_create_field_idx = 0;
+        self.vault_create_buffer_path.clear();
+        self.vault_create_buffer_content.clear();
+        self.vault_edit_open = false;
+        self.vault_edit_field_idx = 0;
+        self.vault_edit_buffer_path.clear();
+        self.vault_edit_buffer_content.clear();
+        self.vault_edit_loading = false;
+        self.vault_edit_target_root = None;
+        self.vault_runtime_prompt_open = false;
+        self.vault_runtime_prompt_field_idx = 0;
+        self.vault_runtime_prompt_password.clear();
+        self.vault_runtime_prompt_confirm.clear();
+        self.pending_vault_prompt_action = None;
+        self.clear_vault_prompt_password_cache();
+        self.pending_vault_prompt_project_root = None;
+        self.cleanup_vault_temp_password_files();
+        self.vault_password_create_open = false;
+        self.vault_password_create_field_idx = 0;
+        self.vault_password_create_buffer_path.clear();
+        self.vault_password_create_buffer_password.clear();
+        self.vault_password_create_buffer_confirm.clear();
+        self.vault_password_create_target_root = None;
         self.project_ssh_target_root = None;
         self.inventory_idx = 0;
         self.playbook_idx = 0;
@@ -621,18 +794,28 @@ impl App {
             Action::CharInput(ch) => self.handle_char_input(ch, tx),
             Action::Backspace => self.handle_backspace(),
             Action::NextView => {
-                if self.inventory_edit_mode_open {
+                if self.vault_runtime_prompt_open {
+                    self.vault_runtime_prompt_field_idx = min(
+                        self.vault_runtime_prompt_field_idx + 1,
+                        self.vault_runtime_prompt_last_field_idx(),
+                    );
+                } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(1);
                 } else if !self.settings_editor_open
                     && !self.template_editor_open
                     && !self.inventory_create_open
                     && !self.project_create_open
                     && !self.project_ssh_open
+                    && !self.vault_create_open
+                    && !self.vault_edit_open
+                    && !self.vault_password_create_open
+                    && !self.vault_runtime_prompt_open
                     && !self.inventory_editor_open
                     && !self.inventory_edit_mode_open
                     && !self.runtime_prompt_open
                     && !(self.current_view() == View::Settings && self.global_settings_text_mode)
                 {
+                    self.clear_log_select_mode_for_view_change();
                     self.view_idx = (self.view_idx + 1) % View::all().len();
                     if self.current_view() == View::Playbooks {
                         self.playbooks_focus_runs = false;
@@ -644,18 +827,26 @@ impl App {
                 }
             }
             Action::PrevView => {
-                if self.inventory_edit_mode_open {
+                if self.vault_runtime_prompt_open {
+                    self.vault_runtime_prompt_field_idx =
+                        self.vault_runtime_prompt_field_idx.saturating_sub(1);
+                } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(-1);
                 } else if !self.settings_editor_open
                     && !self.template_editor_open
                     && !self.inventory_create_open
                     && !self.project_create_open
                     && !self.project_ssh_open
+                    && !self.vault_create_open
+                    && !self.vault_edit_open
+                    && !self.vault_password_create_open
+                    && !self.vault_runtime_prompt_open
                     && !self.inventory_editor_open
                     && !self.inventory_edit_mode_open
                     && !self.runtime_prompt_open
                     && !(self.current_view() == View::Settings && self.global_settings_text_mode)
                 {
+                    self.clear_log_select_mode_for_view_change();
                     self.view_idx = (self.view_idx + View::all().len() - 1) % View::all().len();
                     if self.current_view() == View::Playbooks {
                         self.playbooks_focus_runs = false;
@@ -667,10 +858,17 @@ impl App {
                 }
             }
             Action::SettingsIncrease => {
-                if self.template_editor_open {
+                if self.vault_runtime_prompt_open {
+                    self.vault_runtime_prompt_field_idx = min(
+                        self.vault_runtime_prompt_field_idx + 1,
+                        self.vault_runtime_prompt_last_field_idx(),
+                    );
+                } else if self.template_editor_open {
                     self.adjust_template_editor_field(1);
                 } else if self.settings_editor_open {
                     self.adjust_settings_field(1);
+                } else if self.project_ssh_open {
+                    self.adjust_project_ssh_field(1);
                 } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(1);
                 } else if self.current_view() == View::Inventory
@@ -694,10 +892,15 @@ impl App {
                 }
             }
             Action::SettingsDecrease => {
-                if self.template_editor_open {
+                if self.vault_runtime_prompt_open {
+                    self.vault_runtime_prompt_field_idx =
+                        self.vault_runtime_prompt_field_idx.saturating_sub(1);
+                } else if self.template_editor_open {
                     self.adjust_template_editor_field(-1);
                 } else if self.settings_editor_open {
                     self.adjust_settings_field(-1);
+                } else if self.project_ssh_open {
+                    self.adjust_project_ssh_field(-1);
                 } else if self.inventory_edit_mode_open {
                     self.move_inventory_edit_mode_selection(-1);
                 } else if self.current_view() == View::Inventory
@@ -720,7 +923,10 @@ impl App {
                 }
             }
             Action::MoveUp => {
-                if self.template_editor_open {
+                if self.vault_runtime_prompt_open {
+                    self.vault_runtime_prompt_field_idx =
+                        self.vault_runtime_prompt_field_idx.saturating_sub(1);
+                } else if self.template_editor_open {
                     if !self.template_editor_text_mode {
                         self.template_editor_field_idx =
                             self.template_editor_field_idx.saturating_sub(1);
@@ -732,6 +938,13 @@ impl App {
                     }
                 } else if self.project_ssh_open {
                     self.project_ssh_field_idx = self.project_ssh_field_idx.saturating_sub(1);
+                } else if self.vault_create_open {
+                    self.vault_create_field_idx = self.vault_create_field_idx.saturating_sub(1);
+                } else if self.vault_edit_open {
+                    self.vault_edit_field_idx = self.vault_edit_field_idx.saturating_sub(1);
+                } else if self.vault_password_create_open {
+                    self.vault_password_create_field_idx =
+                        self.vault_password_create_field_idx.saturating_sub(1);
                 } else if self.project_create_open {
                     self.project_create_field_idx = self.project_create_field_idx.saturating_sub(1);
                 } else if self.inventory_create_open {
@@ -763,7 +976,12 @@ impl App {
                 }
             }
             Action::MoveDown => {
-                if self.template_editor_open {
+                if self.vault_runtime_prompt_open {
+                    self.vault_runtime_prompt_field_idx = min(
+                        self.vault_runtime_prompt_field_idx + 1,
+                        self.vault_runtime_prompt_last_field_idx(),
+                    );
+                } else if self.template_editor_open {
                     if !self.template_editor_text_mode {
                         self.template_editor_field_idx = min(
                             self.template_editor_field_idx + 1,
@@ -778,7 +996,17 @@ impl App {
                         );
                     }
                 } else if self.project_ssh_open {
-                    self.project_ssh_field_idx = min(self.project_ssh_field_idx + 1, 1);
+                    self.project_ssh_field_idx = min(
+                        self.project_ssh_field_idx + 1,
+                        PROJECT_SECRET_FIELD_COUNT - 1,
+                    );
+                } else if self.vault_create_open {
+                    self.vault_create_field_idx = min(self.vault_create_field_idx + 1, 1);
+                } else if self.vault_edit_open {
+                    self.vault_edit_field_idx = min(self.vault_edit_field_idx + 1, 1);
+                } else if self.vault_password_create_open {
+                    self.vault_password_create_field_idx =
+                        min(self.vault_password_create_field_idx + 1, 2);
                 } else if self.project_create_open {
                     self.project_create_field_idx = min(
                         self.project_create_field_idx + 1,
@@ -839,8 +1067,16 @@ impl App {
             Action::ToggleCheckMode => self.toggle_check_mode(),
             Action::ToggleDiffMode => self.toggle_diff_mode(),
             Action::SaveInventoryEditor => {
-                if self.project_ssh_open {
+                if self.vault_runtime_prompt_open {
+                    self.save_vault_runtime_prompt(tx);
+                } else if self.project_ssh_open {
                     self.save_project_ssh_prompt();
+                } else if self.vault_create_open {
+                    self.save_vault_create_prompt(tx);
+                } else if self.vault_edit_open {
+                    self.save_vault_edit_prompt(tx);
+                } else if self.vault_password_create_open {
+                    self.save_vault_password_create_prompt();
                 } else if self.template_editor_open {
                     if self.template_editor_text_mode {
                         self.commit_template_editor_text_edit();
@@ -862,7 +1098,9 @@ impl App {
             }
             Action::OpenRuntimePrompt => self.open_runtime_prompt(),
             Action::CloseRuntimePrompt => {
-                if self.template_editor_open {
+                if self.vault_runtime_prompt_open {
+                    self.cancel_vault_runtime_prompt();
+                } else if self.template_editor_open {
                     if self.template_editor_text_mode {
                         self.cancel_template_editor_text_edit();
                     } else {
@@ -878,6 +1116,12 @@ impl App {
                     self.cancel_project_create_prompt();
                 } else if self.project_ssh_open {
                     self.cancel_project_ssh_prompt();
+                } else if self.vault_create_open {
+                    self.cancel_vault_create_prompt();
+                } else if self.vault_edit_open {
+                    self.cancel_vault_edit_prompt();
+                } else if self.vault_password_create_open {
+                    self.cancel_vault_password_create_prompt();
                 } else if self.inventory_editor_open {
                     self.close_inventory_editor(false);
                 } else if self.inventory_edit_mode_open {
@@ -907,7 +1151,9 @@ impl App {
                 }
             }
             Action::SelectRuntimeCandidate => {
-                if self.template_editor_open {
+                if self.vault_runtime_prompt_open {
+                    self.confirm_vault_runtime_prompt(tx);
+                } else if self.template_editor_open {
                     self.confirm_template_editor();
                 } else if self.settings_editor_open {
                     self.confirm_settings_editor();
@@ -919,6 +1165,12 @@ impl App {
                     self.confirm_project_create(tx);
                 } else if self.project_ssh_open {
                     self.confirm_project_ssh_prompt();
+                } else if self.vault_create_open {
+                    self.confirm_vault_create_prompt();
+                } else if self.vault_edit_open {
+                    self.confirm_vault_edit_prompt(tx);
+                } else if self.vault_password_create_open {
+                    self.confirm_vault_password_create_prompt();
                 } else if self.inventory_edit_mode_open {
                     self.confirm_inventory_edit_mode_selection();
                 } else if self.current_view() == View::Inventory
@@ -962,6 +1214,13 @@ impl App {
             Action::ProjectSyncLog(line) => self.record_project_sync_log(line),
             Action::ProjectSyncFinished { success, message } => {
                 self.project_sync_running = false;
+                self.vault_edit_loading = false;
+                self.cleanup_vault_temp_password_files();
+                if let Some(project_root) = self.pending_vault_prompt_project_root.take() {
+                    if !success {
+                        self.clear_vault_prompt_password_cache_for(&project_root);
+                    }
+                }
                 self.record_project_sync_log(message.clone());
                 if let Some(pending) = self.pending_git_project.take() {
                     if success {
@@ -985,6 +1244,9 @@ impl App {
                                 vars_sync_cmd: pending.vars_sync_cmd,
                                 ssh_private_key_file: None,
                                 ssh_private_key_inline: None,
+                                vault_source_type: None,
+                                vault_password_file: None,
+                                vault_id_label: None,
                             });
                             self.project_idx = self.projects.len().saturating_sub(1);
                             self.persist_projects();
@@ -999,6 +1261,32 @@ impl App {
                     if success && self.project_idx == self.active_project_idx {
                         self.refresh_project();
                     }
+                }
+            }
+            Action::VaultEditLoaded {
+                success,
+                path,
+                content,
+                message,
+            } => {
+                self.project_sync_running = false;
+                self.vault_edit_loading = false;
+                self.cleanup_vault_temp_password_files();
+                if let Some(project_root) = self.pending_vault_prompt_project_root.take() {
+                    if !success {
+                        self.clear_vault_prompt_password_cache_for(&project_root);
+                    }
+                }
+                self.record_project_sync_log(message.clone());
+                if success {
+                    self.vault_edit_buffer_path = path;
+                    self.vault_edit_buffer_content = content.unwrap_or_default();
+                    self.vault_edit_field_idx = 1;
+                    self.status_line = String::from(
+                        "Vault content loaded. Edit and Ctrl+S to re-encrypt and save.",
+                    );
+                } else {
+                    self.status_line = message;
                 }
             }
             Action::RefreshProject => self.refresh_project(),
@@ -1034,6 +1322,7 @@ impl App {
                 self.persist_run(run_id);
             }
             Action::RunLog { run_id, line } => {
+                let mut should_persist = false;
                 if let Some(idx) = self.runs.iter().position(|r| r.id == run_id) {
                     let selected_run = self.run_idx == idx;
                     let run = &mut self.runs[idx];
@@ -1054,6 +1343,10 @@ impl App {
                     if selected_run && (!self.log_select_mode || was_at_tail) {
                         self.log_cursor = run.logs.len().saturating_sub(1);
                     }
+                    should_persist = run.logs.len() % RUN_LOG_PERSIST_EVERY == 0;
+                }
+                if should_persist {
+                    self.persist_run(run_id);
                 }
             }
             Action::RunFinished {
@@ -1061,6 +1354,7 @@ impl App {
                 success,
                 exit_code,
             } => {
+                self.cleanup_vault_temp_password_files_for_run(run_id);
                 if let Some(idx) = self.runs.iter().position(|r| r.id == run_id) {
                     let run = &mut self.runs[idx];
                     run.status = if success {
@@ -1088,6 +1382,10 @@ impl App {
     }
 
     fn handle_char_input(&mut self, ch: char, tx: &UnboundedSender<Action>) {
+        if self.vault_runtime_prompt_open {
+            self.push_vault_runtime_prompt_char(ch);
+            return;
+        }
         if self.settings_editor_open && self.settings_editor_text_mode {
             self.push_settings_text_char(ch);
             return;
@@ -1098,6 +1396,18 @@ impl App {
         }
         if self.project_ssh_open {
             self.push_project_ssh_char(ch);
+            return;
+        }
+        if self.vault_create_open {
+            self.push_vault_create_char(ch);
+            return;
+        }
+        if self.vault_edit_open {
+            self.push_vault_edit_char(ch);
+            return;
+        }
+        if self.vault_password_create_open {
+            self.push_vault_password_create_char(ch);
             return;
         }
         if self.project_create_open {
@@ -1350,6 +1660,18 @@ impl App {
                     self.open_project_ssh_prompt();
                     return;
                 }
+                'V' => {
+                    self.open_vault_create_prompt();
+                    return;
+                }
+                'E' => {
+                    self.open_vault_edit_prompt(tx);
+                    return;
+                }
+                'P' => {
+                    self.open_vault_password_create_prompt();
+                    return;
+                }
                 'D' => {
                     self.request_project_delete();
                     return;
@@ -1444,6 +1766,7 @@ impl App {
 
         match ch {
             'h' => {
+                self.clear_log_select_mode_for_view_change();
                 self.view_idx = (self.view_idx + View::all().len() - 1) % View::all().len();
                 if self.current_view() == View::Playbooks {
                     self.playbooks_focus_runs = false;
@@ -1454,6 +1777,7 @@ impl App {
                 }
             }
             'l' => {
+                self.clear_log_select_mode_for_view_change();
                 self.view_idx = (self.view_idx + 1) % View::all().len();
                 if self.current_view() == View::Playbooks {
                     self.playbooks_focus_runs = false;
@@ -1494,8 +1818,10 @@ impl App {
             'r' => {
                 if self.current_view() == View::Projects {
                     self.refresh_project();
-                } else {
+                } else if self.current_view() == View::Templates {
                     self.start_template_run(tx);
+                } else {
+                    self.start_run(tx);
                 }
             }
             'v' => {
@@ -1523,6 +1849,10 @@ impl App {
     }
 
     fn handle_backspace(&mut self) {
+        if self.vault_runtime_prompt_open {
+            self.backspace_vault_runtime_prompt();
+            return;
+        }
         if self.settings_editor_open && self.settings_editor_text_mode {
             self.settings_editor_text_buffer.pop();
             return;
@@ -1533,6 +1863,18 @@ impl App {
         }
         if self.project_ssh_open {
             self.backspace_project_ssh();
+            return;
+        }
+        if self.vault_create_open {
+            self.backspace_vault_create();
+            return;
+        }
+        if self.vault_edit_open {
+            self.backspace_vault_edit();
+            return;
+        }
+        if self.vault_password_create_open {
+            self.backspace_vault_password_create();
             return;
         }
         if self.project_create_open {
@@ -1621,11 +1963,30 @@ impl App {
         if !self.settings_editor_text_mode {
             return;
         }
+        let previous_value = self.current_settings_text_value();
         let value = if self.settings_field_accepts_multiline() {
             normalize_optional_multiline_text(self.settings_editor_text_buffer.clone())
         } else {
             normalize_optional_text(self.settings_editor_text_buffer.clone())
         };
+        if self.settings_editor_field_idx == 8 {
+            if let Some(ref candidate) = value {
+                if parse_extra_vars_file_refs(candidate).is_err()
+                    && previous_value.as_deref() != Some(candidate.as_str())
+                {
+                    self.status_line = String::from(
+                        "Playbook settings: plaintext extra-vars are read-only; use vars file references",
+                    );
+                    return;
+                }
+            }
+        }
+        if self.settings_editor_field_idx == 11 && value.is_some() && previous_value != value {
+            self.status_line = String::from(
+                "Playbook settings: inline SSH keys are read-only; use SSH key file references",
+            );
+            return;
+        }
         self.set_current_settings_text_value(value);
         self.settings_editor_text_mode = false;
         self.settings_editor_text_buffer.clear();
@@ -1783,6 +2144,7 @@ impl App {
             5 => self.ansible_cfg.host_key_checking = !self.ansible_cfg.host_key_checking,
             7 => self.ansible_cfg.retry_files_enabled = !self.ansible_cfg.retry_files_enabled,
             11 => self.ansible_cfg.pipelining = !self.ansible_cfg.pipelining,
+            12 => self.secret_enforcement_mode = self.secret_enforcement_mode.cycle(1),
             _ => return,
         }
         self.persist_global_settings();
@@ -1825,6 +2187,9 @@ impl App {
             }
             11 => {
                 self.ansible_cfg.pipelining = !self.ansible_cfg.pipelining;
+            }
+            12 => {
+                self.secret_enforcement_mode = self.secret_enforcement_mode.cycle(delta);
             }
             _ => return,
         }
@@ -1970,6 +2335,15 @@ impl App {
             self.sync_log_cursor_to_selected_run();
             self.status_line = String::from("Log select mode OFF");
         }
+    }
+
+    fn clear_log_select_mode_for_view_change(&mut self) {
+        if !self.log_select_mode {
+            return;
+        }
+        self.log_select_mode = false;
+        self.log_anchor = None;
+        self.sync_log_cursor_to_selected_run();
     }
 
     fn mark_log_selection(&mut self) {
@@ -2135,7 +2509,7 @@ impl App {
     fn open_project_ssh_prompt(&mut self) {
         if self.current_view() != View::Projects {
             self.status_line =
-                String::from("Project SSH key settings are available in Projects tab");
+                String::from("Project secret settings are available in Projects tab");
             return;
         }
         let Some(project) = self.projects.get(self.project_idx).cloned() else {
@@ -2147,9 +2521,12 @@ impl App {
         self.project_ssh_field_idx = 0;
         self.project_ssh_buffer_file = project.ssh_private_key_file.unwrap_or_default();
         self.project_ssh_buffer_inline = project.ssh_private_key_inline.unwrap_or_default();
+        self.project_vault_source_type = project.vault_source_type;
+        self.project_vault_password_file_buffer = project.vault_password_file.unwrap_or_default();
+        self.project_vault_id_label_buffer = project.vault_id_label.unwrap_or_default();
         self.project_ssh_target_root = Some(project.root);
         self.status_line = format!(
-            "Project SSH key settings: {} (Ctrl+S save, Esc cancel)",
+            "Project secret settings: {} (Ctrl+S save, Esc cancel)",
             project.name
         );
     }
@@ -2159,8 +2536,11 @@ impl App {
         self.project_ssh_field_idx = 0;
         self.project_ssh_buffer_file.clear();
         self.project_ssh_buffer_inline.clear();
+        self.project_vault_source_type = None;
+        self.project_vault_password_file_buffer.clear();
+        self.project_vault_id_label_buffer.clear();
         self.project_ssh_target_root = None;
-        self.status_line = String::from("Project SSH key settings cancelled");
+        self.status_line = String::from("Project secret settings cancelled");
     }
 
     fn save_project_ssh_prompt(&mut self) {
@@ -2179,47 +2559,102 @@ impl App {
 
         let file = normalize_optional_text(self.project_ssh_buffer_file.clone());
         let inline = normalize_optional_multiline_text(self.project_ssh_buffer_inline.clone());
+        let vault_password_file =
+            normalize_optional_text(self.project_vault_password_file_buffer.clone());
+        let vault_id_label = normalize_optional_text(self.project_vault_id_label_buffer.clone());
+        if inline.is_some() && inline != self.projects[idx].ssh_private_key_inline {
+            self.status_line =
+                String::from("Project: inline SSH keys are read-only; use SSH key file references");
+            return;
+        }
         self.projects[idx].ssh_private_key_file = file;
         self.projects[idx].ssh_private_key_inline = inline;
+        self.projects[idx].vault_source_type = self.project_vault_source_type;
+        self.projects[idx].vault_password_file = vault_password_file;
+        self.projects[idx].vault_id_label = vault_id_label;
         let name = self.projects[idx].name.clone();
+        let project_root = self.projects[idx].root.clone();
         self.persist_projects();
+        self.clear_vault_prompt_password_cache_for(&project_root);
 
         self.project_ssh_open = false;
         self.project_ssh_field_idx = 0;
         self.project_ssh_buffer_file.clear();
         self.project_ssh_buffer_inline.clear();
+        self.project_vault_source_type = None;
+        self.project_vault_password_file_buffer.clear();
+        self.project_vault_id_label_buffer.clear();
         self.project_ssh_target_root = None;
-        self.status_line = format!("Project SSH key settings updated: {name}");
+        self.status_line = format!("Project secret settings updated: {name}");
     }
 
     fn confirm_project_ssh_prompt(&mut self) {
         if !self.project_ssh_open {
             return;
         }
-        if self.project_ssh_field_idx == 0 {
-            self.project_ssh_field_idx = 1;
-            return;
+        match self.project_ssh_field_idx {
+            1 => {
+                self.insert_project_ssh_newline();
+            }
+            2 => {
+                self.adjust_project_ssh_field(1);
+            }
+            idx => {
+                if idx + 1 < PROJECT_SECRET_FIELD_COUNT {
+                    self.project_ssh_field_idx += 1;
+                }
+            }
         }
-        self.insert_project_ssh_newline();
     }
 
-    fn active_project_ssh_buffer_mut(&mut self) -> &mut String {
-        if self.project_ssh_field_idx == 0 {
-            &mut self.project_ssh_buffer_file
-        } else {
-            &mut self.project_ssh_buffer_inline
+    fn adjust_project_ssh_field(&mut self, delta: i8) {
+        if !self.project_ssh_open {
+            return;
+        }
+        if self.project_ssh_field_idx == 2 {
+            self.project_vault_source_type =
+                VaultSourceType::cycle(self.project_vault_source_type, delta);
         }
     }
 
     fn push_project_ssh_char(&mut self, ch: char) {
+        if self.project_ssh_field_idx == 2 {
+            match ch {
+                'h' => self.adjust_project_ssh_field(-1),
+                'l' | ' ' => self.adjust_project_ssh_field(1),
+                _ => {}
+            }
+            return;
+        }
         if ch.is_control() {
             return;
         }
-        self.active_project_ssh_buffer_mut().push(ch);
+        match self.project_ssh_field_idx {
+            0 => self.project_ssh_buffer_file.push(ch),
+            1 => self.project_ssh_buffer_inline.push(ch),
+            2 => {}
+            3 => self.project_vault_password_file_buffer.push(ch),
+            4 => self.project_vault_id_label_buffer.push(ch),
+            _ => {}
+        }
     }
 
     fn backspace_project_ssh(&mut self) {
-        self.active_project_ssh_buffer_mut().pop();
+        match self.project_ssh_field_idx {
+            0 => {
+                self.project_ssh_buffer_file.pop();
+            }
+            1 => {
+                self.project_ssh_buffer_inline.pop();
+            }
+            3 => {
+                self.project_vault_password_file_buffer.pop();
+            }
+            4 => {
+                self.project_vault_id_label_buffer.pop();
+            }
+            _ => {}
+        }
     }
 
     fn insert_project_ssh_newline(&mut self) {
@@ -2227,6 +2662,1001 @@ impl App {
             return;
         }
         self.project_ssh_buffer_inline.push('\n');
+    }
+
+    fn open_vault_create_prompt(&mut self) {
+        if self.current_view() != View::Projects {
+            self.status_line = String::from("Vault create is available in Projects tab");
+            return;
+        }
+        if self.project_sync_running {
+            self.status_line = String::from("Wait for current project sync/create to finish");
+            return;
+        }
+        let Some(project) = self.projects.get(self.project_idx) else {
+            self.status_line = String::from("No project selected");
+            return;
+        };
+        self.vault_create_open = true;
+        self.vault_create_field_idx = 0;
+        self.vault_create_buffer_path = String::from("vars/secrets.vault.yml");
+        self.vault_create_buffer_content.clear();
+        self.status_line = if project.vault_source_type.is_none() {
+            String::from(
+                "Vault create: set project vault source in secret settings first (Projects: e)",
+            )
+        } else {
+            format!(
+                "Vault create new file: {} (Ctrl+S create+encrypt, Esc cancel)",
+                project.name
+            )
+        };
+    }
+
+    fn cancel_vault_create_prompt(&mut self) {
+        self.vault_create_open = false;
+        self.vault_create_field_idx = 0;
+        self.vault_create_buffer_path.clear();
+        self.vault_create_buffer_content.clear();
+        self.status_line = String::from("Vault create cancelled");
+    }
+
+    fn save_vault_create_prompt(&mut self, tx: &UnboundedSender<Action>) {
+        if !self.vault_create_open {
+            return;
+        }
+        if self.project_sync_running {
+            self.status_line = String::from("A project sync/create is already running");
+            return;
+        }
+
+        let Some(project) = self.projects.get(self.project_idx).cloned() else {
+            self.cancel_vault_create_prompt();
+            self.status_line = String::from("No project selected");
+            return;
+        };
+        let Some(vault_source_type) = project.vault_source_type else {
+            self.status_line = String::from(
+                "Configure project vault source first (Projects -> e, Vault Source Type)",
+            );
+            return;
+        };
+
+        let raw_target = self.vault_create_buffer_path.trim();
+        let target_value = if raw_target.is_empty() {
+            String::from("vars/secrets.vault.yml")
+        } else {
+            normalize_run_path(raw_target)
+        };
+        let target_path = {
+            let path = PathBuf::from(&target_value);
+            if path.is_absolute() {
+                path
+            } else {
+                project.root.join(path)
+            }
+        };
+        if target_path.exists() {
+            self.status_line = format!(
+                "Vault file already exists: {} (create flow only, choose another path)",
+                target_path.display()
+            );
+            return;
+        }
+
+        let mut vault_password_file = project.vault_password_file.clone();
+        if vault_source_type == VaultSourceType::File {
+            let Some(password_file) = project
+                .vault_password_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                self.status_line =
+                    String::from("Vault source is file, but no vault password file is configured");
+                return;
+            };
+            let Some(password_path) = self.resolve_existing_run_path(password_file) else {
+                let candidates = self.render_run_path_candidates(password_file);
+                self.status_line = format!(
+                    "Vault password file does not exist: checked {}",
+                    candidates.join(", ")
+                );
+                return;
+            };
+            vault_password_file = Some(password_path.to_string_lossy().to_string());
+        }
+
+        let content = {
+            let normalized = self
+                .vault_create_buffer_content
+                .replace("\r\n", "\n")
+                .replace('\r', "\n");
+            if normalized.trim().is_empty() {
+                self.status_line = String::from("Vault content cannot be empty");
+                return;
+            }
+            normalized
+        };
+
+        if vault_source_type == VaultSourceType::Prompt {
+            let action = PendingVaultPromptAction::Create {
+                project_root: project.root.clone(),
+                target_path: target_path.clone(),
+                content: content.clone(),
+                vault_id_label: project.vault_id_label.clone(),
+            };
+            if self.try_execute_cached_vault_prompt_action(action.clone(), tx) {
+                return;
+            }
+            self.open_vault_runtime_prompt(
+                action,
+                String::from("Vault password required (prompt mode): enter and Ctrl+S to continue"),
+            );
+            return;
+        }
+
+        self.project_sync_running = true;
+        self.record_project_sync_log(format!(
+            "Starting vault creation for project {}",
+            project.name
+        ));
+        spawn_ansible_vault_create_file(
+            project.root.clone(),
+            self.run_options.ansible_bin.clone(),
+            target_path.to_string_lossy().to_string(),
+            content,
+            vault_source_type,
+            vault_password_file,
+            project.vault_id_label.clone(),
+            tx.clone(),
+        );
+
+        self.vault_create_open = false;
+        self.vault_create_field_idx = 0;
+        self.vault_create_buffer_path.clear();
+        self.vault_create_buffer_content.clear();
+        self.status_line = format!("Creating encrypted vault file: {}", target_path.display());
+    }
+
+    fn confirm_vault_create_prompt(&mut self) {
+        if !self.vault_create_open {
+            return;
+        }
+        if self.vault_create_field_idx == 0 {
+            self.vault_create_field_idx = 1;
+            return;
+        }
+        self.insert_vault_create_newline();
+    }
+
+    fn push_vault_create_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        if self.vault_create_field_idx == 0 {
+            self.vault_create_buffer_path.push(ch);
+        } else {
+            self.vault_create_buffer_content.push(ch);
+        }
+    }
+
+    fn backspace_vault_create(&mut self) {
+        if self.vault_create_field_idx == 0 {
+            self.vault_create_buffer_path.pop();
+        } else {
+            self.vault_create_buffer_content.pop();
+        }
+    }
+
+    fn insert_vault_create_newline(&mut self) {
+        if self.vault_create_field_idx == 1 {
+            self.vault_create_buffer_content.push('\n');
+        }
+    }
+
+    fn open_vault_edit_prompt(&mut self, tx: &UnboundedSender<Action>) {
+        if self.current_view() != View::Projects {
+            self.status_line = String::from("Vault edit is available in Projects tab");
+            return;
+        }
+        if self.project_sync_running {
+            self.status_line = String::from("Wait for current project sync/create to finish");
+            return;
+        }
+        let Some(project) = self.projects.get(self.project_idx) else {
+            self.status_line = String::from("No project selected");
+            return;
+        };
+        self.vault_edit_open = true;
+        self.vault_edit_field_idx = 0;
+        self.vault_edit_buffer_path = String::from("vars/secrets.vault.yml");
+        self.vault_edit_buffer_content.clear();
+        self.vault_edit_loading = false;
+        self.vault_edit_target_root = Some(project.root.clone());
+        self.status_line = format!(
+            "Vault edit: {} (auto-loading default path, Ctrl+S save, Esc cancel)",
+            project.name
+        );
+        self.load_vault_edit_content(tx);
+    }
+
+    fn cancel_vault_edit_prompt(&mut self) {
+        self.vault_edit_open = false;
+        self.vault_edit_field_idx = 0;
+        self.vault_edit_buffer_path.clear();
+        self.vault_edit_buffer_content.clear();
+        self.vault_edit_loading = false;
+        self.vault_edit_target_root = None;
+        self.status_line = String::from("Vault edit cancelled");
+    }
+
+    fn confirm_vault_edit_prompt(&mut self, tx: &UnboundedSender<Action>) {
+        if !self.vault_edit_open {
+            return;
+        }
+        if self.vault_edit_loading {
+            return;
+        }
+        if self.vault_edit_field_idx == 0 {
+            self.load_vault_edit_content(tx);
+            return;
+        }
+        self.insert_vault_edit_newline();
+    }
+
+    fn save_vault_edit_prompt(&mut self, tx: &UnboundedSender<Action>) {
+        if !self.vault_edit_open {
+            return;
+        }
+        if self.vault_edit_loading || self.project_sync_running {
+            self.status_line = String::from("Vault operation already running");
+            return;
+        }
+        let Some(target_root) = self.vault_edit_target_root.clone() else {
+            self.cancel_vault_edit_prompt();
+            self.status_line = String::from("Project target is no longer available");
+            return;
+        };
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|p| p.root == target_root)
+            .cloned()
+        else {
+            self.cancel_vault_edit_prompt();
+            self.status_line = String::from("Project target is no longer available");
+            return;
+        };
+        let Some(vault_source_type) = project.vault_source_type else {
+            self.status_line = String::from(
+                "Configure project vault source first (Projects -> e, Vault Source Type)",
+            );
+            return;
+        };
+
+        let raw_path = self.vault_edit_buffer_path.trim();
+        if raw_path.is_empty() {
+            self.status_line = String::from("Vault file path is required");
+            self.vault_edit_field_idx = 0;
+            return;
+        }
+        let target_path = {
+            let normalized = normalize_run_path(raw_path);
+            let path = PathBuf::from(&normalized);
+            if path.is_absolute() {
+                path
+            } else {
+                project.root.join(path)
+            }
+        };
+        if !target_path.is_file() {
+            self.status_line = format!("Vault file does not exist: {}", target_path.display());
+            self.vault_edit_field_idx = 0;
+            return;
+        }
+
+        let mut vault_password_file = project.vault_password_file.clone();
+        if vault_source_type == VaultSourceType::File {
+            let Some(password_file) = project
+                .vault_password_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                self.status_line =
+                    String::from("Vault source is file, but no vault password file is configured");
+                return;
+            };
+            let Some(password_path) = self.resolve_existing_run_path(password_file) else {
+                let candidates = self.render_run_path_candidates(password_file);
+                self.status_line = format!(
+                    "Vault password file does not exist: checked {}",
+                    candidates.join(", ")
+                );
+                return;
+            };
+            vault_password_file = Some(password_path.to_string_lossy().to_string());
+        }
+
+        let content = self
+            .vault_edit_buffer_content
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+
+        if vault_source_type == VaultSourceType::Prompt {
+            let action = PendingVaultPromptAction::EditSave {
+                project_root: project.root.clone(),
+                target_path: target_path.clone(),
+                content: content.clone(),
+                vault_id_label: project.vault_id_label.clone(),
+            };
+            if self.try_execute_cached_vault_prompt_action(action.clone(), tx) {
+                return;
+            }
+            self.open_vault_runtime_prompt(
+                action,
+                String::from("Vault password required (prompt mode): enter and Ctrl+S to continue"),
+            );
+            return;
+        }
+
+        self.project_sync_running = true;
+        self.vault_edit_loading = true;
+        self.record_project_sync_log(format!("Saving vault file for project {}", project.name));
+        spawn_ansible_vault_update_file(
+            project.root.clone(),
+            self.run_options.ansible_bin.clone(),
+            target_path.to_string_lossy().to_string(),
+            content,
+            vault_source_type,
+            vault_password_file,
+            project.vault_id_label.clone(),
+            tx.clone(),
+        );
+
+        self.vault_edit_open = false;
+        self.vault_edit_field_idx = 0;
+        self.vault_edit_buffer_path.clear();
+        self.vault_edit_buffer_content.clear();
+        self.vault_edit_loading = false;
+        self.vault_edit_target_root = None;
+        self.status_line = format!("Saving encrypted vault file: {}", target_path.display());
+    }
+
+    fn load_vault_edit_content(&mut self, tx: &UnboundedSender<Action>) {
+        if self.project_sync_running || self.vault_edit_loading {
+            self.status_line = String::from("Vault operation already running");
+            return;
+        }
+        let Some(target_root) = self.vault_edit_target_root.clone() else {
+            self.cancel_vault_edit_prompt();
+            self.status_line = String::from("Project target is no longer available");
+            return;
+        };
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|p| p.root == target_root)
+            .cloned()
+        else {
+            self.cancel_vault_edit_prompt();
+            self.status_line = String::from("Project target is no longer available");
+            return;
+        };
+        let Some(vault_source_type) = project.vault_source_type else {
+            self.status_line = String::from(
+                "Configure project vault source first (Projects -> e, Vault Source Type)",
+            );
+            return;
+        };
+        let raw_path = self.vault_edit_buffer_path.trim();
+        if raw_path.is_empty() {
+            self.status_line = String::from("Vault file path is required");
+            self.vault_edit_field_idx = 0;
+            return;
+        }
+        let target_path = {
+            let normalized = normalize_run_path(raw_path);
+            let path = PathBuf::from(&normalized);
+            if path.is_absolute() {
+                path
+            } else {
+                project.root.join(path)
+            }
+        };
+
+        let mut vault_password_file = project.vault_password_file.clone();
+        if vault_source_type == VaultSourceType::File {
+            let Some(password_file) = project
+                .vault_password_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                self.status_line =
+                    String::from("Vault source is file, but no vault password file is configured");
+                return;
+            };
+            let Some(password_path) = self.resolve_existing_run_path(password_file) else {
+                let candidates = self.render_run_path_candidates(password_file);
+                self.status_line = format!(
+                    "Vault password file does not exist: checked {}",
+                    candidates.join(", ")
+                );
+                return;
+            };
+            vault_password_file = Some(password_path.to_string_lossy().to_string());
+        }
+
+        if vault_source_type == VaultSourceType::Prompt {
+            let action = PendingVaultPromptAction::EditLoad {
+                project_root: project.root.clone(),
+                target_path: target_path.clone(),
+                vault_id_label: project.vault_id_label.clone(),
+            };
+            if self.try_execute_cached_vault_prompt_action(action.clone(), tx) {
+                return;
+            }
+            self.open_vault_runtime_prompt(
+                action,
+                String::from("Vault password required (prompt mode): enter and Ctrl+S to continue"),
+            );
+            return;
+        }
+
+        self.project_sync_running = true;
+        self.vault_edit_loading = true;
+        self.record_project_sync_log(format!("Loading vault file for project {}", project.name));
+        spawn_ansible_vault_view_file(
+            project.root.clone(),
+            self.run_options.ansible_bin.clone(),
+            target_path.to_string_lossy().to_string(),
+            vault_source_type,
+            vault_password_file,
+            project.vault_id_label.clone(),
+            tx.clone(),
+        );
+        self.status_line = format!(
+            "Decrypting vault file for edit: {}",
+            target_path.to_string_lossy()
+        );
+    }
+
+    fn push_vault_edit_char(&mut self, ch: char) {
+        if ch.is_control() || self.vault_edit_loading {
+            return;
+        }
+        if self.vault_edit_field_idx == 0 {
+            self.vault_edit_buffer_path.push(ch);
+        } else {
+            self.vault_edit_buffer_content.push(ch);
+        }
+    }
+
+    fn backspace_vault_edit(&mut self) {
+        if self.vault_edit_loading {
+            return;
+        }
+        if self.vault_edit_field_idx == 0 {
+            self.vault_edit_buffer_path.pop();
+        } else {
+            self.vault_edit_buffer_content.pop();
+        }
+    }
+
+    fn insert_vault_edit_newline(&mut self) {
+        if self.vault_edit_field_idx == 1 && !self.vault_edit_loading {
+            self.vault_edit_buffer_content.push('\n');
+        }
+    }
+
+    fn open_vault_runtime_prompt(&mut self, action: PendingVaultPromptAction, status_line: String) {
+        self.vault_runtime_prompt_open = true;
+        self.vault_runtime_prompt_field_idx = 0;
+        self.vault_runtime_prompt_password.clear();
+        self.vault_runtime_prompt_confirm.clear();
+        self.pending_vault_prompt_action = Some(action);
+        self.status_line = status_line;
+    }
+
+    fn cancel_vault_runtime_prompt(&mut self) {
+        self.vault_runtime_prompt_open = false;
+        self.vault_runtime_prompt_field_idx = 0;
+        self.vault_runtime_prompt_password.clear();
+        self.vault_runtime_prompt_confirm.clear();
+        self.pending_vault_prompt_action = None;
+        self.status_line = String::from("Vault prompt cancelled");
+    }
+
+    fn confirm_vault_runtime_prompt(&mut self, tx: &UnboundedSender<Action>) {
+        if !self.vault_runtime_prompt_open {
+            return;
+        }
+        if self.vault_runtime_prompt_confirm_required() && self.vault_runtime_prompt_field_idx == 0
+        {
+            self.vault_runtime_prompt_field_idx = 1;
+            return;
+        }
+        self.save_vault_runtime_prompt(tx);
+    }
+
+    fn push_vault_runtime_prompt_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        if self.vault_runtime_prompt_field_idx == 0 {
+            self.vault_runtime_prompt_password.push(ch);
+        } else {
+            self.vault_runtime_prompt_confirm.push(ch);
+        }
+    }
+
+    fn backspace_vault_runtime_prompt(&mut self) {
+        if self.vault_runtime_prompt_field_idx == 0 {
+            self.vault_runtime_prompt_password.pop();
+        } else {
+            self.vault_runtime_prompt_confirm.pop();
+        }
+    }
+
+    fn clear_vault_prompt_password_cache(&mut self) {
+        if let Some(cache) = &mut self.vault_prompt_password_cache {
+            cache.password.clear();
+        }
+        self.vault_prompt_password_cache = None;
+    }
+
+    fn clear_vault_prompt_password_cache_for(&mut self, project_root: &Path) {
+        let matches_project = self
+            .vault_prompt_password_cache
+            .as_ref()
+            .is_some_and(|cache| cache.project_root == project_root);
+        if matches_project {
+            self.clear_vault_prompt_password_cache();
+        }
+    }
+
+    fn cached_vault_prompt_password_for(&self, project_root: &Path) -> Option<String> {
+        self.vault_prompt_password_cache.as_ref().and_then(|cache| {
+            if cache.project_root == project_root {
+                Some(cache.password.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn try_execute_cached_vault_prompt_action(
+        &mut self,
+        action: PendingVaultPromptAction,
+        tx: &UnboundedSender<Action>,
+    ) -> bool {
+        let Some(password) = self.cached_vault_prompt_password_for(action.project_root()) else {
+            return false;
+        };
+        if let Err(err) = self.execute_vault_prompt_action_with_password(action, &password, tx) {
+            self.status_line = err;
+        }
+        true
+    }
+
+    fn execute_vault_prompt_action_with_password(
+        &mut self,
+        action: PendingVaultPromptAction,
+        password: &str,
+        tx: &UnboundedSender<Action>,
+    ) -> Result<(), String> {
+        let project_root = action.project_root().to_path_buf();
+        let password_file = self.write_temp_vault_password_file(&project_root, password)?;
+        let password_file_value = password_file.to_string_lossy().to_string();
+
+        match action {
+            PendingVaultPromptAction::Create {
+                project_root,
+                target_path,
+                content,
+                vault_id_label,
+            } => {
+                self.vault_temp_password_files.push(password_file.clone());
+                self.pending_vault_prompt_project_root = Some(project_root.clone());
+                self.project_sync_running = true;
+                self.record_project_sync_log(String::from(
+                    "Starting vault creation with runtime prompt password",
+                ));
+                spawn_ansible_vault_create_file(
+                    project_root,
+                    self.run_options.ansible_bin.clone(),
+                    target_path.to_string_lossy().to_string(),
+                    content,
+                    VaultSourceType::File,
+                    Some(password_file_value.clone()),
+                    vault_id_label,
+                    tx.clone(),
+                );
+
+                self.vault_create_open = false;
+                self.vault_create_field_idx = 0;
+                self.vault_create_buffer_path.clear();
+                self.vault_create_buffer_content.clear();
+                self.status_line = format!(
+                    "Creating encrypted vault file: {}",
+                    target_path.to_string_lossy()
+                );
+            }
+            PendingVaultPromptAction::EditLoad {
+                project_root,
+                target_path,
+                vault_id_label,
+            } => {
+                self.vault_temp_password_files.push(password_file.clone());
+                self.pending_vault_prompt_project_root = Some(project_root.clone());
+                self.project_sync_running = true;
+                self.vault_edit_loading = true;
+                self.record_project_sync_log(String::from(
+                    "Loading vault file with runtime prompt password",
+                ));
+                spawn_ansible_vault_view_file(
+                    project_root,
+                    self.run_options.ansible_bin.clone(),
+                    target_path.to_string_lossy().to_string(),
+                    VaultSourceType::File,
+                    Some(password_file_value.clone()),
+                    vault_id_label,
+                    tx.clone(),
+                );
+                self.status_line = format!(
+                    "Decrypting vault file for edit: {}",
+                    target_path.to_string_lossy()
+                );
+            }
+            PendingVaultPromptAction::EditSave {
+                project_root,
+                target_path,
+                content,
+                vault_id_label,
+            } => {
+                self.vault_temp_password_files.push(password_file.clone());
+                self.pending_vault_prompt_project_root = Some(project_root.clone());
+                self.project_sync_running = true;
+                self.vault_edit_loading = true;
+                self.record_project_sync_log(String::from(
+                    "Saving vault file with runtime prompt password",
+                ));
+                spawn_ansible_vault_update_file(
+                    project_root,
+                    self.run_options.ansible_bin.clone(),
+                    target_path.to_string_lossy().to_string(),
+                    content,
+                    VaultSourceType::File,
+                    Some(password_file_value.clone()),
+                    vault_id_label,
+                    tx.clone(),
+                );
+
+                self.vault_edit_open = false;
+                self.vault_edit_field_idx = 0;
+                self.vault_edit_buffer_path.clear();
+                self.vault_edit_buffer_content.clear();
+                self.vault_edit_loading = false;
+                self.vault_edit_target_root = None;
+                self.status_line = format!(
+                    "Saving encrypted vault file: {}",
+                    target_path.to_string_lossy()
+                );
+            }
+            PendingVaultPromptAction::Run {
+                mut request,
+                status_line,
+            } => {
+                self.vault_temp_password_files_by_run
+                    .entry(request.run_id)
+                    .or_default()
+                    .push(password_file);
+                request.options.vault_source_type = Some(VaultSourceType::File);
+                request.options.vault_password_file = Some(password_file_value);
+                self.status_line = status_line;
+                spawn_ansible_run(request, tx.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn save_vault_runtime_prompt(&mut self, tx: &UnboundedSender<Action>) {
+        if !self.vault_runtime_prompt_open {
+            return;
+        }
+        let Some(action) = self.pending_vault_prompt_action.clone() else {
+            self.cancel_vault_runtime_prompt();
+            self.status_line = String::from("No pending vault action");
+            return;
+        };
+        if self.vault_runtime_prompt_password.is_empty() {
+            self.status_line = String::from("Vault password cannot be empty");
+            self.vault_runtime_prompt_field_idx = 0;
+            return;
+        }
+        if self.vault_runtime_prompt_confirm_required()
+            && self.vault_runtime_prompt_password != self.vault_runtime_prompt_confirm
+        {
+            self.status_line = String::from("Vault password confirmation does not match");
+            self.vault_runtime_prompt_field_idx = 1;
+            return;
+        }
+
+        let project_root = action.project_root().to_path_buf();
+        let password = self.vault_runtime_prompt_password.clone();
+        if let Err(err) = self.execute_vault_prompt_action_with_password(action, &password, tx) {
+            self.status_line = err;
+            return;
+        }
+
+        self.vault_prompt_password_cache = Some(VaultPromptPasswordCache {
+            project_root,
+            password,
+        });
+        self.vault_runtime_prompt_open = false;
+        self.vault_runtime_prompt_field_idx = 0;
+        self.vault_runtime_prompt_password.clear();
+        self.vault_runtime_prompt_confirm.clear();
+        self.pending_vault_prompt_action = None;
+    }
+
+    fn write_temp_vault_password_file(
+        &self,
+        project_root: &Path,
+        password: &str,
+    ) -> Result<PathBuf, String> {
+        let dir = project_root.join(".ansible-tui").join("vault").join("auth");
+        fs::create_dir_all(&dir).map_err(|err| format!("Failed creating temp vault dir: {err}"))?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = dir.join(format!("prompt-pass-{stamp}.txt"));
+
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|err| {
+            format!(
+                "Failed creating temporary vault password file {}: {err}",
+                path.display()
+            )
+        })?;
+        file.write_all(password.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.flush())
+            .map_err(|err| {
+                let _ = fs::remove_file(&path);
+                format!(
+                    "Failed writing temporary vault password file {}: {err}",
+                    path.display()
+                )
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+        Ok(path)
+    }
+
+    fn cleanup_vault_temp_password_files(&mut self) {
+        for path in self.vault_temp_password_files.drain(..) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn cleanup_vault_temp_password_files_for_run(&mut self, run_id: u64) {
+        if let Some(paths) = self.vault_temp_password_files_by_run.remove(&run_id) {
+            for path in paths {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    fn open_vault_password_create_prompt(&mut self) {
+        if self.current_view() != View::Projects {
+            self.status_line = String::from("Vault password helper is available in Projects tab");
+            return;
+        }
+        if self.project_sync_running {
+            self.status_line = String::from("Wait for current project sync/create to finish");
+            return;
+        }
+        let Some(project) = self.projects.get(self.project_idx) else {
+            self.status_line = String::from("No project selected");
+            return;
+        };
+        self.vault_password_create_open = true;
+        self.vault_password_create_field_idx = 0;
+        self.vault_password_create_buffer_path = project
+            .vault_password_file
+            .clone()
+            .unwrap_or_else(|| String::from("vault"));
+        self.vault_password_create_buffer_password.clear();
+        self.vault_password_create_buffer_confirm.clear();
+        self.vault_password_create_target_root = Some(project.root.clone());
+        self.status_line = format!(
+            "Vault password helper: {} (Ctrl+S create file, Esc cancel)",
+            project.name
+        );
+    }
+
+    fn cancel_vault_password_create_prompt(&mut self) {
+        self.vault_password_create_open = false;
+        self.vault_password_create_field_idx = 0;
+        self.vault_password_create_buffer_path.clear();
+        self.vault_password_create_buffer_password.clear();
+        self.vault_password_create_buffer_confirm.clear();
+        self.vault_password_create_target_root = None;
+        self.status_line = String::from("Vault password helper cancelled");
+    }
+
+    fn save_vault_password_create_prompt(&mut self) {
+        if !self.vault_password_create_open {
+            return;
+        }
+        let Some(target_root) = self.vault_password_create_target_root.clone() else {
+            self.cancel_vault_password_create_prompt();
+            self.status_line = String::from("Project target is no longer available");
+            return;
+        };
+        let Some(project_idx) = self.projects.iter().position(|p| p.root == target_root) else {
+            self.cancel_vault_password_create_prompt();
+            self.status_line = String::from("Project target is no longer available");
+            return;
+        };
+
+        let path_input = self.vault_password_create_buffer_path.trim().to_string();
+        if path_input.is_empty() {
+            self.status_line = String::from("Vault password file path is required");
+            self.vault_password_create_field_idx = 0;
+            return;
+        }
+        let normalized_path = normalize_run_path(&path_input);
+        let password_path = {
+            let path = PathBuf::from(&normalized_path);
+            if path.is_absolute() {
+                path
+            } else {
+                self.projects[project_idx].root.join(path)
+            }
+        };
+        if password_path.exists() {
+            self.status_line = format!(
+                "Vault password file already exists: {}",
+                password_path.display()
+            );
+            return;
+        }
+        if let Some(parent) = password_path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                self.status_line = format!(
+                    "Failed creating parent directory {}: {err}",
+                    parent.display()
+                );
+                return;
+            }
+        }
+
+        if self.vault_password_create_buffer_password.is_empty() {
+            self.status_line = String::from("Vault password cannot be empty");
+            self.vault_password_create_field_idx = 1;
+            return;
+        }
+        if self.vault_password_create_buffer_password != self.vault_password_create_buffer_confirm {
+            self.status_line = String::from("Vault password confirmation does not match");
+            self.vault_password_create_field_idx = 2;
+            return;
+        }
+
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = match options.open(&password_path) {
+            Ok(file) => file,
+            Err(err) => {
+                self.status_line = format!(
+                    "Failed creating vault password file {}: {err}",
+                    password_path.display()
+                );
+                return;
+            }
+        };
+        let write_result = file
+            .write_all(self.vault_password_create_buffer_password.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.flush());
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&password_path);
+            self.status_line = format!(
+                "Failed writing vault password file {}: {err}",
+                password_path.display()
+            );
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&password_path, fs::Permissions::from_mode(0o600));
+        }
+
+        let store_value = if PathBuf::from(&normalized_path).is_absolute() {
+            normalized_path
+        } else {
+            path_input
+        };
+        self.projects[project_idx].vault_password_file = Some(store_value.clone());
+        self.projects[project_idx].vault_source_type = Some(VaultSourceType::File);
+        let project_root = self.projects[project_idx].root.clone();
+        self.persist_projects();
+        self.clear_vault_prompt_password_cache_for(&project_root);
+
+        if self.project_ssh_open
+            && self.project_ssh_target_root.as_ref() == Some(&self.projects[project_idx].root)
+        {
+            self.project_vault_password_file_buffer = store_value;
+            self.project_vault_source_type = Some(VaultSourceType::File);
+        }
+
+        self.vault_password_create_open = false;
+        self.vault_password_create_field_idx = 0;
+        self.vault_password_create_buffer_path.clear();
+        self.vault_password_create_buffer_password.clear();
+        self.vault_password_create_buffer_confirm.clear();
+        self.vault_password_create_target_root = None;
+        self.status_line = format!(
+            "Vault password file created: {}",
+            password_path.to_string_lossy()
+        );
+    }
+
+    fn confirm_vault_password_create_prompt(&mut self) {
+        if !self.vault_password_create_open {
+            return;
+        }
+        if self.vault_password_create_field_idx < 2 {
+            self.vault_password_create_field_idx += 1;
+        }
+    }
+
+    fn push_vault_password_create_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        match self.vault_password_create_field_idx {
+            0 => self.vault_password_create_buffer_path.push(ch),
+            1 => self.vault_password_create_buffer_password.push(ch),
+            2 => self.vault_password_create_buffer_confirm.push(ch),
+            _ => {}
+        }
+    }
+
+    fn backspace_vault_password_create(&mut self) {
+        match self.vault_password_create_field_idx {
+            0 => {
+                self.vault_password_create_buffer_path.pop();
+            }
+            1 => {
+                self.vault_password_create_buffer_password.pop();
+            }
+            2 => {
+                self.vault_password_create_buffer_confirm.pop();
+            }
+            _ => {}
+        }
     }
 
     fn active_project_create_buffer_mut(&mut self) -> &mut String {
@@ -2349,6 +3779,9 @@ impl App {
             vars_sync_cmd,
             ssh_private_key_file: None,
             ssh_private_key_inline: None,
+            vault_source_type: None,
+            vault_password_file: None,
+            vault_id_label: None,
         });
         self.project_idx = self.projects.len().saturating_sub(1);
         self.cancel_project_create_prompt();
@@ -2390,6 +3823,9 @@ impl App {
             vars_sync_cmd,
             ssh_private_key_file: None,
             ssh_private_key_inline: None,
+            vault_source_type: None,
+            vault_password_file: None,
+            vault_id_label: None,
         });
         self.project_idx = self.projects.len().saturating_sub(1);
         self.cancel_project_create_prompt();
@@ -2587,6 +4023,36 @@ impl App {
         }
     }
 
+    fn dispatch_run_request(
+        &mut self,
+        request: RunRequest,
+        status_line: String,
+        tx: &UnboundedSender<Action>,
+    ) {
+        if matches!(
+            request.options.vault_source_type,
+            Some(VaultSourceType::Prompt)
+        ) {
+            let action = PendingVaultPromptAction::Run {
+                request,
+                status_line,
+            };
+            if self.try_execute_cached_vault_prompt_action(action.clone(), tx) {
+                return;
+            }
+            self.open_vault_runtime_prompt(
+                action,
+                String::from(
+                    "Vault password required (prompt mode): Enter confirm | Ctrl+S continue",
+                ),
+            );
+            return;
+        }
+
+        self.status_line = status_line;
+        spawn_ansible_run(request, tx.clone());
+    }
+
     fn start_run(&mut self, tx: &UnboundedSender<Action>) {
         if self.settings_editor_open {
             self.status_line = String::from("Close playbook settings editor before running");
@@ -2647,13 +4113,40 @@ impl App {
         options.timeout = settings.timeout;
         options.limit = settings.limit;
         options.tags = settings.tags;
+        options.extra_vars_files.clear();
         options.extra_vars = settings.extra_vars;
         options.extra_args = settings.extra_args;
         options.ssh_private_key_file = ssh_private_key_file;
         options.ssh_private_key_inline = ssh_private_key_inline;
+        let (vault_source_type, vault_password_file, vault_id_label) =
+            self.active_project_vault_settings();
+        options.vault_source_type = vault_source_type;
+        options.vault_password_file = vault_password_file;
+        options.vault_id_label = vault_id_label;
 
-        self.status_line = format!("Starting run #{run_id}...");
-        spawn_ansible_run(
+        let mut warnings = Vec::new();
+        if let Err(err) = self.apply_secret_enforcement("run", &mut options, &mut warnings) {
+            self.status_line = err;
+            return;
+        }
+        if let Err(err) = self.validate_run_option_paths("run", &options) {
+            self.status_line = err;
+            return;
+        }
+
+        let status_line = if warnings.is_empty() {
+            format!(
+                "Starting run #{run_id} [{} mode]",
+                self.secret_enforcement_mode.as_str()
+            )
+        } else {
+            format!(
+                "Starting run #{run_id} [{} mode] | {}",
+                self.secret_enforcement_mode.as_str(),
+                warnings.join(" | ")
+            )
+        };
+        self.dispatch_run_request(
             RunRequest {
                 run_id,
                 cwd: project_root,
@@ -2663,7 +4156,8 @@ impl App {
                 options,
                 template_id: None,
             },
-            tx.clone(),
+            status_line,
+            tx,
         );
     }
 
@@ -2749,10 +4243,30 @@ impl App {
         if let Some(project) = self.projects.get(self.active_project_idx) {
             options.ssh_private_key_file = project.ssh_private_key_file.clone();
             options.ssh_private_key_inline = project.ssh_private_key_inline.clone();
+            options.vault_source_type = project.vault_source_type;
+            options.vault_password_file = project.vault_password_file.clone();
+            options.vault_id_label = project.vault_id_label.clone();
         }
 
-        self.status_line = format!("Starting ping run #{run_id} against {target}");
-        spawn_ansible_run(
+        let mut warnings = Vec::new();
+        if let Err(err) = self.apply_secret_enforcement("ping run", &mut options, &mut warnings) {
+            self.status_line = err;
+            return;
+        }
+        if let Err(err) = self.validate_run_option_paths("ping run", &options) {
+            self.status_line = err;
+            return;
+        }
+
+        let status_line = if warnings.is_empty() {
+            format!("Starting ping run #{run_id} against {target}")
+        } else {
+            format!(
+                "Starting ping run #{run_id} against {target} | {}",
+                warnings.join(" | ")
+            )
+        };
+        self.dispatch_run_request(
             RunRequest {
                 run_id,
                 cwd: project_root,
@@ -2762,7 +4276,8 @@ impl App {
                 options,
                 template_id: None,
             },
-            tx.clone(),
+            status_line,
+            tx,
         );
     }
 
@@ -2803,6 +4318,21 @@ impl App {
                 )
             })
             .unwrap_or((None, None))
+    }
+
+    fn active_project_vault_settings(
+        &self,
+    ) -> (Option<VaultSourceType>, Option<String>, Option<String>) {
+        self.projects
+            .get(self.active_project_idx)
+            .map(|project| {
+                (
+                    project.vault_source_type,
+                    project.vault_password_file.clone(),
+                    project.vault_id_label.clone(),
+                )
+            })
+            .unwrap_or((None, None, None))
     }
 
     fn refresh_project(&mut self) {
@@ -3914,12 +5444,26 @@ impl App {
     }
 
     fn restore_history(&mut self) {
-        match load_runs(self.active_project_root()) {
-            Ok(runs) => {
-                let migration_note =
-                    take_legacy_environment_migration_notice(self.active_project_root())
-                        .ok()
-                        .flatten();
+        let history_root = self.history_store_root_for_active_project();
+        migrate_unstable_hash_history(&history_root);
+        match load_runs(&history_root) {
+            Ok(mut runs) => {
+                if runs.is_empty() {
+                    let legacy_root = self.active_project_root();
+                    if legacy_root != history_root {
+                        if let Ok(legacy_runs) = load_runs(legacy_root) {
+                            if !legacy_runs.is_empty() {
+                                for run in &legacy_runs {
+                                    let _ = save_run(&history_root, run);
+                                }
+                                runs = legacy_runs;
+                            }
+                        }
+                    }
+                }
+                let migration_note = take_legacy_environment_migration_notice(&history_root)
+                    .ok()
+                    .flatten();
                 if runs.is_empty() {
                     self.runs.clear();
                     self.run_idx = 0;
@@ -3932,6 +5476,7 @@ impl App {
                 self.next_run_id = runs.iter().map(|r| r.id).max().unwrap_or(0) + 1;
                 self.runs = runs;
                 self.run_idx = 0;
+                self.align_playbook_selection_with_history();
                 self.sync_run_selection_to_selected_playbook();
                 self.status_line = migration_note
                     .unwrap_or_else(|| format!("Loaded {} historical runs", self.runs.len()));
@@ -3946,7 +5491,8 @@ impl App {
         let Some(run) = self.runs.iter().find(|r| r.id == run_id) else {
             return;
         };
-        if let Err(err) = save_run(self.active_project_root(), run) {
+        let history_root = self.history_store_root_for_active_project();
+        if let Err(err) = save_run(&history_root, run) {
             self.status_line = format!("history save failed: {err}");
         }
     }
@@ -3955,7 +5501,7 @@ impl App {
         if self.runs.is_empty() {
             return;
         }
-        let root = self.active_project_root().to_path_buf();
+        let root = self.history_store_root_for_active_project();
         for run in &self.runs {
             if let Err(err) = save_run(&root, run) {
                 self.status_line = format!("history save failed: {err}");
@@ -3963,6 +5509,40 @@ impl App {
             }
         }
     }
+
+    fn align_playbook_selection_with_history(&mut self) {
+        if self.runs.is_empty() || self.playbooks.is_empty() {
+            return;
+        }
+        if !self.run_indices_for_selected_playbook().is_empty() {
+            return;
+        }
+
+        let project_root = self.active_project_root().to_path_buf();
+        let maybe_idx = self.runs.iter().find_map(|run| {
+            self.playbooks.iter().position(|path| {
+                let display = display_path(&project_root, path);
+                display == run.playbook
+            })
+        });
+        if let Some(idx) = maybe_idx {
+            self.playbook_idx = idx;
+        }
+    }
+
+    fn history_store_root_for_active_project(&self) -> PathBuf {
+        self.history_store_root_for_project(self.active_project_root())
+    }
+
+    fn history_store_root_for_project(&self, project_root: &Path) -> PathBuf {
+        let key = stable_path_hash(project_root);
+        self.cwd
+            .join(".ansible-tui")
+            .join("project-history")
+            .join(key)
+    }
+
+
 
     fn request_quit(&mut self) {
         self.persist_all_runs();
@@ -4062,6 +5642,7 @@ impl App {
             tags: self.run_options.tags.clone(),
             extra_vars: self.run_options.extra_vars.clone(),
             extra_args: self.run_options.extra_args.clone(),
+            secret_enforcement_mode: Some(self.secret_enforcement_mode),
         };
         if let Err(err) = save_app_config(&self.cwd, &config) {
             self.status_line = format!("config save failed: {err}");
@@ -4605,15 +6186,16 @@ impl App {
         } else {
             format!(" | {}", resolved.warnings.join(" | "))
         };
-        self.status_line = format!(
-            "Starting template run #{run_id} ({}) [inv: {} via {} | ssh: {}]{}",
+        let status_line = format!(
+            "Starting template run #{run_id} ({}) [inv: {} via {} | ssh: {} | vault: {}]{}",
             template.name,
             resolved.inventory,
             resolved.inventory_source,
             resolved.ssh_key_source,
+            resolved.vault_source,
             warning_suffix
         );
-        spawn_ansible_run(
+        self.dispatch_run_request(
             RunRequest {
                 run_id,
                 cwd: project_root,
@@ -4623,7 +6205,8 @@ impl App {
                 options: resolved.options,
                 template_id: Some(template.id.clone()),
             },
-            tx.clone(),
+            status_line,
+            tx,
         );
     }
 
@@ -4646,6 +6229,9 @@ impl App {
             .map(|path| display_path(self.active_project_root(), path))
             .and_then(|key| self.playbook_settings.get(&key).cloned())
             .unwrap_or_else(|| self.default_settings());
+        self.template_editor_vault_source_type = None;
+        self.template_editor_vault_password_file.clear();
+        self.template_editor_vault_id_label.clear();
         self.status_line = String::from("New template: fill in fields, Ctrl+S to save");
     }
 
@@ -4684,6 +6270,9 @@ impl App {
             ssh_private_key_file: template.ssh_private_key_file,
             ssh_private_key_inline: template.ssh_private_key_inline,
         };
+        self.template_editor_vault_source_type = template.vault_source_type;
+        self.template_editor_vault_password_file = template.vault_password_file.unwrap_or_default();
+        self.template_editor_vault_id_label = template.vault_id_label.unwrap_or_default();
         self.status_line = format!("Editing template: {}", template.name);
     }
 
@@ -4691,6 +6280,9 @@ impl App {
         self.template_editor_open = false;
         self.template_editor_text_mode = false;
         self.template_editor_text_buffer.clear();
+        self.template_editor_vault_source_type = None;
+        self.template_editor_vault_password_file.clear();
+        self.template_editor_vault_id_label.clear();
         self.status_line = String::from("Template editor closed");
     }
 
@@ -4728,6 +6320,11 @@ impl App {
                 t.extra_args = s.extra_args.clone();
                 t.ssh_private_key_file = s.ssh_private_key_file.clone();
                 t.ssh_private_key_inline = s.ssh_private_key_inline.clone();
+                t.vault_source_type = self.template_editor_vault_source_type;
+                t.vault_password_file =
+                    normalize_optional_text(self.template_editor_vault_password_file.clone());
+                t.vault_id_label =
+                    normalize_optional_text(self.template_editor_vault_id_label.clone());
             }
         } else {
             let mut t = JobTemplate::new(&name);
@@ -4745,6 +6342,10 @@ impl App {
             t.extra_args = s.extra_args.clone();
             t.ssh_private_key_file = s.ssh_private_key_file.clone();
             t.ssh_private_key_inline = s.ssh_private_key_inline.clone();
+            t.vault_source_type = self.template_editor_vault_source_type;
+            t.vault_password_file =
+                normalize_optional_text(self.template_editor_vault_password_file.clone());
+            t.vault_id_label = normalize_optional_text(self.template_editor_vault_id_label.clone());
             self.job_templates.push(t);
             self.template_idx = self.job_templates.len() - 1;
         }
@@ -4803,10 +6404,11 @@ impl App {
         //         4=check, 5=diff, 6=become, 7=verbosity,
         //         8=forks, 9=timeout,
         //         10=limit, 11=tags, 12=extra_vars, 13=extra_args,
-        //         14=ssh key file, 15=ssh key inline
+        //         14=ssh key file, 15=ssh key inline,
+        //         16=vault source, 17=vault password file, 18=vault id label
         matches!(
             self.template_editor_field_idx,
-            0 | 10 | 11 | 12 | 13 | 14 | 15
+            0 | 10 | 11 | 12 | 13 | 14 | 15 | 17 | 18
         )
     }
 
@@ -4892,6 +6494,10 @@ impl App {
                     delta,
                 );
             }
+            16 => {
+                self.template_editor_vault_source_type =
+                    VaultSourceType::cycle(self.template_editor_vault_source_type, delta);
+            }
             _ => {}
         }
     }
@@ -4905,6 +6511,10 @@ impl App {
             4 => s.check = !s.check,
             5 => s.diff = !s.diff,
             6 => s.become_enabled = !s.become_enabled,
+            16 => {
+                self.template_editor_vault_source_type =
+                    VaultSourceType::cycle(self.template_editor_vault_source_type, 1)
+            }
             _ => {}
         }
     }
@@ -4922,6 +6532,8 @@ impl App {
             13 => s.extra_args.clone().unwrap_or_default(),
             14 => s.ssh_private_key_file.clone().unwrap_or_default(),
             15 => s.ssh_private_key_inline.clone().unwrap_or_default(),
+            17 => self.template_editor_vault_password_file.clone(),
+            18 => self.template_editor_vault_id_label.clone(),
             _ => return,
         };
         self.template_editor_text_mode = true;
@@ -4938,10 +6550,34 @@ impl App {
             0 => self.template_editor_name = buf.trim().to_string(),
             10 => s.limit = normalize_optional_text(buf),
             11 => s.tags = normalize_optional_text(buf),
-            12 => s.extra_vars = normalize_optional_text(buf),
+            12 => {
+                let candidate = normalize_optional_text(buf);
+                if let Some(ref value) = candidate {
+                    if parse_extra_vars_file_refs(value).is_err()
+                        && s.extra_vars.as_deref() != Some(value.as_str())
+                    {
+                        self.status_line = String::from(
+                            "Template: plaintext extra-vars are read-only; use vars file references",
+                        );
+                        return;
+                    }
+                }
+                s.extra_vars = candidate;
+            }
             13 => s.extra_args = normalize_optional_text(buf),
             14 => s.ssh_private_key_file = normalize_optional_text(buf),
-            15 => s.ssh_private_key_inline = normalize_optional_multiline_text(buf),
+            15 => {
+                let candidate = normalize_optional_multiline_text(buf);
+                if candidate.is_some() && candidate != s.ssh_private_key_inline {
+                    self.status_line = String::from(
+                        "Template: inline SSH keys are read-only; use SSH key file references",
+                    );
+                    return;
+                }
+                s.ssh_private_key_inline = candidate;
+            }
+            17 => self.template_editor_vault_password_file = buf.trim().to_string(),
+            18 => self.template_editor_vault_id_label = buf.trim().to_string(),
             _ => {}
         }
         self.template_editor_text_mode = false;
@@ -4965,6 +6601,8 @@ impl App {
             ssh_private_key_file: resolved.options.ssh_private_key_file,
             has_inline_ssh_key: resolved.options.ssh_private_key_inline.is_some(),
             ssh_key_source: resolved.ssh_key_source,
+            vault_source: resolved.vault_source,
+            vault_id_label: resolved.options.vault_id_label,
             warnings: resolved.warnings,
         })
     }
@@ -4984,7 +6622,15 @@ impl App {
         } else {
             String::from("unset")
         };
-        let warnings = Vec::new();
+        let template_has_vault_override = options.vault_source_type.is_some()
+            || options.vault_password_file.is_some()
+            || options.vault_id_label.is_some();
+        let mut vault_source = if template_has_vault_override {
+            String::from("template")
+        } else {
+            String::from("unset")
+        };
+        let mut warnings = Vec::new();
 
         options.extra_vars_files.clear();
         if options.ssh_private_key_file.is_none() && options.ssh_private_key_inline.is_none() {
@@ -5000,6 +6646,31 @@ impl App {
                     ssh_key_source = String::from("project");
                 }
             }
+        }
+        if let Some(project) = self.projects.get(self.active_project_idx) {
+            if options.vault_source_type.is_none()
+                && options.vault_password_file.is_none()
+                && options.vault_id_label.is_none()
+                && (project.vault_source_type.is_some()
+                    || project.vault_password_file.is_some()
+                    || project.vault_id_label.is_some())
+            {
+                vault_source = String::from("project");
+            }
+            if options.vault_source_type.is_none() {
+                options.vault_source_type = project.vault_source_type;
+            }
+            if options.vault_password_file.is_none() {
+                options.vault_password_file = project.vault_password_file.clone();
+            }
+            if options.vault_id_label.is_none() {
+                options.vault_id_label = project.vault_id_label.clone();
+            }
+        }
+
+        self.apply_secret_enforcement("template run", &mut options, &mut warnings)?;
+        if options.vault_source_type.is_none() {
+            vault_source = String::from("unset");
         }
 
         if inventory.is_empty() {
@@ -5019,6 +6690,15 @@ impl App {
                     return Err(format!("SSH key file does not exist: {key_path}"));
                 }
             }
+            if matches!(options.vault_source_type, Some(VaultSourceType::File)) {
+                if let Some(ref vault_password_file) = options.vault_password_file {
+                    if !self.run_path_exists(vault_password_file) {
+                        return Err(format!(
+                            "Vault password file does not exist: {vault_password_file}"
+                        ));
+                    }
+                }
+            }
         }
 
         Ok(ResolvedTemplateRunContext {
@@ -5026,22 +6706,215 @@ impl App {
             options,
             inventory_source,
             ssh_key_source,
+            vault_source,
             warnings,
         })
     }
 
     fn run_path_exists(&self, raw: &str) -> bool {
+        self.resolve_existing_run_path(raw).is_some()
+    }
+
+    fn resolve_existing_run_path(&self, raw: &str) -> Option<PathBuf> {
         let normalized = normalize_run_path(raw);
         if normalized.is_empty() {
-            return false;
+            return None;
         }
         let path = PathBuf::from(&normalized);
         if path.is_absolute() {
-            path.exists()
+            return path.exists().then_some(path);
+        }
+
+        let project_candidate = self.active_project_root().join(&path);
+        if project_candidate.exists() {
+            return Some(project_candidate);
+        }
+
+        let workspace_candidate = self.cwd.join(&path);
+        if workspace_candidate.exists() {
+            return Some(workspace_candidate);
+        }
+
+        None
+    }
+
+    fn resolve_run_path_for_execution(&self, raw: &str) -> String {
+        let normalized = normalize_run_path(raw);
+        if normalized.is_empty() {
+            return normalized;
+        }
+        if let Some(path) = self.resolve_existing_run_path(&normalized) {
+            return path.to_string_lossy().to_string();
+        }
+
+        let path = PathBuf::from(&normalized);
+        if path.is_absolute() {
+            normalized
         } else {
-            self.active_project_root().join(path).exists()
+            self.active_project_root()
+                .join(path)
+                .to_string_lossy()
+                .to_string()
         }
     }
+
+    fn render_run_path_candidates(&self, raw: &str) -> Vec<String> {
+        let normalized = normalize_run_path(raw);
+        if normalized.is_empty() {
+            return vec![String::from("(empty path)")];
+        }
+        let path = PathBuf::from(&normalized);
+        if path.is_absolute() {
+            return vec![path.to_string_lossy().to_string()];
+        }
+
+        let project_candidate = self.active_project_root().join(&path);
+        let workspace_candidate = self.cwd.join(&path);
+        let mut out = vec![project_candidate.to_string_lossy().to_string()];
+        if workspace_candidate != project_candidate {
+            out.push(workspace_candidate.to_string_lossy().to_string());
+        }
+        out
+    }
+
+    fn apply_secret_enforcement(
+        &self,
+        context: &str,
+        options: &mut RunOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), String> {
+        options.vault_password_file = options
+            .vault_password_file
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        options.vault_id_label = options
+            .vault_id_label
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        if options.vault_source_type.is_none() {
+            options.vault_password_file = None;
+            options.vault_id_label = None;
+        } else if matches!(options.vault_source_type, Some(VaultSourceType::File))
+            && options.vault_password_file.is_none()
+        {
+            return Err(format!(
+                "{context}: vault source is set to file but vault password file is missing"
+            ));
+        }
+
+        let has_inline_ssh_key = options
+            .ssh_private_key_inline
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if has_inline_ssh_key {
+            if self.secret_enforcement_mode == SecretEnforcementMode::Strict {
+                return Err(format!(
+                    "{context}: inline SSH private keys are blocked in strict mode"
+                ));
+            }
+            warnings.push(String::from("compat: inline SSH private key in use"));
+        }
+
+        let mut extra_vars_files = options
+            .extra_vars_files
+            .iter()
+            .map(|value| normalize_run_path(value))
+            .filter(|value| !value.trim().is_empty())
+            .collect::<Vec<_>>();
+
+        if let Some(extra_vars) = options
+            .extra_vars
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            match parse_extra_vars_file_refs(&extra_vars) {
+                Ok(files) => {
+                    extra_vars_files.extend(files);
+                    options.extra_vars = None;
+                }
+                Err(_) => {
+                    if self.secret_enforcement_mode == SecretEnforcementMode::Strict {
+                        return Err(format!(
+                            "{context}: plaintext --extra-vars are blocked in strict mode; use vars files (for example @vars/secrets.vault.yml)"
+                        ));
+                    }
+                    warnings.push(String::from("compat: plaintext --extra-vars in use"));
+                }
+            }
+        } else {
+            options.extra_vars = None;
+        }
+
+        options.extra_vars_files = extra_vars_files
+            .into_iter()
+            .map(|value| self.resolve_run_path_for_execution(&value))
+            .collect::<Vec<_>>();
+        options.ssh_private_key_file = options
+            .ssh_private_key_file
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| self.resolve_run_path_for_execution(&value));
+        options.vault_password_file = options
+            .vault_password_file
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| self.resolve_run_path_for_execution(&value));
+
+        Ok(())
+    }
+
+    fn validate_run_option_paths(&self, context: &str, options: &RunOptions) -> Result<(), String> {
+        for vars_file in &options.extra_vars_files {
+            if !self.run_path_exists(vars_file) {
+                return Err(format!("{context}: vars file does not exist: {vars_file}"));
+            }
+        }
+        if let Some(ref key_path) = options.ssh_private_key_file {
+            if !self.run_path_exists(key_path) {
+                return Err(format!(
+                    "{context}: SSH key file does not exist: {key_path}"
+                ));
+            }
+        }
+        if matches!(options.vault_source_type, Some(VaultSourceType::File)) {
+            if let Some(ref vault_password_file) = options.vault_password_file {
+                if !self.run_path_exists(vault_password_file) {
+                    return Err(format!(
+                        "{context}: vault password file does not exist: {vault_password_file}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_extra_vars_file_refs(raw: &str) -> Result<Vec<String>, ()> {
+    let normalized = raw.replace(',', " ").replace('\n', " ");
+    let mut files = Vec::new();
+    for token in normalized.split_whitespace() {
+        let value = token.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let value = value.strip_prefix('@').unwrap_or(value);
+        if value.is_empty()
+            || value.contains('=')
+            || value.starts_with('{')
+            || value.starts_with('[')
+        {
+            return Err(());
+        }
+        files.push(normalize_run_path(value));
+    }
+    Ok(files)
 }
 
 fn normalize_optional_multiline_text(value: String) -> Option<String> {
@@ -5120,6 +6993,19 @@ fn ensure_ansible_project_layout(root: &Path) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// FNV-1a hash producing a stable 16-hex-digit key for a path.
+/// Unlike `DefaultHasher`, this is deterministic across program runs.
+fn stable_path_hash(path: &Path) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 pub fn display_path(cwd: &Path, path: &Path) -> String {
@@ -5828,5 +7714,26 @@ all:
         assert_eq!(vars.ansible_host, "192.0.2.10");
         assert_eq!(vars.ansible_user, "ubuntu");
         assert_eq!(vars.ansible_port, Some(22));
+    }
+
+    #[test]
+    fn parse_extra_vars_file_refs_accepts_file_tokens() {
+        let parsed =
+            parse_extra_vars_file_refs("@vars/common.yml vars/secret.vault.yml,vars/env.yml")
+                .expect("file refs should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                String::from("vars/common.yml"),
+                String::from("vars/secret.vault.yml"),
+                String::from("vars/env.yml")
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_extra_vars_file_refs_rejects_plaintext_values() {
+        assert!(parse_extra_vars_file_refs("{\"password\":\"secret\"}").is_err());
+        assert!(parse_extra_vars_file_refs("foo=bar").is_err());
     }
 }

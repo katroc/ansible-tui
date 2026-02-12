@@ -2,13 +2,14 @@ mod action;
 mod ansible_cfg;
 mod app;
 mod config;
-mod history;
+mod db;
 mod input;
 mod job_template;
 mod playbook_settings;
 mod projects;
 mod run;
 mod run_store;
+mod secrets;
 mod theme;
 mod ui;
 

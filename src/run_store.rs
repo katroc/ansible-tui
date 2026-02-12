@@ -1,97 +1,62 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 
 use chrono::{DateTime, Local};
+use rusqlite::params;
 
 use crate::app::{RunRecord, RunStatus};
-use crate::history::{history_has_legacy_environment_field, load_run_history, save_run_history};
+use crate::db::{open_db, sqlite_to_io};
 
 const STORE_DIR: &str = ".ansible-tui";
 const STORE_FILE: &str = "history.db";
 const LEGACY_STORE_FILE: &str = "runs.db";
+const LEGACY_TSV_FILE: &str = "runs.tsv";
 const LEGACY_ENV_NOTICE_FILE: &str = "legacy-environment-migration-noted";
 const MAX_PERSISTED_RUNS: usize = 500;
-const FIELD_SEP: char = '\u{001f}';
 
 pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
-    if !sqlite_available() {
-        return load_run_history(cwd);
-    }
-
-    ensure_store_dir(cwd)?;
     migrate_legacy_db_filename(cwd)?;
-    ensure_schema(cwd)?;
-    migrate_from_tsv_if_needed(cwd)?;
+    let conn = open_history_db(cwd)?;
+    migrate_from_tsv_if_needed(cwd, &conn)?;
 
-    let query = format!(
-        "SELECT \
-            id || char(31) || \
-            hex(playbook) || char(31) || \
-            hex(inventory) || char(31) || \
-            status || char(31) || \
-            started_at || char(31) || \
-            COALESCE(finished_at, '') || char(31) || \
-            COALESCE(exit_code, '') || char(31) || \
-            COALESCE(hex(template_id), '') \
-         FROM runs \
-         ORDER BY id DESC \
-         LIMIT {MAX_PERSISTED_RUNS};"
-    );
-    let stdout = run_sql_query(cwd, &query)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, playbook, inventory, status, started_at, finished_at, exit_code, template_id \
+             FROM runs ORDER BY id DESC LIMIT ?1",
+        )
+        .map_err(sqlite_to_io)?;
+
+    let rows = stmt
+        .query_map(params![MAX_PERSISTED_RUNS as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i32>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })
+        .map_err(sqlite_to_io)?;
 
     let mut out = Vec::new();
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = split_fields(line);
-        if fields.len() < 7 {
-            continue;
-        }
-        let Ok(id) = fields[0].parse::<u64>() else {
+    for row in rows {
+        let (id, playbook, inventory, status_str, started_str, finished_str, exit_code, template_id) =
+            row.map_err(sqlite_to_io)?;
+        let Some(status) = parse_status(&status_str) else {
             continue;
         };
-        let Ok(playbook_bytes) = decode_hex(fields[1]) else {
+        let Some(started_at) = parse_local_datetime(&started_str) else {
             continue;
         };
-        let Ok(inventory_bytes) = decode_hex(fields[2]) else {
-            continue;
-        };
-        let Some(status) = parse_status(fields[3]) else {
-            continue;
-        };
-        let Some(started_at) = parse_local_datetime(fields[4]) else {
-            continue;
-        };
-        let finished_at = if fields[5].is_empty() {
-            None
-        } else {
-            parse_local_datetime(fields[5])
-        };
-        let exit_code = if fields[6].is_empty() {
-            None
-        } else {
-            fields[6].parse::<i32>().ok()
-        };
-        let template_id = if fields.len() > 7 && !fields[7].is_empty() {
-            decode_hex(fields[7])
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok())
-        } else {
-            None
-        };
-
-        let playbook =
-            String::from_utf8(playbook_bytes).map_err(|err| io::Error::other(err.to_string()))?;
-        let inventory =
-            String::from_utf8(inventory_bytes).map_err(|err| io::Error::other(err.to_string()))?;
-        let logs = load_logs_for_run(cwd, id)?;
+        let finished_at = finished_str.as_deref().and_then(parse_local_datetime);
+        let logs = load_logs_for_run(&conn, id as u64)?;
 
         out.push(RunRecord {
-            id,
+            id: id as u64,
             playbook,
             inventory,
             status,
@@ -107,31 +72,13 @@ pub fn load_runs(cwd: &Path) -> io::Result<Vec<RunRecord>> {
 }
 
 pub fn save_run(cwd: &Path, run: &RunRecord) -> io::Result<()> {
-    if !sqlite_available() {
-        return save_run_legacy_tsv(cwd, run);
-    }
+    let conn = open_history_db(cwd)?;
 
-    ensure_store_dir(cwd)?;
-    migrate_legacy_db_filename(cwd)?;
-    ensure_schema(cwd)?;
+    let tx = conn.unchecked_transaction().map_err(sqlite_to_io)?;
 
-    let finished_at = run
-        .finished_at
-        .map(|ts| sql_quote(&ts.to_rfc3339()))
-        .unwrap_or_else(|| String::from("NULL"));
-    let exit_code = run
-        .exit_code
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| String::from("NULL"));
-    let template_id = run
-        .template_id
-        .as_deref()
-        .map(sql_quote)
-        .unwrap_or_else(|| String::from("NULL"));
-    let mut sql = format!(
-        "BEGIN; \
-         INSERT INTO runs (id, playbook, inventory, status, started_at, finished_at, exit_code, template_id) \
-         VALUES ({id}, {playbook}, {inventory}, {status}, {started}, {finished}, {exit_code}, {template_id}) \
+    tx.execute(
+        "INSERT INTO runs (id, playbook, inventory, status, started_at, finished_at, exit_code, template_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT(id) DO UPDATE SET \
             playbook=excluded.playbook, \
             inventory=excluded.inventory, \
@@ -139,72 +86,126 @@ pub fn save_run(cwd: &Path, run: &RunRecord) -> io::Result<()> {
             started_at=excluded.started_at, \
             finished_at=excluded.finished_at, \
             exit_code=excluded.exit_code, \
-            template_id=excluded.template_id; \
-         DELETE FROM run_logs WHERE run_id={id};",
-        id = run.id,
-        playbook = sql_quote(&run.playbook),
-        inventory = sql_quote(&run.inventory),
-        status = sql_quote(run.status.as_str()),
-        started = sql_quote(&run.started_at.to_rfc3339()),
-        finished = finished_at,
-        exit_code = exit_code,
-        template_id = template_id,
-    );
+            template_id=excluded.template_id",
+        params![
+            run.id as i64,
+            run.playbook,
+            run.inventory,
+            run.status.as_str(),
+            run.started_at.to_rfc3339(),
+            run.finished_at.map(|ts| ts.to_rfc3339()),
+            run.exit_code,
+            run.template_id,
+        ],
+    )
+    .map_err(sqlite_to_io)?;
 
-    for (seq, line) in run.logs.iter().enumerate() {
-        sql.push_str(&format!(
-            "INSERT INTO run_logs (run_id, seq, line) VALUES ({}, {}, {});",
-            run.id,
-            seq,
-            sql_quote(line)
-        ));
+    tx.execute("DELETE FROM run_logs WHERE run_id=?1", params![run.id as i64])
+        .map_err(sqlite_to_io)?;
+
+    {
+        let mut insert_log = tx
+            .prepare("INSERT INTO run_logs (run_id, seq, line) VALUES (?1, ?2, ?3)")
+            .map_err(sqlite_to_io)?;
+        for (seq, line) in run.logs.iter().enumerate() {
+            insert_log
+                .execute(params![run.id as i64, seq as i64, line])
+                .map_err(sqlite_to_io)?;
+        }
     }
 
-    sql.push_str(&format!(
-        "DELETE FROM run_logs WHERE run_id NOT IN (SELECT id FROM runs ORDER BY id DESC LIMIT {MAX_PERSISTED_RUNS}); \
-         DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY id DESC LIMIT {MAX_PERSISTED_RUNS}); \
-         COMMIT;"
-    ));
-    run_sql_exec(cwd, &sql)
+    tx.execute(
+        "DELETE FROM run_logs WHERE run_id NOT IN (SELECT id FROM runs ORDER BY id DESC LIMIT ?1)",
+        params![MAX_PERSISTED_RUNS as i64],
+    )
+    .map_err(sqlite_to_io)?;
+    tx.execute(
+        "DELETE FROM runs WHERE id NOT IN (SELECT id FROM runs ORDER BY id DESC LIMIT ?1)",
+        params![MAX_PERSISTED_RUNS as i64],
+    )
+    .map_err(sqlite_to_io)?;
+
+    tx.commit().map_err(sqlite_to_io)?;
+    Ok(())
 }
 
-fn save_run_legacy_tsv(cwd: &Path, run: &RunRecord) -> io::Result<()> {
-    let mut runs = load_run_history(cwd)?;
-    if let Some(existing) = runs.iter_mut().find(|r| r.id == run.id) {
-        *existing = run.clone();
-    } else {
-        runs.push(run.clone());
+pub fn take_legacy_environment_migration_notice(cwd: &Path) -> io::Result<Option<String>> {
+    let note_path = legacy_environment_notice_path(cwd);
+    if note_path.is_file() {
+        return Ok(None);
     }
-    runs.sort_by(|a, b| b.id.cmp(&a.id));
-    if runs.len() > MAX_PERSISTED_RUNS {
-        runs.truncate(MAX_PERSISTED_RUNS);
+
+    let has_legacy = sqlite_store_has_legacy_environment_column(cwd)?
+        || tsv_has_legacy_environment_field(cwd)?;
+    if !has_legacy {
+        return Ok(None);
     }
-    save_run_history(cwd, &runs)
+
+    fs::create_dir_all(cwd.join(STORE_DIR))?;
+    fs::write(note_path, "acknowledged\n")?;
+    Ok(Some(String::from(
+        "Migration note: historical runs remain compatible, but legacy environment labels were removed from history and templates.",
+    )))
 }
 
-fn ensure_store_dir(cwd: &Path) -> io::Result<()> {
-    fs::create_dir_all(cwd.join(STORE_DIR))
+/// Migrate history from directories created with the old unstable `DefaultHasher`.
+/// If the stable-hash directory has no db yet, scan sibling directories for one
+/// that contains a `history.db` and rename it to the correct location.
+pub fn migrate_unstable_hash_history(stable_root: &Path) {
+    let db_path = stable_root.join(STORE_DIR).join(STORE_FILE);
+    if db_path.is_file() {
+        return;
+    }
+    let Some(parent) = stable_root.parent() else {
+        return;
+    };
+    if !parent.is_dir() {
+        return;
+    }
+    let stable_name = stable_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let mut candidate: Option<PathBuf> = None;
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if !entry_path.is_dir() {
+                continue;
+            }
+            let name = entry_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if name == stable_name {
+                continue;
+            }
+            if entry_path.join(STORE_DIR).join(STORE_FILE).is_file() {
+                if candidate.is_some() {
+                    // Multiple candidates – ambiguous, skip migration
+                    return;
+                }
+                candidate = Some(entry_path);
+            }
+        }
+    }
+    if let Some(old_dir) = candidate {
+        let _ = fs::rename(&old_dir, stable_root);
+    }
 }
 
-fn migrate_legacy_db_filename(cwd: &Path) -> io::Result<()> {
-    let new_path = store_path(cwd);
-    if new_path.is_file() {
-        return Ok(());
-    }
+// --- private helpers ---
 
-    let legacy_path = legacy_store_path(cwd);
-    if !legacy_path.is_file() {
-        return Ok(());
-    }
-
-    fs::rename(legacy_path, new_path)
+fn open_history_db(cwd: &Path) -> io::Result<rusqlite::Connection> {
+    let conn = open_db(&store_path(cwd))?;
+    ensure_schema(&conn)?;
+    Ok(conn)
 }
 
-fn ensure_schema(cwd: &Path) -> io::Result<()> {
-    run_sql_exec(
-        cwd,
-        "PRAGMA journal_mode = WAL;
-         CREATE TABLE IF NOT EXISTS runs (
+fn ensure_schema(conn: &rusqlite::Connection) -> io::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY,
             playbook TEXT NOT NULL,
             inventory TEXT NOT NULL,
@@ -221,162 +222,136 @@ fn ensure_schema(cwd: &Path) -> io::Result<()> {
             PRIMARY KEY (run_id, seq)
          );
          CREATE INDEX IF NOT EXISTS idx_run_logs_run_id_seq ON run_logs(run_id, seq);",
-    )?;
-    migrate_add_template_column(cwd)
+    )
+    .map_err(sqlite_to_io)?;
+    migrate_add_template_column(conn)
 }
 
-fn migrate_add_template_column(cwd: &Path) -> io::Result<()> {
-    let info = run_sql_query(cwd, "PRAGMA table_info(runs);")?;
-    if !info.contains("template_id") {
-        run_sql_exec(cwd, "ALTER TABLE runs ADD COLUMN template_id TEXT;")?;
+fn migrate_add_template_column(conn: &rusqlite::Connection) -> io::Result<()> {
+    let has_col = conn
+        .prepare("PRAGMA table_info(runs)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == "template_id"))
+        })
+        .unwrap_or(false);
+    if !has_col {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN template_id TEXT;")
+            .map_err(sqlite_to_io)?;
     }
     Ok(())
 }
 
-fn migrate_from_tsv_if_needed(cwd: &Path) -> io::Result<()> {
-    let count_stdout = run_sql_query(cwd, "SELECT COUNT(*) FROM runs;")?;
-    let count = count_stdout.trim().parse::<usize>().unwrap_or(0);
+fn migrate_legacy_db_filename(cwd: &Path) -> io::Result<()> {
+    let new_path = store_path(cwd);
+    if new_path.is_file() {
+        return Ok(());
+    }
+    let legacy_path = cwd.join(STORE_DIR).join(LEGACY_STORE_FILE);
+    if !legacy_path.is_file() {
+        return Ok(());
+    }
+    fs::rename(legacy_path, new_path)
+}
+
+fn migrate_from_tsv_if_needed(cwd: &Path, conn: &rusqlite::Connection) -> io::Result<()> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .map_err(sqlite_to_io)?;
     if count > 0 {
         return Ok(());
     }
 
-    let legacy_runs = load_run_history(cwd)?;
+    let tsv_path = cwd.join(STORE_DIR).join(LEGACY_TSV_FILE);
+    let data = match fs::read_to_string(tsv_path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    let legacy_runs = parse_tsv_runs(&data);
     if legacy_runs.is_empty() {
         return Ok(());
     }
+
+    // Save via the connection directly to avoid recursive open
+    let tx = conn.unchecked_transaction().map_err(sqlite_to_io)?;
     for run in legacy_runs.into_iter().take(MAX_PERSISTED_RUNS) {
-        save_run(cwd, &run)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO runs (id, playbook, inventory, status, started_at, finished_at, exit_code, template_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run.id as i64,
+                run.playbook,
+                run.inventory,
+                run.status.as_str(),
+                run.started_at.to_rfc3339(),
+                run.finished_at.map(|ts| ts.to_rfc3339()),
+                run.exit_code,
+                run.template_id,
+            ],
+        )
+        .map_err(sqlite_to_io)?;
     }
+    tx.commit().map_err(sqlite_to_io)?;
     Ok(())
 }
 
-fn load_logs_for_run(cwd: &Path, run_id: u64) -> io::Result<Vec<String>> {
-    let stdout = run_sql_query(
-        cwd,
-        &format!(
-            "SELECT seq || char(31) || hex(line)
-             FROM run_logs
-             WHERE run_id={}
-             ORDER BY seq ASC;",
-            run_id
-        ),
-    )?;
+fn load_logs_for_run(conn: &rusqlite::Connection, run_id: u64) -> io::Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT line FROM run_logs WHERE run_id=?1 ORDER BY seq ASC")
+        .map_err(sqlite_to_io)?;
+    let rows = stmt
+        .query_map(params![run_id as i64], |row| row.get::<_, String>(0))
+        .map_err(sqlite_to_io)?;
 
     let mut out = Vec::new();
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = split_fields(line);
-        if fields.len() != 2 {
-            continue;
-        }
-        let Ok(bytes) = decode_hex(fields[1]) else {
-            continue;
-        };
-        if let Ok(text) = String::from_utf8(bytes) {
-            out.push(text);
-        }
+    for row in rows {
+        out.push(row.map_err(sqlite_to_io)?);
     }
     Ok(out)
-}
-
-fn run_sql_exec(cwd: &Path, sql: &str) -> io::Result<()> {
-    let output = Command::new("sqlite3")
-        .arg("-batch")
-        .arg(store_path(cwd))
-        .arg(sql)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn run_sql_query(cwd: &Path, sql: &str) -> io::Result<String> {
-    let output = Command::new("sqlite3")
-        .arg("-batch")
-        .arg(store_path(cwd))
-        .arg(sql)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn store_path(cwd: &Path) -> PathBuf {
     cwd.join(STORE_DIR).join(STORE_FILE)
 }
 
-fn legacy_store_path(cwd: &Path) -> PathBuf {
-    cwd.join(STORE_DIR).join(LEGACY_STORE_FILE)
-}
-
-pub fn take_legacy_environment_migration_notice(cwd: &Path) -> io::Result<Option<String>> {
-    let note_path = legacy_environment_notice_path(cwd);
-    if note_path.is_file() {
-        return Ok(None);
-    }
-
-    let has_legacy_environment = sqlite_store_has_legacy_environment_column(cwd)?
-        || history_has_legacy_environment_field(cwd)?;
-    if !has_legacy_environment {
-        return Ok(None);
-    }
-
-    ensure_store_dir(cwd)?;
-    fs::write(note_path, "acknowledged\n")?;
-    Ok(Some(String::from(
-        "Migration note: historical runs remain compatible, but legacy environment labels were removed from history and templates.",
-    )))
-}
-
-fn sqlite_store_has_legacy_environment_column(cwd: &Path) -> io::Result<bool> {
-    if !sqlite_available() {
-        return Ok(false);
-    }
-    let path = store_path(cwd);
-    if !path.is_file() {
-        return Ok(false);
-    }
-    let info = run_sql_query(cwd, "PRAGMA table_info(runs);")?;
-    Ok(info.lines().any(|line| {
-        line.split('|')
-            .nth(1)
-            .map(|name| name == "environment")
-            .unwrap_or(false)
-    }))
-}
-
 fn legacy_environment_notice_path(cwd: &Path) -> PathBuf {
     cwd.join(STORE_DIR).join(LEGACY_ENV_NOTICE_FILE)
 }
 
-fn sql_quote(value: &str) -> String {
-    let mut quoted = String::from("'");
-    for ch in value.chars() {
-        if ch == '\'' {
-            quoted.push('\'');
-            quoted.push('\'');
-        } else {
-            quoted.push(ch);
-        }
+fn sqlite_store_has_legacy_environment_column(cwd: &Path) -> io::Result<bool> {
+    let path = store_path(cwd);
+    if !path.is_file() {
+        return Ok(false);
     }
-    quoted.push('\'');
-    quoted
+    let conn = open_db(&path)?;
+    let has_col = conn
+        .prepare("PRAGMA table_info(runs)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .map(|rows| rows.filter_map(|r| r.ok()).any(|name| name == "environment"))
+        })
+        .unwrap_or(false);
+    Ok(has_col)
 }
 
-fn split_fields(line: &str) -> Vec<&str> {
-    line.split(FIELD_SEP).collect()
+fn tsv_has_legacy_environment_field(cwd: &Path) -> io::Result<bool> {
+    let tsv_path = cwd.join(STORE_DIR).join(LEGACY_TSV_FILE);
+    let data = match fs::read_to_string(tsv_path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.split('\t').count() >= 9 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn parse_status(raw: &str) -> Option<RunStatus> {
@@ -394,41 +369,78 @@ fn parse_local_datetime(raw: &str) -> Option<DateTime<Local>> {
         .map(|ts| ts.with_timezone(&Local))
 }
 
-fn decode_hex(raw: &str) -> io::Result<Vec<u8>> {
-    if raw.is_empty() {
-        return Ok(Vec::new());
+// --- TSV parsing for legacy migration ---
+
+fn parse_tsv_runs(data: &str) -> Vec<RunRecord> {
+    let mut runs = Vec::new();
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(run) = parse_tsv_line(line) {
+            runs.push(run);
+        }
     }
-    if raw.len() % 2 != 0 {
-        return Err(io::Error::other("invalid hex length"));
-    }
-    let mut out = Vec::with_capacity(raw.len() / 2);
-    let bytes = raw.as_bytes();
-    for i in (0..bytes.len()).step_by(2) {
-        let hi = from_hex_digit(bytes[i]).ok_or_else(|| io::Error::other("invalid hex"))?;
-        let lo = from_hex_digit(bytes[i + 1]).ok_or_else(|| io::Error::other("invalid hex"))?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
+    runs.sort_by(|a, b| b.id.cmp(&a.id));
+    runs
 }
 
-fn from_hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(10 + b - b'a'),
-        b'A'..=b'F' => Some(10 + b - b'A'),
-        _ => None,
+fn parse_tsv_line(line: &str) -> Option<RunRecord> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() < 7 {
+        return None;
     }
-}
+    let id = fields[0].parse::<u64>().ok()?;
+    let status = parse_status(fields[1])?;
+    let started_at = parse_local_datetime(fields[2])?;
+    let finished_at = if fields[3].is_empty() {
+        None
+    } else {
+        parse_local_datetime(fields[3])
+    };
+    let exit_code = if fields[4].is_empty() {
+        None
+    } else {
+        fields[4].parse::<i32>().ok()
+    };
+    let playbook = tsv_unescape(fields[5]);
+    let inventory = tsv_unescape(fields[6]);
+    let template_id = fields.get(7).and_then(|v| {
+        let s = tsv_unescape(v).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    });
 
-fn sqlite_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        Command::new("sqlite3")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+    Some(RunRecord {
+        id,
+        playbook,
+        inventory,
+        status,
+        started_at,
+        finished_at,
+        exit_code,
+        logs: Vec::new(),
+        template_id,
     })
+}
+
+fn tsv_unescape(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }

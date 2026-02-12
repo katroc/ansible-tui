@@ -46,6 +46,12 @@ pub enum Action {
         success: bool,
         message: String,
     },
+    VaultEditLoaded {
+        success: bool,
+        path: String,
+        content: Option<String>,
+        message: String,
+    },
     RefreshProject,
     StartRun,
     StartTemplateRun,

@@ -52,6 +52,18 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.project_ssh_open {
         render_project_ssh_prompt(frame, app);
     }
+    if app.vault_create_open {
+        render_vault_create_prompt(frame, app);
+    }
+    if app.vault_edit_open {
+        render_vault_edit_prompt(frame, app);
+    }
+    if app.vault_runtime_prompt_open {
+        render_vault_runtime_prompt(frame, app);
+    }
+    if app.vault_password_create_open {
+        render_vault_password_create_prompt(frame, app);
+    }
     if app.inventory_edit_mode_open {
         render_inventory_edit_mode_prompt(frame, app);
     }
@@ -425,7 +437,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(12),
+            Constraint::Length(16),
             Constraint::Min(6),
             Constraint::Length(2),
         ])
@@ -471,6 +483,27 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 summarize_inline_key(project.ssh_private_key_inline.as_deref()),
             ),
             (
+                String::from("vault_source"),
+                project
+                    .vault_source_type
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| String::from("unset")),
+            ),
+            (
+                String::from("vault_password_file"),
+                project
+                    .vault_password_file
+                    .clone()
+                    .unwrap_or_else(|| String::from("unset")),
+            ),
+            (
+                String::from("vault_id_label"),
+                project
+                    .vault_id_label
+                    .clone()
+                    .unwrap_or_else(|| String::from("unset")),
+            ),
+            (
                 String::from("playbooks"),
                 if selected_active {
                     app.playbooks.len().to_string()
@@ -496,6 +529,9 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             (String::from("vars_sync"), String::from("unset")),
             (String::from("ssh_key_file"), String::from("unset")),
             (String::from("ssh_key_inline"), String::from("unset")),
+            (String::from("vault_source"), String::from("unset")),
+            (String::from("vault_password_file"), String::from("unset")),
+            (String::from("vault_id_label"), String::from("unset")),
             (String::from("playbooks"), String::from("0")),
             (String::from("inventories"), String::from("0")),
         ]
@@ -550,7 +586,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(logs, right[1]);
 
     let hint = Paragraph::new(
-        "n new | f import path | g clone git | e ssh key settings | a/Enter activate | Shift+D delete | i inventory sync | v vars sync | j/k select",
+        "n new | f import path | g clone git | e secret settings | Shift+V create new vault | Shift+E edit vault | Shift+P create vault password | a/Enter activate | Shift+D delete | i inventory sync | v vars sync | j/k select",
     )
     .style(Style::default().fg(th::SUBTEXT0));
     frame.render_widget(hint, right[2]);
@@ -1718,6 +1754,10 @@ fn global_settings_rows(app: &App) -> Vec<(String, String)> {
             String::from("pipelining"),
             app.ansible_cfg.pipelining.to_string(),
         ),
+        (
+            String::from("secret_enforcement_mode"),
+            app.secret_enforcement_mode.as_str().to_string(),
+        ),
     ]
 }
 
@@ -1984,14 +2024,14 @@ fn render_project_create_prompt(frame: &mut Frame, app: &App) {
 }
 
 fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
-    let area = centered_rect(74, 64, frame.area());
+    let area = centered_rect(78, 72, frame.area());
     frame.render_widget(Clear, area);
 
     let wrapper = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(th::MAUVE))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Project SSH Key Settings");
+        .title("Project Secret Settings");
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -2003,7 +2043,10 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(2),
             Constraint::Length(3),
-            Constraint::Min(10),
+            Constraint::Min(7),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Length(2),
         ])
         .split(inner);
@@ -2013,7 +2056,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| String::from("(unknown)"));
     frame.render_widget(
         Paragraph::new(format!(
-            "Project: {project_name} | Inline key overrides file path at project scope."
+            "Project: {project_name} | Vault refs default from project and can be overridden in templates."
         ))
         .style(Style::default().fg(th::SUBTEXT1)),
         chunks[0],
@@ -2080,12 +2123,618 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
         chunks[2],
     );
 
+    let source_focused = app.project_ssh_field_idx == 2;
+    let source_value = app
+        .project_vault_source_type
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| String::from("unset"));
+    frame.render_widget(
+        Paragraph::new(if source_focused {
+            format!("{source_value} (h/l/Enter to cycle)")
+        } else {
+            source_value
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if source_focused {
+                    Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th::SURFACE1)
+                })
+                .title("Vault Source Type"),
+        )
+        .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[3],
+    );
+
+    let vault_file_focused = app.project_ssh_field_idx == 3;
+    let vault_file_display = if vault_file_focused {
+        if app.project_vault_password_file_buffer.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.project_vault_password_file_buffer)
+        }
+    } else if app.project_vault_password_file_buffer.is_empty() {
+        String::from("(unset)")
+    } else {
+        app.project_vault_password_file_buffer.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(vault_file_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if vault_file_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Vault Password File"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[4],
+    );
+
+    let vault_id_focused = app.project_ssh_field_idx == 4;
+    let vault_id_display = if vault_id_focused {
+        if app.project_vault_id_label_buffer.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.project_vault_id_label_buffer)
+        }
+    } else if app.project_vault_id_label_buffer.is_empty() {
+        String::from("(unset)")
+    } else {
+        app.project_vault_id_label_buffer.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(vault_id_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if vault_id_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Vault ID Label"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[5],
+    );
+
     frame.render_widget(
         Paragraph::new(
-            "Type text | Up/Down field | Enter next/newline | Ctrl+S save | Backspace edit | Esc cancel",
+            "Type text | Up/Down field | h/l cycle source | Enter next/newline | Ctrl+S save | Backspace edit | Esc cancel",
         )
         .style(Style::default().fg(th::SUBTEXT0)),
+        chunks[6],
+    );
+}
+
+fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
+    let area = centered_rect(82, 74, frame.area());
+    frame.render_widget(Clear, area);
+
+    let wrapper = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th::MAUVE))
+        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+        .title("Create New Encrypted Vault File");
+    frame.render_widget(wrapper, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let project_name = app
+        .selected_project()
+        .map(|project| project.name.clone())
+        .unwrap_or_else(|| String::from("(unknown)"));
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Project: {project_name} | Creates a new file only; does not load/decrypt existing vault files."
+        ))
+        .style(Style::default().fg(th::SUBTEXT1)),
+        chunks[0],
+    );
+
+    let path_focused = app.vault_create_field_idx == 0;
+    let path_display = if path_focused {
+        if app.vault_create_buffer_path.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.vault_create_buffer_path)
+        }
+    } else if app.vault_create_buffer_path.is_empty() {
+        String::from("(unset)")
+    } else {
+        app.vault_create_buffer_path.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(path_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if path_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Vault File Path"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[1],
+    );
+
+    let content_focused = app.vault_create_field_idx == 1;
+    let content_display = if content_focused {
+        if app.vault_create_buffer_content.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.vault_create_buffer_content)
+        }
+    } else if app.vault_create_buffer_content.is_empty() {
+        String::from("(empty)")
+    } else {
+        format!(
+            "(set: {} lines, {} chars)",
+            app.vault_create_buffer_content.lines().count(),
+            app.vault_create_buffer_content.chars().count()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(content_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if content_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Vault YAML Content"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE))
+            .wrap(Wrap { trim: false }),
+        chunks[2],
+    );
+
+    let vault_auth = app
+        .selected_project()
+        .map(|project| {
+            let source = project
+                .vault_source_type
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| String::from("unset"));
+            let password_file = project
+                .vault_password_file
+                .clone()
+                .unwrap_or_else(|| String::from("unset"));
+            let vault_id = project
+                .vault_id_label
+                .clone()
+                .unwrap_or_else(|| String::from("unset"));
+            format!(
+                "Vault auth: source={source} | password_file={password_file} | vault_id={vault_id}"
+            )
+        })
+        .unwrap_or_else(|| String::from("Vault auth: unset"));
+    frame.render_widget(
+        Paragraph::new(vault_auth)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(th::SURFACE1))
+                    .title("Auth Source (from Project Secret Settings)"),
+            )
+            .style(Style::default().fg(th::SUBTEXT1).bg(th::BASE))
+            .wrap(Wrap { trim: true }),
         chunks[3],
+    );
+
+    frame.render_widget(
+        Paragraph::new(
+            "Type text | Up/Down field | Enter next/newline | Ctrl+S create+encrypt | Backspace edit | Esc cancel",
+        )
+        .style(Style::default().fg(th::SUBTEXT0)),
+        chunks[4],
+    );
+}
+
+fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
+    let area = centered_rect(72, 44, frame.area());
+    frame.render_widget(Clear, area);
+
+    let wrapper = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th::MAUVE))
+        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+        .title("Create Vault Password File");
+    frame.render_widget(wrapper, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let project_name = app
+        .selected_project()
+        .map(|project| project.name.clone())
+        .unwrap_or_else(|| String::from("(unknown)"));
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Project: {project_name} | Creates password file and sets vault source to file."
+        ))
+        .style(Style::default().fg(th::SUBTEXT1)),
+        chunks[0],
+    );
+
+    let path_focused = app.vault_password_create_field_idx == 0;
+    let path_display = if path_focused {
+        if app.vault_password_create_buffer_path.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.vault_password_create_buffer_path)
+        }
+    } else if app.vault_password_create_buffer_path.is_empty() {
+        String::from("(unset)")
+    } else {
+        app.vault_password_create_buffer_path.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(path_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if path_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Password File Path"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[1],
+    );
+
+    let password_focused = app.vault_password_create_field_idx == 1;
+    let password_display = if app.vault_password_create_buffer_password.is_empty() {
+        if password_focused {
+            String::from("|")
+        } else {
+            String::from("(empty)")
+        }
+    } else {
+        masked_secret(&app.vault_password_create_buffer_password, password_focused)
+    };
+    frame.render_widget(
+        Paragraph::new(password_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if password_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Vault Password"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[2],
+    );
+
+    let confirm_focused = app.vault_password_create_field_idx == 2;
+    let confirm_display = if app.vault_password_create_buffer_confirm.is_empty() {
+        if confirm_focused {
+            String::from("|")
+        } else {
+            String::from("(empty)")
+        }
+    } else {
+        masked_secret(&app.vault_password_create_buffer_confirm, confirm_focused)
+    };
+    frame.render_widget(
+        Paragraph::new(confirm_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if confirm_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Confirm Password"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[3],
+    );
+
+    frame.render_widget(
+        Paragraph::new(
+            "Type text | Up/Down field | Enter next | Ctrl+S create file | Backspace edit | Esc cancel",
+        )
+        .style(Style::default().fg(th::SUBTEXT0)),
+        chunks[4],
+    );
+}
+
+fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
+    let area = centered_rect(84, 78, frame.area());
+    frame.render_widget(Clear, area);
+
+    let wrapper = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th::MAUVE))
+        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+        .title("Edit Encrypted Vault File");
+    frame.render_widget(wrapper, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let project_name = app
+        .selected_project()
+        .map(|project| project.name.clone())
+        .unwrap_or_else(|| String::from("(unknown)"));
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Project: {project_name} | Enter on path decrypts+loads; Ctrl+S re-encrypts and saves."
+        ))
+        .style(Style::default().fg(th::SUBTEXT1)),
+        chunks[0],
+    );
+
+    let path_focused = app.vault_edit_field_idx == 0;
+    let path_display = if path_focused {
+        if app.vault_edit_buffer_path.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.vault_edit_buffer_path)
+        }
+    } else if app.vault_edit_buffer_path.is_empty() {
+        String::from("(unset)")
+    } else {
+        app.vault_edit_buffer_path.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(path_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if path_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Vault File Path"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[1],
+    );
+
+    let content_focused = app.vault_edit_field_idx == 1;
+    let content_display = if content_focused {
+        if app.vault_edit_buffer_content.is_empty() {
+            String::from("|")
+        } else {
+            format!("{}|", app.vault_edit_buffer_content)
+        }
+    } else if app.vault_edit_buffer_content.is_empty() {
+        String::from("(empty: press Enter on path to load)")
+    } else {
+        format!(
+            "(loaded: {} lines, {} chars)",
+            app.vault_edit_buffer_content.lines().count(),
+            app.vault_edit_buffer_content.chars().count()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(content_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if content_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Decrypted Vault YAML Content"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE))
+            .wrap(Wrap { trim: false }),
+        chunks[2],
+    );
+
+    let vault_auth = app
+        .selected_project()
+        .map(|project| {
+            let source = project
+                .vault_source_type
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| String::from("unset"));
+            let password_file = project
+                .vault_password_file
+                .clone()
+                .unwrap_or_else(|| String::from("unset"));
+            let vault_id = project
+                .vault_id_label
+                .clone()
+                .unwrap_or_else(|| String::from("unset"));
+            format!(
+                "Vault auth: source={source} | password_file={password_file} | vault_id={vault_id}"
+            )
+        })
+        .unwrap_or_else(|| String::from("Vault auth: unset"));
+    frame.render_widget(
+        Paragraph::new(if app.vault_edit_loading {
+            format!("{vault_auth} | status=loading...")
+        } else {
+            vault_auth
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(if app.vault_edit_loading {
+                    Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th::SURFACE1)
+                })
+                .title("Auth Source (from Project Secret Settings)"),
+        )
+        .style(Style::default().fg(th::SUBTEXT1).bg(th::BASE))
+        .wrap(Wrap { trim: true }),
+        chunks[3],
+    );
+
+    frame.render_widget(
+        Paragraph::new(
+            "Type text | Up/Down field | Enter on path reloads | Enter in content newline | Ctrl+S save+encrypt | Backspace edit | Esc cancel",
+        )
+        .style(Style::default().fg(th::SUBTEXT0)),
+        chunks[4],
+    );
+}
+
+fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
+    let area = centered_rect(68, 34, frame.area());
+    frame.render_widget(Clear, area);
+    let confirm_required = app.vault_runtime_prompt_confirm_required();
+
+    let wrapper = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th::MAUVE))
+        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
+        .title("Vault Password (Prompt Mode)");
+    frame.render_widget(wrapper, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let chunks = if confirm_required {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Length(2),
+            ])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Length(2),
+            ])
+            .split(inner)
+    };
+
+    frame.render_widget(
+        Paragraph::new("Enter vault password. It will be reused for this project session.")
+            .style(Style::default().fg(th::SUBTEXT1)),
+        chunks[0],
+    );
+
+    let password_focused = app.vault_runtime_prompt_field_idx == 0;
+    let password_display = if app.vault_runtime_prompt_password.is_empty() {
+        if password_focused {
+            String::from("|")
+        } else {
+            String::from("(empty)")
+        }
+    } else {
+        masked_secret(&app.vault_runtime_prompt_password, password_focused)
+    };
+    frame.render_widget(
+        Paragraph::new(password_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if password_focused {
+                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th::SURFACE1)
+                    })
+                    .title("Vault Password"),
+            )
+            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        chunks[1],
+    );
+
+    if confirm_required {
+        let confirm_focused = app.vault_runtime_prompt_field_idx == 1;
+        let confirm_display = if app.vault_runtime_prompt_confirm.is_empty() {
+            if confirm_focused {
+                String::from("|")
+            } else {
+                String::from("(empty)")
+            }
+        } else {
+            masked_secret(&app.vault_runtime_prompt_confirm, confirm_focused)
+        };
+        frame.render_widget(
+            Paragraph::new(confirm_display)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(if confirm_focused {
+                            Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(th::SURFACE1)
+                        })
+                        .title("Confirm Password"),
+                )
+                .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            chunks[2],
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(if confirm_required {
+            "Type text | Tab/Shift+Tab or Up/Down field | Enter next/confirm | Ctrl+S continue | Backspace | Esc cancel"
+        } else {
+            "Type text | Enter confirm | Ctrl+S continue | Backspace | Esc cancel"
+        })
+        .style(Style::default().fg(th::SUBTEXT0)),
+        if confirm_required { chunks[3] } else { chunks[2] },
     );
 }
 
@@ -2555,7 +3204,7 @@ fn template_editor_rows(app: &App) -> Vec<(String, String)> {
             display_template_editor_text(app, 11, settings.tags.as_deref().unwrap_or("unset")),
         ),
         (
-            String::from("extra-vars (--extra-vars)"),
+            String::from("extra-vars/files (--extra-vars)"),
             display_template_editor_text(
                 app,
                 12,
@@ -2584,6 +3233,36 @@ fn template_editor_rows(app: &App) -> Vec<(String, String)> {
                 app,
                 15,
                 settings.ssh_private_key_inline.as_deref(),
+            ),
+        ),
+        (
+            String::from("vault source (prompt/file)"),
+            app.template_editor_vault_source_type
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("vault password file"),
+            display_template_editor_text(
+                app,
+                17,
+                if app.template_editor_vault_password_file.is_empty() {
+                    "unset"
+                } else {
+                    &app.template_editor_vault_password_file
+                },
+            ),
+        ),
+        (
+            String::from("vault id label"),
+            display_template_editor_text(
+                app,
+                18,
+                if app.template_editor_vault_id_label.is_empty() {
+                    "unset"
+                } else {
+                    &app.template_editor_vault_id_label
+                },
             ),
         ),
     ]
@@ -2624,7 +3303,7 @@ fn settings_rows(app: &App, settings: &PlaybookSettings) -> Vec<(String, String)
             display_setting_text(app, 7, settings.tags.as_deref().unwrap_or("unset")),
         ),
         (
-            String::from("extra-vars (--extra-vars)"),
+            String::from("extra-vars/files (--extra-vars)"),
             display_setting_text(app, 8, settings.extra_vars.as_deref().unwrap_or("unset")),
         ),
         (
@@ -2731,6 +3410,17 @@ fn active_help_text(app: &App) -> String {
             "Keys: j/k or Up/Down candidate | Enter select runtime | b bootstrap managed runtime | Esc close",
         );
     }
+    if app.vault_runtime_prompt_open {
+        return if app.vault_runtime_prompt_confirm_required() {
+            String::from(
+                "Keys: Type text | Tab/Shift+Tab or Up/Down field | Enter next/confirm | Ctrl+S continue | Backspace edit | Esc cancel",
+            )
+        } else {
+            String::from(
+                "Keys: Type text | Enter confirm | Ctrl+S continue | Backspace edit | Esc cancel",
+            )
+        };
+    }
     if app.inventory_create_open {
         return String::from("Keys: Type filename | Enter create | Backspace edit | Esc cancel");
     }
@@ -2741,7 +3431,22 @@ fn active_help_text(app: &App) -> String {
     }
     if app.project_ssh_open {
         return String::from(
-            "Keys: Type text | Up/Down field | Enter next/newline | Ctrl+S save | Backspace edit | Esc cancel",
+            "Keys: Type text | Up/Down field | h/l cycle source | Enter next/newline | Ctrl+S save | Backspace edit | Esc cancel",
+        );
+    }
+    if app.vault_create_open {
+        return String::from(
+            "Keys: Type text | Up/Down field | Enter next/newline | Ctrl+S create+encrypt | Backspace edit | Esc cancel",
+        );
+    }
+    if app.vault_edit_open {
+        return String::from(
+            "Keys: Type text | Up/Down field | Enter on path reload | Enter in content newline | Ctrl+S save+encrypt | Backspace edit | Esc cancel",
+        );
+    }
+    if app.vault_password_create_open {
+        return String::from(
+            "Keys: Type text | Up/Down field | Enter next | Ctrl+S create file | Backspace edit | Esc cancel",
         );
     }
     if app.inventory_edit_mode_open {
@@ -2786,10 +3491,10 @@ fn active_help_text(app: &App) -> String {
     }
     match app.current_view() {
         View::Dashboard => {
-            String::from("Keys: Tab/h/l views | r run selected template | u runtime picker | q quit")
+            String::from("Keys: Tab/h/l views | r run selected playbook | u runtime picker | q quit")
         }
         View::Projects => String::from(
-            "Keys: j/k or Up/Down select project | Enter/a activate | n new | f import path | g clone git | e ssh key settings | Shift+D delete selected (confirm) | i inventory sync | v vars sync | Tab/h/l views | q quit",
+            "Keys: j/k or Up/Down select project | Enter/a activate | n new | f import path | g clone git | e secret settings | Shift+V create new vault | Shift+E edit vault | Shift+P create vault password | Shift+D delete selected (confirm) | i inventory sync | v vars sync | Tab/h/l views | q quit",
         ),
         View::Inventory => match app.inventory_sub_tab {
             InventorySubTab::Files => String::from(
@@ -2882,7 +3587,7 @@ fn settings_preview_rows(
                 .unwrap_or_else(|| String::from("unset")),
         ),
         (
-            String::from("extra-vars"),
+            String::from("extra-vars/files"),
             settings
                 .extra_vars
                 .clone()
@@ -2951,7 +3656,7 @@ fn template_settings_preview_rows(
                 .unwrap_or_else(|| String::from("unset")),
         ),
         (
-            String::from("extra-vars"),
+            String::from("extra-vars/files"),
             template
                 .extra_vars
                 .clone()
@@ -2974,6 +3679,27 @@ fn template_settings_preview_rows(
         (
             String::from("ssh_key_inline"),
             summarize_inline_key(template.ssh_private_key_inline.as_deref()),
+        ),
+        (
+            String::from("vault_source"),
+            template
+                .vault_source_type
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("vault_password_file"),
+            template
+                .vault_password_file
+                .clone()
+                .unwrap_or_else(|| String::from("unset")),
+        ),
+        (
+            String::from("vault_id_label"),
+            template
+                .vault_id_label
+                .clone()
+                .unwrap_or_else(|| String::from("unset")),
         ),
     ];
 
@@ -3002,6 +3728,14 @@ fn template_settings_preview_rows(
                         .map(|path| format!("{path} ({})", context.ssh_key_source))
                         .unwrap_or_else(|| String::from("unset"))
                 },
+            ));
+            rows.push((String::from("effective vault source"), context.vault_source));
+            rows.push((
+                String::from("effective vault id"),
+                context
+                    .vault_id_label
+                    .clone()
+                    .unwrap_or_else(|| String::from("unset")),
             ));
             if !context.warnings.is_empty() {
                 rows.push((
@@ -3082,6 +3816,15 @@ fn summarize_inline_key(value: Option<&str>) -> String {
             )
         }
         _ => String::from("unset"),
+    }
+}
+
+fn masked_secret(value: &str, focused: bool) -> String {
+    let stars = "*".repeat(value.chars().count().max(1));
+    if focused {
+        format!("{stars}|")
+    } else {
+        stars
     }
 }
 

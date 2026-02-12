@@ -15,7 +15,7 @@ Foundation-first Rust TUI for Ansible operations.
 - Project discovery for inventories and playbooks
 - Async action/event loop
 - Real `ansible-playbook` execution with live `stdout`/`stderr` streaming
-- Local run history persistence in SQLite `./.ansible-tui/history.db` (with automatic legacy import from `runs.db`/`runs.tsv`)
+- Local run history persistence in SQLite under `./.ansible-tui/project-history/<hash>/.ansible-tui/history.db` per project (with automatic legacy import from older `runs.db`/`runs.tsv` locations)
 - Runtime picker with managed Ansible bootstrap
 - Side-by-side main panel and live logs
 - Per-playbook run history list embedded in Playbooks tab
@@ -23,13 +23,16 @@ Foundation-first Rust TUI for Ansible operations.
 - In-app inventory editor with save/discard flow
 - Guided YAML inventory builder (filename + host/group lists + dynamic assignment -> preview/save)
 - SSH private key assignment at project scope and per-playbook scope (file path or inline key text)
+- Vault reference defaults at project scope with template-level override (`prompt`/`file` + optional vault-id)
+- Secret enforcement mode (`strict` default, `compat` optional) for plaintext-sensitive options
+- Redacted run command logging for secret-bearing arguments
 - Global shortcut helper strip visible on all tabs
 - Editable global run profile in Settings tab (saved to `ansible.cfg` + app config)
 - Per-playbook settings for common ansible-playbook flags
 
 ## Keybindings
 
-- `Tab`: switch view
+- `Tab`: switch view (or move to next field in vault password prompt)
 - `h`/`l`: switch view (except in Settings tab where they adjust selected setting)
 - `j`/`k` or `Up`/`Down`: move selection in the focused list
 - `n` (Inventory tab): create a new inventory file under `./inventories`
@@ -38,7 +41,10 @@ Foundation-first Rust TUI for Ansible operations.
 - `p` (Inventory Hosts/Groups sub-tabs): run a quick `ansible.builtin.ping` test for the selected host or group target
 - `Shift+D` (Inventory tab): delete selected inventory (double-press confirmation)
 - `Shift+D` (Projects tab): delete selected project (double-press confirmation, keeps at least one project)
-- `e` (Projects tab): edit selected project's SSH private key settings (file path or inline key)
+- `e` (Projects tab): edit selected project's secret settings (SSH key refs + vault refs)
+- `Shift+V` (Projects tab): create and encrypt a new vault vars file from inside the app (new-file flow)
+- `Shift+E` (Projects tab): open vault editor and auto-decrypt the default vault path for editing (or change path and press `Enter` to reload), then re-encrypt on save
+- `Shift+P` (Projects tab): create a vault password file from inside the app (sets vault source to `file`)
 - Guided builder flow: select target in Group Tree, then attach/detach available groups or hosts with `space`/`d` (`Enter` also toggles attach)
 - `Left`/`Right` (Playbooks tab): switch focus between Playbooks and Runs lists
 - `Shift+J`/`Shift+K` (Playbooks tab): alternate run selection shortcuts
@@ -80,6 +86,7 @@ In the Settings tab you can edit these global defaults:
 - ansible.cfg default: `remote_user`
 - ansible.cfg default: `private_key_file`
 - ansible.cfg default: `pipelining`
+- app config: `secret_enforcement_mode` (`strict` or `compat`)
 
 ## Project discovery rules
 
@@ -109,10 +116,31 @@ Per playbook, settings currently manage:
 - `--timeout`
 - `--limit`
 - `--tags`
-- `--extra-vars`
+- `--extra-vars` input (strict mode expects vars files, for example `@vars/secrets.vault.yml`)
 - SSH private key via file path (`--private-key`)
 - SSH private key via inline pasted key material (written to a temporary key file at run-time)
 - additional CLI args appended as-is (split on whitespace, no `--extra-args` flag)
+
+## Vault references and enforcement
+
+- Project settings can define vault auth defaults:
+  - `vault_source_type`: `prompt` or `file`
+  - `vault_password_file`: path used when source is `file`
+  - `vault_id_label`: optional vault id label (for `--vault-id`)
+- Template editor can override those vault settings per template.
+- Vault creation flow in Projects tab (`Shift+V`) creates new files only (does not open existing vault content), writes your YAML to a temp file, encrypts it with `ansible-vault`, then moves the encrypted file into your target path.
+- Vault edit flow in Projects tab (`Shift+E`) decrypts the target file into the editor buffer (`Enter` on path), then re-encrypts updated content on `Ctrl+S`.
+- When project vault source is `prompt`, run/create/edit flows use an in-app vault password modal (instead of relying on TTY prompts), cache that password in-memory per project for the current app session, and reuse it for subsequent prompt-mode actions.
+- Vault password helper (`Shift+P`) creates the password file with secure permissions and updates project vault settings.
+- Effective CLI behavior:
+  - `prompt` + no vault-id -> `--ask-vault-pass`
+  - `prompt` + vault-id -> `--vault-id <id>@prompt`
+  - `file` + no vault-id -> `--vault-password-file <path>`
+  - `file` + vault-id -> `--vault-id <id>@<path>`
+- Secret enforcement mode:
+  - `strict` (default): blocks inline SSH keys and plaintext `--extra-vars`; use references/files.
+  - `compat`: allows legacy plaintext with run warnings.
+  - New plaintext persistence is blocked in editors/prompts (legacy values are read-only until removed).
 
 ## Clipboard notes
 

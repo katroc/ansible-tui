@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use rusqlite::params;
+
+use crate::db::{open_db, project_db_path, sqlite_to_io};
 
 #[derive(Debug, Clone)]
 pub struct PlaybookSettings {
@@ -39,32 +43,63 @@ impl Default for PlaybookSettings {
 }
 
 const SETTINGS_DIR: &str = ".ansible-tui";
-const SETTINGS_FILE: &str = "playbook_settings.tsv";
-const LEGACY_SETTINGS_FILE: &str = "playbook_templates.tsv";
+const LEGACY_SETTINGS_FILE: &str = "playbook_settings.tsv";
+const LEGACY_SETTINGS_FILE_2: &str = "playbook_templates.tsv";
 
 pub fn load_playbook_settings(cwd: &Path) -> io::Result<BTreeMap<String, PlaybookSettings>> {
-    let path = settings_file(cwd);
-    let data = match fs::read_to_string(path) {
-        Ok(data) => data,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            let legacy = cwd.join(SETTINGS_DIR).join(LEGACY_SETTINGS_FILE);
-            match fs::read_to_string(legacy) {
-                Ok(data) => data,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-                Err(err) => return Err(err),
-            }
-        }
-        Err(err) => return Err(err),
-    };
+    let conn = open_settings_db(cwd)?;
+    migrate_from_tsv_if_needed(cwd, &conn)?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT playbook_path, \"check\", diff, become_enabled, verbosity, \
+             forks, timeout, \"limit\", tags, extra_vars, extra_args, \
+             ssh_private_key_file, ssh_private_key_inline \
+             FROM playbook_settings ORDER BY playbook_path ASC",
+        )
+        .map_err(sqlite_to_io)?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(4)?.min(4) as u8,
+                row.get::<_, Option<i64>>(5)?.map(|v| v as u16),
+                row.get::<_, Option<i64>>(6)?.map(|v| v as u16),
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+            ))
+        })
+        .map_err(sqlite_to_io)?;
 
     let mut out = BTreeMap::new();
-    for line in data.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some((key, settings)) = parse_line(line) {
-            out.insert(key, settings);
-        }
+    for row in rows {
+        let (path, check, diff, become_enabled, verbosity, forks, timeout, limit, tags, extra_vars, extra_args, ssh_key_file, ssh_key_inline) =
+            row.map_err(sqlite_to_io)?;
+        out.insert(
+            path,
+            PlaybookSettings {
+                check,
+                diff,
+                become_enabled,
+                verbosity,
+                forks,
+                timeout,
+                limit,
+                tags,
+                extra_vars,
+                extra_args,
+                ssh_private_key_file: ssh_key_file,
+                ssh_private_key_inline: ssh_key_inline,
+            },
+        );
     }
     Ok(out)
 }
@@ -73,16 +108,44 @@ pub fn save_playbook_settings(
     cwd: &Path,
     settings: &BTreeMap<String, PlaybookSettings>,
 ) -> io::Result<()> {
-    let dir = cwd.join(SETTINGS_DIR);
-    fs::create_dir_all(&dir)?;
-    let path = settings_file(cwd);
+    let conn = open_settings_db(cwd)?;
+    let tx = conn.unchecked_transaction().map_err(sqlite_to_io)?;
+    tx.execute("DELETE FROM playbook_settings", [])
+        .map_err(sqlite_to_io)?;
 
-    let mut out = String::new();
-    for (playbook, setting) in settings {
-        out.push_str(&format_line(playbook, setting));
-        out.push('\n');
+    let mut insert = tx
+        .prepare(
+            "INSERT INTO playbook_settings \
+             (playbook_path, \"check\", diff, become_enabled, verbosity, \
+              forks, timeout, \"limit\", tags, extra_vars, extra_args, \
+              ssh_private_key_file, ssh_private_key_inline) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        )
+        .map_err(sqlite_to_io)?;
+
+    for (playbook, s) in settings {
+        insert
+            .execute(params![
+                playbook,
+                s.check as i64,
+                s.diff as i64,
+                s.become_enabled as i64,
+                s.verbosity as i64,
+                s.forks.map(|v| v as i64),
+                s.timeout.map(|v| v as i64),
+                s.limit,
+                s.tags,
+                s.extra_vars,
+                s.extra_args,
+                s.ssh_private_key_file,
+                s.ssh_private_key_inline,
+            ])
+            .map_err(sqlite_to_io)?;
     }
-    fs::write(path, out)
+
+    drop(insert);
+    tx.commit().map_err(sqlite_to_io)?;
+    Ok(())
 }
 
 pub fn cycle_u16(current: Option<u16>, presets: &[Option<u16>], delta: i8) -> Option<u16> {
@@ -100,32 +163,104 @@ pub fn cycle_u16(current: Option<u16>, presets: &[Option<u16>], delta: i8) -> Op
     presets[next as usize]
 }
 
-fn settings_file(cwd: &Path) -> PathBuf {
-    cwd.join(SETTINGS_DIR).join(SETTINGS_FILE)
-}
+// --- private helpers ---
 
-fn format_line(playbook: &str, settings: &PlaybookSettings) -> String {
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        escape(playbook),
-        bool_to_u8(settings.check),
-        bool_to_u8(settings.diff),
-        bool_to_u8(settings.become_enabled),
-        settings.verbosity,
-        settings.forks.map(|v| v.to_string()).unwrap_or_default(),
-        settings.timeout.map(|v| v.to_string()).unwrap_or_default(),
-        escape_opt(&settings.limit),
-        escape_opt(&settings.tags),
-        escape_opt(&settings.extra_vars),
-        escape_opt(&settings.extra_args),
-        escape_opt(&settings.ssh_private_key_file),
-        escape_opt(&settings.ssh_private_key_inline),
+fn open_settings_db(cwd: &Path) -> io::Result<rusqlite::Connection> {
+    let conn = open_db(&project_db_path(cwd))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS playbook_settings (
+            playbook_path TEXT PRIMARY KEY,
+            \"check\" INTEGER NOT NULL DEFAULT 0,
+            diff INTEGER NOT NULL DEFAULT 0,
+            become_enabled INTEGER NOT NULL DEFAULT 0,
+            verbosity INTEGER NOT NULL DEFAULT 0,
+            forks INTEGER,
+            timeout INTEGER,
+            \"limit\" TEXT,
+            tags TEXT,
+            extra_vars TEXT,
+            extra_args TEXT,
+            ssh_private_key_file TEXT,
+            ssh_private_key_inline TEXT
+         )",
     )
+    .map_err(sqlite_to_io)?;
+    Ok(conn)
 }
 
-fn parse_line(line: &str) -> Option<(String, PlaybookSettings)> {
+fn migrate_from_tsv_if_needed(cwd: &Path, conn: &rusqlite::Connection) -> io::Result<()> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM playbook_settings", [], |row| {
+            row.get(0)
+        })
+        .map_err(sqlite_to_io)?;
+    if count > 0 {
+        return Ok(());
+    }
+
+    // Try both legacy filenames
+    let data = {
+        let primary = cwd.join(SETTINGS_DIR).join(LEGACY_SETTINGS_FILE);
+        match fs::read_to_string(primary) {
+            Ok(data) => data,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let secondary = cwd.join(SETTINGS_DIR).join(LEGACY_SETTINGS_FILE_2);
+                match fs::read_to_string(secondary) {
+                    Ok(data) => data,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    };
+
+    let tx = conn.unchecked_transaction().map_err(sqlite_to_io)?;
+    let mut insert = tx
+        .prepare(
+            "INSERT OR IGNORE INTO playbook_settings \
+             (playbook_path, \"check\", diff, become_enabled, verbosity, \
+              forks, timeout, \"limit\", tags, extra_vars, extra_args, \
+              ssh_private_key_file, ssh_private_key_inline) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        )
+        .map_err(sqlite_to_io)?;
+
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some((path, s)) = parse_tsv_line(line) {
+            insert
+                .execute(params![
+                    path,
+                    s.check as i64,
+                    s.diff as i64,
+                    s.become_enabled as i64,
+                    s.verbosity as i64,
+                    s.forks.map(|v| v as i64),
+                    s.timeout.map(|v| v as i64),
+                    s.limit,
+                    s.tags,
+                    s.extra_vars,
+                    s.extra_args,
+                    s.ssh_private_key_file,
+                    s.ssh_private_key_inline,
+                ])
+                .map_err(sqlite_to_io)?;
+        }
+    }
+
+    drop(insert);
+    tx.commit().map_err(sqlite_to_io)?;
+    Ok(())
+}
+
+// --- TSV legacy parsing ---
+
+fn parse_tsv_line(line: &str) -> Option<(String, PlaybookSettings)> {
     let mut fields = line.split('\t');
-    let playbook = unescape(fields.next()?);
+    let playbook = tsv_unescape(fields.next()?);
     let check = parse_bool(fields.next().unwrap_or_default());
     let diff = parse_bool(fields.next().unwrap_or_default());
     let become_enabled = parse_bool(fields.next().unwrap_or_default());
@@ -166,14 +301,6 @@ fn parse_bool(raw: &str) -> bool {
     matches!(raw.trim(), "1" | "true" | "yes")
 }
 
-fn bool_to_u8(value: bool) -> u8 {
-    if value {
-        1
-    } else {
-        0
-    }
-}
-
 fn parse_opt_u16(raw: &str) -> Option<u16> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -183,12 +310,8 @@ fn parse_opt_u16(raw: &str) -> Option<u16> {
     }
 }
 
-fn escape_opt(value: &Option<String>) -> String {
-    value.as_deref().map(escape).unwrap_or_default()
-}
-
 fn parse_opt_string(raw: &str) -> Option<String> {
-    let raw = unescape(raw);
+    let raw = tsv_unescape(raw);
     let raw = raw.trim().to_string();
     if raw.is_empty() {
         None
@@ -197,13 +320,7 @@ fn parse_opt_string(raw: &str) -> Option<String> {
     }
 }
 
-fn escape(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('\t', "\\t")
-        .replace('\n', "\\n")
-}
-
-fn unescape(raw: &str) -> String {
+fn tsv_unescape(raw: &str) -> String {
     let mut out = String::new();
     let mut chars = raw.chars();
     while let Some(ch) = chars.next() {
