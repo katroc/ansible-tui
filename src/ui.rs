@@ -11,7 +11,8 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    display_path, App, FocusContext, InventorySubTab, ProjectCreateMode, RunStatus, View,
+    display_path, App, FilterTarget, FocusContext, InventorySubTab, ProjectCreateMode, RunStatus,
+    View,
 };
 use crate::playbook_settings::PlaybookSettings;
 use crate::run::playbook_bin_available;
@@ -369,7 +370,7 @@ const HINTS_DASHBOARD: [HintBinding; 5] = [
         desc: "quit",
     },
 ];
-const HINTS_PROJECTS: [HintBinding; 7] = [
+const HINTS_PROJECTS: [HintBinding; 8] = [
     HintBinding {
         key: "j/k, Up/Down",
         desc: "select project",
@@ -398,8 +399,12 @@ const HINTS_PROJECTS: [HintBinding; 7] = [
         key: "Shift+D",
         desc: "delete selected project",
     },
+    HintBinding {
+        key: "/",
+        desc: "filter list (Esc clears)",
+    },
 ];
-const HINTS_INVENTORY_FILES: [HintBinding; 6] = [
+const HINTS_INVENTORY_FILES: [HintBinding; 7] = [
     HintBinding {
         key: "j/k, Up/Down",
         desc: "select inventory",
@@ -423,6 +428,10 @@ const HINTS_INVENTORY_FILES: [HintBinding; 6] = [
     HintBinding {
         key: "Tab/h/l",
         desc: "switch view",
+    },
+    HintBinding {
+        key: "/",
+        desc: "filter list (Esc clears)",
     },
 ];
 const HINTS_INVENTORY_HOSTS: [HintBinding; 7] = [
@@ -485,7 +494,7 @@ const HINTS_INVENTORY_GROUPS: [HintBinding; 7] = [
         desc: "back to inventory files",
     },
 ];
-const HINTS_PLAYBOOKS: [HintBinding; 7] = [
+const HINTS_PLAYBOOKS: [HintBinding; 8] = [
     HintBinding {
         key: "<-/->, h/l, Enter",
         desc: "focus playbooks/runs",
@@ -514,8 +523,12 @@ const HINTS_PLAYBOOKS: [HintBinding; 7] = [
         key: "PgUp/PgDn, End",
         desc: "scroll/follow logs",
     },
+    HintBinding {
+        key: "/",
+        desc: "filter focused list",
+    },
 ];
-const HINTS_PLAYBOOKS_LOG_SELECT: [HintBinding; 7] = [
+const HINTS_PLAYBOOKS_LOG_SELECT: [HintBinding; 8] = [
     HintBinding {
         key: "j/k, Up/Down",
         desc: "move log cursor",
@@ -544,8 +557,12 @@ const HINTS_PLAYBOOKS_LOG_SELECT: [HintBinding; 7] = [
         key: "r",
         desc: "run selected playbook",
     },
+    HintBinding {
+        key: "/",
+        desc: "filter focused list",
+    },
 ];
-const HINTS_TEMPLATES: [HintBinding; 7] = [
+const HINTS_TEMPLATES: [HintBinding; 8] = [
     HintBinding {
         key: "<-/->, h/l, Enter",
         desc: "focus templates/runs",
@@ -574,8 +591,12 @@ const HINTS_TEMPLATES: [HintBinding; 7] = [
         key: "v",
         desc: "log-select mode",
     },
+    HintBinding {
+        key: "/",
+        desc: "filter focused list",
+    },
 ];
-const HINTS_TEMPLATES_LOG_SELECT: [HintBinding; 6] = [
+const HINTS_TEMPLATES_LOG_SELECT: [HintBinding; 7] = [
     HintBinding {
         key: "j/k, Up/Down",
         desc: "move log cursor",
@@ -599,6 +620,10 @@ const HINTS_TEMPLATES_LOG_SELECT: [HintBinding; 6] = [
     HintBinding {
         key: "r",
         desc: "run selected template",
+    },
+    HintBinding {
+        key: "/",
+        desc: "filter focused list",
     },
 ];
 const HINTS_SETTINGS: [HintBinding; 6] = [
@@ -651,6 +676,24 @@ const HINTS_SETTINGS_TEXT: [HintBinding; 6] = [
     HintBinding {
         key: "Tab",
         desc: "switch view",
+    },
+];
+const HINTS_LIST_FILTER_EDIT: [HintBinding; 4] = [
+    HintBinding {
+        key: "Type",
+        desc: "edit filter query",
+    },
+    HintBinding {
+        key: "Backspace",
+        desc: "delete char",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "apply filter",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "clear filter",
     },
 ];
 
@@ -1054,14 +1097,17 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
         .split(area);
 
+    let filtered_project_indices = app.filtered_project_indices();
     let items = if app.projects.is_empty() {
         vec![ListItem::new("No projects configured.")]
+    } else if filtered_project_indices.is_empty() {
+        vec![ListItem::new("No projects match current filter.")]
     } else {
-        app.projects
+        filtered_project_indices
             .iter()
-            .enumerate()
-            .map(|(idx, project)| {
-                let active = if idx == app.active_project_idx {
+            .map(|idx| {
+                let project = &app.projects[*idx];
+                let active = if *idx == app.active_project_idx {
                     "*"
                 } else {
                     " "
@@ -1075,15 +1121,19 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(neutral_border_style())
-                .title("Projects"),
+                .title(filtered_list_title(
+                    "Projects",
+                    app.filter_query_for(FilterTarget::Projects),
+                    app.is_filter_editing_target(FilterTarget::Projects),
+                )),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
         .highlight_symbol(">> ");
-    let mut state = ListState::default().with_selected(if app.projects.is_empty() {
-        None
-    } else {
-        Some(app.project_idx)
-    });
+    let mut state = ListState::default().with_selected(
+        filtered_project_indices
+            .iter()
+            .position(|idx| *idx == app.project_idx),
+    );
     frame.render_stateful_widget(list, chunks[0], &mut state);
 
     let right = Layout::default()
@@ -1276,12 +1326,20 @@ fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::R
         .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
         .split(area);
 
+    let filtered_inventory_indices = app.filtered_inventory_indices();
     let items = if app.inventories.is_empty() {
         vec![ListItem::new("No inventories found under ./inventory")]
+    } else if filtered_inventory_indices.is_empty() {
+        vec![ListItem::new("No inventories match current filter")]
     } else {
-        app.inventories
+        filtered_inventory_indices
             .iter()
-            .map(|p| ListItem::new(display_path(app.active_project_root(), p)))
+            .map(|idx| {
+                ListItem::new(display_path(
+                    app.active_project_root(),
+                    &app.inventories[*idx],
+                ))
+            })
             .collect::<Vec<_>>()
     };
     let list = List::new(items)
@@ -1289,15 +1347,19 @@ fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::R
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(neutral_border_style())
-                .title("Inventories"),
+                .title(filtered_list_title(
+                    "Inventories",
+                    app.filter_query_for(FilterTarget::InventoryFiles),
+                    app.is_filter_editing_target(FilterTarget::InventoryFiles),
+                )),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
         .highlight_symbol(">> ");
-    let mut state = ListState::default().with_selected(if app.inventories.is_empty() {
-        None
-    } else {
-        Some(app.inventory_idx)
-    });
+    let mut state = ListState::default().with_selected(
+        filtered_inventory_indices
+            .iter()
+            .position(|idx| *idx == app.inventory_idx),
+    );
     frame.render_stateful_widget(list, chunks[0], &mut state);
 
     let right = Layout::default()
@@ -1811,14 +1873,22 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
         .split(chunks[0]);
 
+    let filtered_playbook_indices = app.filtered_playbook_indices();
     let items = if app.playbooks.is_empty() {
         vec![ListItem::new(
             "No playbooks found under ./playbooks or project root",
         )]
+    } else if filtered_playbook_indices.is_empty() {
+        vec![ListItem::new("No playbooks match current filter")]
     } else {
-        app.playbooks
+        filtered_playbook_indices
             .iter()
-            .map(|p| ListItem::new(display_path(app.active_project_root(), p)))
+            .map(|idx| {
+                ListItem::new(display_path(
+                    app.active_project_root(),
+                    &app.playbooks[*idx],
+                ))
+            })
             .collect::<Vec<_>>()
     };
     let focus_ctx = app.content_focus_context();
@@ -1837,22 +1907,36 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(playbooks_border_style)
-                .title("Playbooks"),
+                .title(filtered_list_title(
+                    "Playbooks",
+                    app.filter_query_for(FilterTarget::Playbooks),
+                    app.is_filter_editing_target(FilterTarget::Playbooks),
+                )),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
         .highlight_symbol(">> ");
-    let mut state = ListState::default().with_selected(if app.playbooks.is_empty() {
-        None
-    } else {
-        Some(app.playbook_idx)
-    });
+    let mut state = ListState::default().with_selected(
+        filtered_playbook_indices
+            .iter()
+            .position(|idx| *idx == app.playbook_idx),
+    );
     frame.render_stateful_widget(list, top[0], &mut state);
 
     let run_indices = app.run_indices_for_selected_playbook();
-    let run_items = if run_indices.is_empty() {
-        vec![ListItem::new(
-            "No runs yet for this playbook. Press r to run.",
-        )]
+    let run_items = if app.selected_playbook_display().is_none() {
+        vec![ListItem::new("No playbook selected")]
+    } else if run_indices.is_empty() {
+        if app
+            .filter_query_for(FilterTarget::PlaybookRuns)
+            .trim()
+            .is_empty()
+        {
+            vec![ListItem::new(
+                "No runs yet for this playbook. Press r to run.",
+            )]
+        } else {
+            vec![ListItem::new("No runs match current filter")]
+        }
     } else {
         run_indices
             .iter()
@@ -1877,9 +1961,10 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(runs_border_style)
-                .title(format!(
-                    "Runs For Selected Playbook ({})",
-                    app.active_project_name()
+                .title(filtered_list_title(
+                    &format!("Runs For Selected Playbook ({})", app.active_project_name()),
+                    app.filter_query_for(FilterTarget::PlaybookRuns),
+                    app.is_filter_editing_target(FilterTarget::PlaybookRuns),
                 )),
         )
         .highlight_style(Style::default().fg(th::GREEN))
@@ -1938,8 +2023,10 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .split(chunks[0]);
 
     let filtered_template_indices = app.filtered_template_indices();
-    let template_items = if filtered_template_indices.is_empty() {
+    let template_items = if app.job_templates.is_empty() {
         vec![ListItem::new("No templates found. Press n to create one.")]
+    } else if filtered_template_indices.is_empty() {
+        vec![ListItem::new("No templates match current filter")]
     } else {
         filtered_template_indices
             .iter()
@@ -1970,7 +2057,11 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 } else {
                     neutral_border_style()
                 })
-                .title("Templates"),
+                .title(filtered_list_title(
+                    "Templates",
+                    app.filter_query_for(FilterTarget::Templates),
+                    app.is_filter_editing_target(FilterTarget::Templates),
+                )),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
         .highlight_symbol(">> ");
@@ -1981,10 +2072,20 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_stateful_widget(template_list, top[0], &mut template_state);
 
     let template_run_indices = app.run_indices_for_selected_template();
-    let template_run_items = if template_run_indices.is_empty() {
-        vec![ListItem::new(
-            "No runs yet for this template. Press r to run.",
-        )]
+    let template_run_items = if app.selected_template().is_none() {
+        vec![ListItem::new("No template selected")]
+    } else if template_run_indices.is_empty() {
+        if app
+            .filter_query_for(FilterTarget::TemplateRuns)
+            .trim()
+            .is_empty()
+        {
+            vec![ListItem::new(
+                "No runs yet for this template. Press r to run.",
+            )]
+        } else {
+            vec![ListItem::new("No runs match current filter")]
+        }
     } else {
         template_run_indices
             .iter()
@@ -2013,7 +2114,11 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 } else {
                     neutral_border_style()
                 })
-                .title("Runs For Selected Template"),
+                .title(filtered_list_title(
+                    "Runs For Selected Template",
+                    app.filter_query_for(FilterTarget::TemplateRuns),
+                    app.is_filter_editing_target(FilterTarget::TemplateRuns),
+                )),
         )
         .highlight_style(Style::default().fg(th::GREEN))
         .highlight_symbol(">> ");
@@ -2286,6 +2391,21 @@ fn neutral_border_style() -> Style {
     Style::default()
         .fg(th::SURFACE0)
         .add_modifier(Modifier::DIM)
+}
+
+fn filtered_list_title(base: &str, query: &str, editing: bool) -> String {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        if editing {
+            format!("{base} (/|)")
+        } else {
+            base.to_string()
+        }
+    } else if editing {
+        format!("{base} (/{trimmed}|)")
+    } else {
+        format!("{base} (/{trimmed})")
+    }
 }
 
 fn focus_context_label(context: FocusContext) -> &'static str {
@@ -4183,6 +4303,12 @@ fn active_help_model(app: &App) -> HelpModel {
             hints: &HINTS_INVENTORY_EDITOR,
         };
     }
+    if app.filter_edit_mode {
+        return HelpModel {
+            title: "List Filter",
+            hints: &HINTS_LIST_FILTER_EDIT,
+        };
+    }
     if app.current_view() == View::Settings && app.global_settings_text_mode {
         return HelpModel {
             title: "Global Settings Text Edit",
@@ -4317,6 +4443,7 @@ fn help_toggle_available(app: &App) -> bool {
     !(app.vault_runtime_prompt_open
         || (app.settings_editor_open && app.settings_editor_text_mode)
         || (app.template_editor_open && app.template_editor_text_mode)
+        || app.filter_edit_mode
         || app.project_ssh_open
         || app.vault_create_open
         || app.vault_edit_open

@@ -19,6 +19,7 @@ Foundation-first Rust TUI for Ansible operations.
 - Runtime picker with managed Ansible bootstrap
 - Side-by-side main panel and live logs
 - Per-playbook run history list embedded in Playbooks tab
+- Per-project UI session restore (active view, focused pane, selected items, list filters)
 - Inventory management panel with details/preview plus create/delete actions
 - In-app inventory editor with save/discard flow
 - Guided YAML inventory builder (filename + host/group lists + dynamic assignment -> preview/save)
@@ -35,6 +36,7 @@ Foundation-first Rust TUI for Ansible operations.
 - `Tab`: switch view (or move to next field in vault password prompt)
 - `h`/`l`: switch view (except in split/field-focused contexts where they move focus or adjust values)
 - `j`/`k` or `Up`/`Down`: move selection in the focused list
+- `/` (Projects/Inventory Files/Playbooks/Templates lists and run lists): start list filter edit (`Enter` apply, `Esc` clear)
 - `n` (Inventory tab): create a new inventory file under `./inventories`
 - `g` (Inventory tab): open guided YAML inventory builder (new inventory)
 - `e` (Inventory tab): choose edit mode for selected inventory (guided, external `$VISUAL/$EDITOR`/`vim`, or built-in raw text editor)

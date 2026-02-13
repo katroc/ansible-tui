@@ -37,6 +37,7 @@ use crate::run_store::{
     load_runs, migrate_unstable_hash_history, save_run, take_legacy_environment_migration_notice,
 };
 use crate::secrets::{SecretEnforcementMode, VaultSourceType};
+use crate::ui_session::{load_ui_session_state, save_ui_session_state, UiSessionState};
 
 const MAX_LOG_LINES: usize = 1_000;
 const MAX_RUNTIME_LOG_LINES: usize = 120;
@@ -215,6 +216,26 @@ pub enum FocusContext {
     TemplatesRuns,
     TemplatesLogSelect,
     Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterTarget {
+    Projects,
+    InventoryFiles,
+    Playbooks,
+    PlaybookRuns,
+    Templates,
+    TemplateRuns,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListFilters {
+    pub projects: String,
+    pub inventory_files: String,
+    pub playbooks: String,
+    pub playbook_runs: String,
+    pub templates: String,
+    pub template_runs: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +440,10 @@ pub struct App {
     pub global_settings_text_mode: bool,
     pub global_settings_text_buffer: String,
     pub secret_enforcement_mode: SecretEnforcementMode,
+    pub list_filters: ListFilters,
+    pub filter_edit_mode: bool,
+    pub filter_edit_target: Option<FilterTarget>,
+    pub filter_edit_buffer: String,
     // Template state
     pub job_templates: Vec<JobTemplate>,
     pub template_idx: usize,
@@ -568,6 +593,10 @@ impl App {
             global_settings_text_mode: false,
             global_settings_text_buffer: String::new(),
             secret_enforcement_mode,
+            list_filters: ListFilters::default(),
+            filter_edit_mode: false,
+            filter_edit_target: None,
+            filter_edit_buffer: String::new(),
             job_templates: Vec::new(),
             template_idx: 0,
             templates_focus_runs: false,
@@ -798,6 +827,87 @@ impl App {
         }
     }
 
+    fn capture_ui_session_state(&self) -> UiSessionState {
+        UiSessionState {
+            view_idx: self.view_idx,
+            playbooks_focus_runs: self.playbooks_focus_runs,
+            templates_focus_runs: self.templates_focus_runs,
+            log_select_mode: self.log_select_mode,
+            selected_inventory: self
+                .inventories
+                .get(self.inventory_idx)
+                .map(|path| display_path(self.active_project_root(), path)),
+            selected_playbook: self
+                .playbooks
+                .get(self.playbook_idx)
+                .map(|path| display_path(self.active_project_root(), path)),
+            selected_template_id: self.selected_template().map(|template| template.id.clone()),
+            selected_run_id: self.runs.get(self.run_idx).map(|run| run.id),
+            projects_filter: self.list_filters.projects.clone(),
+            inventory_files_filter: self.list_filters.inventory_files.clone(),
+            playbooks_filter: self.list_filters.playbooks.clone(),
+            playbook_runs_filter: self.list_filters.playbook_runs.clone(),
+            templates_filter: self.list_filters.templates.clone(),
+            template_runs_filter: self.list_filters.template_runs.clone(),
+        }
+    }
+
+    fn persist_ui_session_state_for_active_project(&mut self) {
+        let state = self.capture_ui_session_state();
+        if let Err(err) = save_ui_session_state(self.active_project_root(), &state) {
+            self.status_line = format!("ui session save failed: {err}");
+        }
+    }
+
+    fn restore_ui_session_state(&mut self) {
+        let loaded = load_ui_session_state(self.active_project_root());
+        let Ok(Some(state)) = loaded else {
+            return;
+        };
+        let max_view = View::all().len().saturating_sub(1);
+        self.view_idx = state.view_idx.min(max_view);
+        self.playbooks_focus_runs = state.playbooks_focus_runs;
+        self.templates_focus_runs = state.templates_focus_runs;
+        self.log_select_mode = state.log_select_mode;
+        self.list_filters.projects = state.projects_filter;
+        self.list_filters.inventory_files = state.inventory_files_filter;
+        self.list_filters.playbooks = state.playbooks_filter;
+        self.list_filters.playbook_runs = state.playbook_runs_filter;
+        self.list_filters.templates = state.templates_filter;
+        self.list_filters.template_runs = state.template_runs_filter;
+
+        if let Some(selected_inventory) = state.selected_inventory {
+            if let Some(idx) = self.inventories.iter().position(|path| {
+                display_path(self.active_project_root(), path) == selected_inventory
+            }) {
+                self.inventory_idx = idx;
+            }
+        }
+        if let Some(selected_playbook) = state.selected_playbook {
+            if let Some(idx) = self.playbooks.iter().position(|path| {
+                display_path(self.active_project_root(), path) == selected_playbook
+            }) {
+                self.playbook_idx = idx;
+            }
+        }
+        if let Some(selected_template_id) = state.selected_template_id {
+            if let Some(idx) = self
+                .job_templates
+                .iter()
+                .position(|template| template.id == selected_template_id)
+            {
+                self.template_idx = idx;
+            }
+        }
+        if let Some(run_id) = state.selected_run_id {
+            if let Some(idx) = self.runs.iter().position(|run| run.id == run_id) {
+                self.run_idx = idx;
+            }
+        }
+
+        self.sync_selection_to_filters();
+    }
+
     fn load_active_project_state(&mut self) {
         self.playbooks_focus_runs = false;
         self.templates_focus_runs = false;
@@ -845,6 +955,10 @@ impl App {
         self.vault_password_create_buffer_confirm.clear();
         self.vault_password_create_target_root = None;
         self.project_ssh_target_root = None;
+        self.list_filters = ListFilters::default();
+        self.filter_edit_mode = false;
+        self.filter_edit_target = None;
+        self.filter_edit_buffer.clear();
         self.inventory_idx = 0;
         self.playbook_idx = 0;
         self.run_idx = 0;
@@ -858,6 +972,7 @@ impl App {
         self.restore_ansible_cfg_settings();
         self.restore_history();
         self.restore_job_templates();
+        self.restore_ui_session_state();
         self.refresh_runtime_candidates();
     }
 
@@ -865,6 +980,7 @@ impl App {
         if idx >= self.projects.len() {
             return;
         }
+        self.persist_ui_session_state_for_active_project();
         self.active_project_idx = idx;
         self.project_idx = idx;
         self.load_active_project_state();
@@ -963,6 +1079,8 @@ impl App {
                 if self.help_overlay_open {
                     self.help_overlay_open = false;
                     self.status_line = String::from("Keyboard help closed");
+                } else if self.filter_edit_mode {
+                    self.cancel_filter_edit_clear();
                 } else if self.vault_runtime_prompt_open {
                     self.cancel_vault_runtime_prompt();
                 } else if self.template_editor_open {
@@ -1022,6 +1140,8 @@ impl App {
             Action::SelectRuntimeCandidate => {
                 if self.vault_runtime_prompt_open {
                     self.confirm_vault_runtime_prompt(tx);
+                } else if self.filter_edit_mode {
+                    self.confirm_filter_edit();
                 } else if self.template_editor_open {
                     self.confirm_template_editor();
                 } else if self.settings_editor_open {
@@ -1273,6 +1393,7 @@ impl App {
             && !self.inventory_editor_open
             && !self.inventory_edit_mode_open
             && !self.runtime_prompt_open
+            && !self.filter_edit_mode
             && !(self.current_view() == View::Settings && self.global_settings_text_mode)
     }
 
@@ -1553,6 +1674,14 @@ impl App {
         }
         if self.current_view() == View::Settings && self.global_settings_text_mode {
             self.push_global_settings_text_char(ch);
+            return;
+        }
+        if ch == '/' && !self.filter_edit_mode {
+            self.begin_filter_edit();
+            return;
+        }
+        if self.filter_edit_mode {
+            self.push_filter_edit_char(ch);
             return;
         }
 
@@ -2023,6 +2152,7 @@ impl App {
         self.vault_runtime_prompt_open
             || (self.settings_editor_open && self.settings_editor_text_mode)
             || (self.template_editor_open && self.template_editor_text_mode)
+            || self.filter_edit_mode
             || self.project_ssh_open
             || self.vault_create_open
             || self.vault_edit_open
@@ -2037,6 +2167,10 @@ impl App {
     }
 
     fn handle_backspace(&mut self) {
+        if self.filter_edit_mode {
+            self.backspace_filter_edit();
+            return;
+        }
         if self.vault_runtime_prompt_open {
             self.backspace_vault_runtime_prompt();
             return;
@@ -2096,6 +2230,132 @@ impl App {
         if self.current_view() == View::Settings && self.global_settings_text_mode {
             self.global_settings_text_buffer.pop();
         }
+    }
+
+    fn begin_filter_edit(&mut self) {
+        let Some(target) = self.current_filter_target_from_focus() else {
+            self.status_line = String::from("Filtering is not available in this context");
+            return;
+        };
+        self.filter_edit_mode = true;
+        self.filter_edit_target = Some(target);
+        self.filter_edit_buffer = self.filter_query_for(target).to_string();
+        self.status_line = format!(
+            "Filtering {}: type to refine, Enter apply, Esc clear",
+            Self::filter_target_label(target)
+        );
+    }
+
+    fn current_filter_target_from_focus(&self) -> Option<FilterTarget> {
+        match self.current_view() {
+            View::Projects => Some(FilterTarget::Projects),
+            View::Inventory => {
+                if matches!(self.inventory_sub_tab, InventorySubTab::Files) {
+                    Some(FilterTarget::InventoryFiles)
+                } else {
+                    None
+                }
+            }
+            View::Playbooks => {
+                if self.log_select_mode || self.playbooks_focus_runs {
+                    Some(FilterTarget::PlaybookRuns)
+                } else {
+                    Some(FilterTarget::Playbooks)
+                }
+            }
+            View::Templates => {
+                if self.log_select_mode || self.templates_focus_runs {
+                    Some(FilterTarget::TemplateRuns)
+                } else {
+                    Some(FilterTarget::Templates)
+                }
+            }
+            View::Dashboard | View::Settings => None,
+        }
+    }
+
+    fn filter_query_mut(&mut self, target: FilterTarget) -> &mut String {
+        match target {
+            FilterTarget::Projects => &mut self.list_filters.projects,
+            FilterTarget::InventoryFiles => &mut self.list_filters.inventory_files,
+            FilterTarget::Playbooks => &mut self.list_filters.playbooks,
+            FilterTarget::PlaybookRuns => &mut self.list_filters.playbook_runs,
+            FilterTarget::Templates => &mut self.list_filters.templates,
+            FilterTarget::TemplateRuns => &mut self.list_filters.template_runs,
+        }
+    }
+
+    pub fn filter_query_for(&self, target: FilterTarget) -> &str {
+        match target {
+            FilterTarget::Projects => &self.list_filters.projects,
+            FilterTarget::InventoryFiles => &self.list_filters.inventory_files,
+            FilterTarget::Playbooks => &self.list_filters.playbooks,
+            FilterTarget::PlaybookRuns => &self.list_filters.playbook_runs,
+            FilterTarget::Templates => &self.list_filters.templates,
+            FilterTarget::TemplateRuns => &self.list_filters.template_runs,
+        }
+    }
+
+    pub fn is_filter_editing_target(&self, target: FilterTarget) -> bool {
+        self.filter_edit_mode && self.filter_edit_target == Some(target)
+    }
+
+    fn filter_target_label(target: FilterTarget) -> &'static str {
+        match target {
+            FilterTarget::Projects => "projects",
+            FilterTarget::InventoryFiles => "inventory files",
+            FilterTarget::Playbooks => "playbooks",
+            FilterTarget::PlaybookRuns => "playbook runs",
+            FilterTarget::Templates => "templates",
+            FilterTarget::TemplateRuns => "template runs",
+        }
+    }
+
+    fn push_filter_edit_char(&mut self, ch: char) {
+        if ch.is_control() {
+            return;
+        }
+        self.filter_edit_buffer.push(ch);
+        self.apply_filter_edit_buffer();
+    }
+
+    fn backspace_filter_edit(&mut self) {
+        self.filter_edit_buffer.pop();
+        self.apply_filter_edit_buffer();
+    }
+
+    fn apply_filter_edit_buffer(&mut self) {
+        let Some(target) = self.filter_edit_target else {
+            return;
+        };
+        *self.filter_query_mut(target) = self.filter_edit_buffer.clone();
+        self.sync_selection_to_filters();
+    }
+
+    fn confirm_filter_edit(&mut self) {
+        let Some(target) = self.filter_edit_target else {
+            self.filter_edit_mode = false;
+            self.filter_edit_buffer.clear();
+            return;
+        };
+        self.filter_edit_mode = false;
+        self.filter_edit_target = None;
+        self.filter_edit_buffer.clear();
+        self.status_line = format!("Filter applied for {}", Self::filter_target_label(target));
+    }
+
+    fn cancel_filter_edit_clear(&mut self) {
+        let Some(target) = self.filter_edit_target else {
+            self.filter_edit_mode = false;
+            self.filter_edit_buffer.clear();
+            return;
+        };
+        self.filter_edit_mode = false;
+        self.filter_edit_target = None;
+        self.filter_edit_buffer.clear();
+        self.filter_query_mut(target).clear();
+        self.sync_selection_to_filters();
+        self.status_line = format!("Filter cleared for {}", Self::filter_target_label(target));
     }
 
     fn confirm_settings_editor(&mut self) {
@@ -2387,18 +2647,39 @@ impl App {
     fn move_selection_up(&mut self) {
         match self.current_view() {
             View::Projects => {
-                self.project_idx = self.project_idx.saturating_sub(1);
+                let filtered = self.filtered_project_indices();
+                if let Some(pos) = filtered.iter().position(|idx| *idx == self.project_idx) {
+                    if pos > 0 {
+                        self.project_idx = filtered[pos - 1];
+                    }
+                } else if let Some(first) = filtered.first() {
+                    self.project_idx = *first;
+                }
                 self.pending_project_delete = None;
             }
             View::Inventory => {
-                self.inventory_idx = self.inventory_idx.saturating_sub(1);
+                let filtered = self.filtered_inventory_indices();
+                if let Some(pos) = filtered.iter().position(|idx| *idx == self.inventory_idx) {
+                    if pos > 0 {
+                        self.inventory_idx = filtered[pos - 1];
+                    }
+                } else if let Some(first) = filtered.first() {
+                    self.inventory_idx = *first;
+                }
                 self.pending_inventory_delete = None;
             }
             View::Playbooks => {
                 if self.playbooks_focus_runs {
                     self.move_selected_playbook_run(-1, false);
                 } else {
-                    self.playbook_idx = self.playbook_idx.saturating_sub(1);
+                    let filtered = self.filtered_playbook_indices();
+                    if let Some(pos) = filtered.iter().position(|idx| *idx == self.playbook_idx) {
+                        if pos > 0 {
+                            self.playbook_idx = filtered[pos - 1];
+                        }
+                    } else if let Some(first) = filtered.first() {
+                        self.playbook_idx = *first;
+                    }
                     self.sync_run_selection_to_selected_playbook();
                 }
             }
@@ -2411,6 +2692,8 @@ impl App {
                         if pos > 0 {
                             self.template_idx = filtered[pos - 1];
                         }
+                    } else if let Some(first) = filtered.first() {
+                        self.template_idx = *first;
                     }
                     self.pending_template_delete = None;
                     self.sync_run_selection_to_selected_template();
@@ -2423,14 +2706,24 @@ impl App {
     fn move_selection_down(&mut self) {
         match self.current_view() {
             View::Projects => {
-                if !self.projects.is_empty() {
-                    self.project_idx = min(self.project_idx + 1, self.projects.len() - 1);
+                let filtered = self.filtered_project_indices();
+                if let Some(pos) = filtered.iter().position(|idx| *idx == self.project_idx) {
+                    if pos + 1 < filtered.len() {
+                        self.project_idx = filtered[pos + 1];
+                    }
+                } else if let Some(first) = filtered.first() {
+                    self.project_idx = *first;
                 }
                 self.pending_project_delete = None;
             }
             View::Inventory => {
-                if !self.inventories.is_empty() {
-                    self.inventory_idx = min(self.inventory_idx + 1, self.inventories.len() - 1);
+                let filtered = self.filtered_inventory_indices();
+                if let Some(pos) = filtered.iter().position(|idx| *idx == self.inventory_idx) {
+                    if pos + 1 < filtered.len() {
+                        self.inventory_idx = filtered[pos + 1];
+                    }
+                } else if let Some(first) = filtered.first() {
+                    self.inventory_idx = *first;
                 }
                 self.pending_inventory_delete = None;
             }
@@ -2438,8 +2731,13 @@ impl App {
                 if self.playbooks_focus_runs {
                     self.move_selected_playbook_run(1, false);
                 } else {
-                    if !self.playbooks.is_empty() {
-                        self.playbook_idx = min(self.playbook_idx + 1, self.playbooks.len() - 1);
+                    let filtered = self.filtered_playbook_indices();
+                    if let Some(pos) = filtered.iter().position(|idx| *idx == self.playbook_idx) {
+                        if pos + 1 < filtered.len() {
+                            self.playbook_idx = filtered[pos + 1];
+                        }
+                    } else if let Some(first) = filtered.first() {
+                        self.playbook_idx = *first;
                     }
                     self.sync_run_selection_to_selected_playbook();
                 }
@@ -4616,7 +4914,7 @@ impl App {
                         .any(|path| display_path(&project_root, path) == *inventory)
             });
         self.ensure_settings_for_playbooks();
-        self.sync_run_selection_to_selected_playbook();
+        self.sync_selection_to_filters();
     }
 
     fn open_inventory_editor(&mut self) {
@@ -5751,6 +6049,7 @@ impl App {
     }
 
     fn request_quit(&mut self) {
+        self.persist_ui_session_state_for_active_project();
         self.persist_all_runs();
         self.should_quit = true;
     }
@@ -5959,6 +6258,110 @@ impl App {
         }
     }
 
+    fn text_matches_filter(haystack: &str, query: &str) -> bool {
+        let q = query.trim();
+        if q.is_empty() {
+            return true;
+        }
+        haystack
+            .to_ascii_lowercase()
+            .contains(&q.to_ascii_lowercase())
+    }
+
+    pub fn filtered_project_indices(&self) -> Vec<usize> {
+        self.projects
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, project)| {
+                let root = display_path(&self.cwd, &project.root);
+                let search = format!("{} {root}", project.name);
+                if Self::text_matches_filter(&search, &self.list_filters.projects) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn filtered_inventory_indices(&self) -> Vec<usize> {
+        self.inventories
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, path)| {
+                let display = display_path(self.active_project_root(), path);
+                if Self::text_matches_filter(&display, &self.list_filters.inventory_files) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn filtered_playbook_indices(&self) -> Vec<usize> {
+        self.playbooks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, path)| {
+                let display = display_path(self.active_project_root(), path);
+                if Self::text_matches_filter(&display, &self.list_filters.playbooks) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn sync_selection_to_filters(&mut self) {
+        let project_matches = self.filtered_project_indices();
+        if project_matches.is_empty() {
+            self.project_idx = self.projects.len();
+        } else if !project_matches.contains(&self.project_idx) {
+            self.project_idx = project_matches[0];
+        }
+
+        let inventory_matches = self.filtered_inventory_indices();
+        if inventory_matches.is_empty() {
+            self.inventory_idx = self.inventories.len();
+        } else if !inventory_matches.contains(&self.inventory_idx) {
+            self.inventory_idx = inventory_matches[0];
+        }
+
+        let playbook_matches = self.filtered_playbook_indices();
+        if playbook_matches.is_empty() {
+            self.playbook_idx = self.playbooks.len();
+            if self.current_view() == View::Playbooks {
+                self.run_idx = self.runs.len();
+                self.log_cursor = 0;
+                self.log_anchor = None;
+            }
+        } else if !playbook_matches.contains(&self.playbook_idx) {
+            self.playbook_idx = playbook_matches[0];
+        }
+
+        let template_matches = self.filtered_template_indices();
+        if template_matches.is_empty() {
+            self.template_idx = self.job_templates.len();
+            if self.current_view() == View::Templates {
+                self.run_idx = self.runs.len();
+                self.log_cursor = 0;
+                self.log_anchor = None;
+            }
+        } else if !template_matches.contains(&self.template_idx) {
+            self.template_idx = template_matches[0];
+        }
+
+        if self.current_view() == View::Playbooks {
+            self.sync_run_selection_to_selected_playbook();
+        } else if self.current_view() == View::Templates {
+            self.sync_run_selection_to_selected_template();
+        } else if self.run_idx >= self.runs.len() {
+            self.run_idx = self.runs.len();
+        }
+    }
+
     fn selected_playbook_key(&self) -> Option<String> {
         let project_root = self.active_project_root();
         self.playbooks
@@ -6134,13 +6537,29 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(idx, run)| {
-                if run.playbook == playbook {
+                if run.playbook == playbook && self.playbook_run_matches_filter(run) {
                     Some(idx)
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    fn playbook_run_matches_filter(&self, run: &RunRecord) -> bool {
+        let code = run
+            .exit_code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| String::from("-"));
+        let haystack = format!(
+            "{} {} {} {} {}",
+            run.id,
+            run.status.as_str(),
+            code,
+            run.inventory,
+            run.started_at.format("%Y-%m-%d %H:%M:%S")
+        );
+        Self::text_matches_filter(&haystack, &self.list_filters.playbook_runs)
     }
 
     fn sync_run_selection_to_selected_playbook(&mut self) {
@@ -6150,18 +6569,7 @@ impl App {
             self.log_cursor = 0;
             return;
         };
-        let indices = self
-            .runs
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, run)| {
-                if run.playbook == playbook {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let indices = self.run_indices_for_selected_playbook();
         if indices.is_empty() {
             self.run_idx = self.runs.len();
             self.log_anchor = None;
@@ -6292,7 +6700,14 @@ impl App {
         self.job_templates
             .iter()
             .enumerate()
-            .map(|(i, _)| i)
+            .filter_map(|(idx, template)| {
+                let search = format!("{} {}", template.name, template.playbook);
+                if Self::text_matches_filter(&search, &self.list_filters.templates) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -6309,13 +6724,30 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(idx, run)| {
-                if run.template_id.as_deref() == Some(tid) {
+                if run.template_id.as_deref() == Some(tid) && self.template_run_matches_filter(run)
+                {
                     Some(idx)
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    fn template_run_matches_filter(&self, run: &RunRecord) -> bool {
+        let code = run
+            .exit_code
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| String::from("-"));
+        let haystack = format!(
+            "{} {} {} {} {}",
+            run.id,
+            run.status.as_str(),
+            code,
+            run.inventory,
+            run.started_at.format("%Y-%m-%d %H:%M:%S")
+        );
+        Self::text_matches_filter(&haystack, &self.list_filters.template_runs)
     }
 
     fn sync_run_selection_to_selected_template(&mut self) {
@@ -8160,5 +8592,54 @@ all:
         app.update(Action::SettingsIncrease, &tx);
 
         assert!(app.playbooks_focus_runs);
+    }
+
+    #[test]
+    fn slash_filter_updates_playbook_selection() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("slash_playbook_filter");
+        app.view_idx = 3;
+        app.runtime_prompt_open = false;
+        app.playbooks_focus_runs = false;
+        app.playbooks = vec![
+            app.active_project_root().join("playbooks/alpha.yml"),
+            app.active_project_root().join("playbooks/beta.yml"),
+        ];
+        app.playbook_idx = 0;
+
+        app.update(Action::CharInput('/'), &tx);
+        assert!(app.filter_edit_mode);
+        assert_eq!(app.filter_edit_target, Some(FilterTarget::Playbooks));
+
+        for ch in "beta".chars() {
+            app.update(Action::CharInput(ch), &tx);
+        }
+
+        let filtered = app.filtered_playbook_indices();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(app.playbook_idx, filtered[0]);
+
+        app.update(Action::SelectRuntimeCandidate, &tx);
+        assert!(!app.filter_edit_mode);
+        assert_eq!(app.list_filters.playbooks, "beta");
+    }
+
+    #[test]
+    fn esc_clears_active_filter() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("clear_filter");
+        app.view_idx = 3;
+        app.runtime_prompt_open = false;
+        app.playbooks_focus_runs = false;
+        app.playbooks = vec![app.active_project_root().join("playbooks/site.yml")];
+
+        app.update(Action::CharInput('/'), &tx);
+        app.update(Action::CharInput('s'), &tx);
+        assert!(app.filter_edit_mode);
+        assert_eq!(app.list_filters.playbooks, "s");
+
+        app.update(Action::CloseRuntimePrompt, &tx);
+        assert!(!app.filter_edit_mode);
+        assert!(app.list_filters.playbooks.is_empty());
     }
 }

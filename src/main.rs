@@ -12,6 +12,7 @@ mod run_store;
 mod secrets;
 mod theme;
 mod ui;
+mod ui_session;
 
 use std::io;
 use std::path::PathBuf;
