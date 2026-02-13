@@ -5,6 +5,11 @@ pub const MAUVE: Color = Color::Rgb(203, 166, 247);
 pub const RED: Color = Color::Rgb(243, 139, 168);
 pub const YELLOW: Color = Color::Rgb(249, 226, 175);
 pub const GREEN: Color = Color::Rgb(166, 227, 161);
+#[allow(dead_code)]
+pub const BLUE: Color = Color::Rgb(137, 180, 250);
+#[allow(dead_code)]
+pub const PEACH: Color = Color::Rgb(250, 179, 135);
+pub const OVERLAY0: Color = Color::Rgb(108, 112, 134);
 
 pub const TEXT: Color = Color::Rgb(205, 214, 244);
 pub const SUBTEXT1: Color = Color::Rgb(186, 194, 222);

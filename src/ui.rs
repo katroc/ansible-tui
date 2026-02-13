@@ -5,8 +5,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    BarChart, Block, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row,
-    Sparkline, Table, TableState, Tabs, Wrap,
+    BarChart, Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph,
+    Row, Sparkline, Table, TableState, Tabs, Wrap,
 };
 use ratatui::Frame;
 
@@ -789,6 +789,7 @@ fn render_tabs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .style(Style::default().bg(th::MANTLE).fg(th::SUBTEXT1))
                 .title("Ansible TUI"),
@@ -954,6 +955,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Runtime Health"),
         )
@@ -977,6 +979,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Success Rate"),
         )
@@ -993,6 +996,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Playbook Coverage"),
         )
@@ -1019,6 +1023,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Job Status Breakdown"),
         )
@@ -1043,6 +1048,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Run Outcomes (40)"),
         )
@@ -1056,6 +1062,7 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Run Volume (14d)"),
         )
@@ -1120,6 +1127,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title(filtered_list_title(
                     "Projects",
@@ -1240,6 +1248,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .style(Style::default().bg(th::BASE))
                 .title("Project Details"),
@@ -1264,6 +1273,7 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(if app.project_sync_running {
                     Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                 } else {
@@ -1346,6 +1356,7 @@ fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::R
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title(filtered_list_title(
                     "Inventories",
@@ -1376,6 +1387,7 @@ fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::R
     .block(
         Block::default()
             .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
             .border_style(neutral_border_style())
             .style(Style::default().bg(th::BASE))
             .title("Inventory Details"),
@@ -1389,6 +1401,7 @@ fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::R
     .block(
         Block::default()
             .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
             .border_style(neutral_border_style())
             .title("File Preview"),
     )
@@ -1431,6 +1444,7 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(list_border)
                 .title(format!("Hosts{dirty_marker}")),
         )
@@ -1535,6 +1549,7 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(detail_border)
                     .title(format!("Host: {host}")),
             )
@@ -1563,6 +1578,7 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(detail_border)
                     .title("Host Detail"),
             )
@@ -1582,6 +1598,7 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
         let input = Paragraph::new(val).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
                 .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
                 .title("New Host Name"),
@@ -1600,6 +1617,7 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
         let input = Paragraph::new(val).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
                 .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
                 .title("New Variable Name"),
@@ -1701,6 +1719,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(tree_border)
                 .title(format!("Group Tree{dirty_marker}")),
         )
@@ -1758,6 +1777,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(groups_border)
                 .title(format!("Groups (target: {target_label})")),
         )
@@ -1813,6 +1833,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(hosts_border)
                 .title("Hosts"),
         )
@@ -1837,6 +1858,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         let input = Paragraph::new(val).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
                 .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
                 .title("New Group Name"),
@@ -1855,6 +1877,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
         let input = Paragraph::new(val).block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
                 .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
                 .title("New Host Name"),
@@ -1906,6 +1929,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(playbooks_border_style)
                 .title(filtered_list_title(
                     "Playbooks",
@@ -1960,6 +1984,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(runs_border_style)
                 .title(filtered_list_title(
                     &format!("Runs For Selected Playbook ({})", app.active_project_name()),
@@ -1991,6 +2016,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(neutral_border_style())
                     .style(Style::default().bg(th::BASE))
                     .title("Playbook Settings"),
@@ -2004,6 +2030,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Playbook Settings"),
         );
@@ -2052,6 +2079,7 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(if matches!(focus_ctx, FocusContext::TemplatesList) {
                     Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                 } else {
@@ -2109,6 +2137,7 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(if matches!(focus_ctx, FocusContext::TemplatesRuns) {
                     Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
                 } else {
@@ -2155,6 +2184,7 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .style(Style::default().bg(th::BASE))
                 .title("Template Settings"),
@@ -2259,6 +2289,7 @@ fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(border_style)
                 .title(title),
         )
@@ -2308,6 +2339,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(th::FOCUS_BORDER))
             .style(Style::default().bg(th::MANTLE))
             .title("Keyboard Help"),
@@ -2337,6 +2369,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
     let body = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
             .border_style(neutral_border_style())
             .style(Style::default().bg(th::BASE)),
     );
@@ -2389,9 +2422,10 @@ fn hint_bar_style() -> Style {
 
 fn neutral_border_style() -> Style {
     Style::default()
-        .fg(th::SURFACE0)
+        .fg(th::OVERLAY0)
         .add_modifier(Modifier::DIM)
 }
+
 
 fn filtered_list_title(base: &str, query: &str, editing: bool) -> String {
     let trimmed = query.trim();
@@ -2551,6 +2585,7 @@ fn render_settings(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
             .border_style(neutral_border_style())
             .style(Style::default().bg(th::BASE))
             .title("Global Settings"),
@@ -2729,7 +2764,8 @@ fn render_runtime_prompt(frame: &mut Frame, app: &App) {
     let header = Paragraph::new(
         "Select an existing Ansible runtime below, or press b to install a managed runtime in ./.ansible-tui/runtime.",
     )
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(Block::default().borders(Borders::ALL)
+                .border_type(BorderType::Rounded).title(title))
         .wrap(Wrap { trim: true });
     frame.render_widget(header, chunks[1]);
 
@@ -2754,6 +2790,7 @@ fn render_runtime_prompt(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Candidates"),
         )
@@ -2787,6 +2824,7 @@ fn render_runtime_prompt(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Setup Logs"),
         )
@@ -2801,6 +2839,7 @@ fn render_project_create_prompt(frame: &mut Frame, app: &App) {
 
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(th::MAUVE))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title(app.project_create_mode.title());
@@ -2891,6 +2930,7 @@ fn render_project_create_prompt(frame: &mut Frame, app: &App) {
         };
         let block = Block::default()
             .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
             .border_style(if focused {
                 Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
             } else {
@@ -2917,6 +2957,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
 
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(th::MAUVE))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title("Project Secret Settings");
@@ -2967,6 +3008,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if file_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -2999,6 +3041,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if inline_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3025,6 +3068,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(if source_focused {
                     Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                 } else {
@@ -3053,6 +3097,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if vault_file_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3081,6 +3126,7 @@ fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if vault_id_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3104,6 +3150,7 @@ fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
 
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(th::MAUVE))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title("Create New Encrypted Vault File");
@@ -3153,6 +3200,7 @@ fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if path_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3185,6 +3233,7 @@ fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if content_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3222,6 +3271,7 @@ fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(neutral_border_style())
                     .title("Auth Source (from Project Secret Settings)"),
             )
@@ -3242,6 +3292,7 @@ fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
 
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(th::MAUVE))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title("Create Vault Password File");
@@ -3291,6 +3342,7 @@ fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if path_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3317,6 +3369,7 @@ fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if password_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3343,6 +3396,7 @@ fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if confirm_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3367,6 +3421,7 @@ fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
 
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(th::MAUVE))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title("Edit Encrypted Vault File");
@@ -3416,6 +3471,7 @@ fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if path_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3448,6 +3504,7 @@ fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if content_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3489,6 +3546,7 @@ fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(if app.vault_edit_loading {
                     Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                 } else {
@@ -3514,6 +3572,7 @@ fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
 
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(th::MAUVE))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title("Vault Password (Prompt Mode)");
@@ -3565,6 +3624,7 @@ fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                     .border_style(if password_focused {
                         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                     } else {
@@ -3592,6 +3652,7 @@ fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                         .border_style(if confirm_focused {
                             Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                         } else {
@@ -3625,6 +3686,7 @@ fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
 
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(th::MAUVE))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title("Create Inventory");
@@ -3656,6 +3718,7 @@ fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(th::YELLOW))
                 .title("Filename"),
         )
@@ -3673,6 +3736,7 @@ fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
 
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(th::MAUVE))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title("Edit Inventory Mode");
@@ -3708,6 +3772,7 @@ fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Choose Mode"),
         )
@@ -3737,6 +3802,7 @@ fn render_inventory_editor(frame: &mut Frame, app: &App) {
     };
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title(title);
@@ -3764,6 +3830,7 @@ fn render_inventory_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style()),
         )
         .style(Style::default().fg(th::TEXT).bg(th::BASE));
@@ -3778,6 +3845,7 @@ fn render_inventory_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Content"),
         )
@@ -3800,6 +3868,7 @@ fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
     };
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title("Playbook Settings");
@@ -3841,6 +3910,7 @@ fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style()),
         )
         .style(Style::default().fg(th::TEXT).bg(th::BASE));
@@ -3861,6 +3931,7 @@ fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .style(Style::default().fg(th::TEXT).bg(th::BASE))
                 .title("Fields"),
@@ -3893,6 +3964,7 @@ fn render_template_editor(frame: &mut Frame, app: &App) {
     };
     let wrapper = Block::default()
         .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
         .title(title);
@@ -3943,6 +4015,7 @@ fn render_template_editor(frame: &mut Frame, app: &App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
             .border_style(neutral_border_style()),
     )
     .style(Style::default().fg(th::TEXT).bg(th::BASE));
@@ -3962,6 +4035,7 @@ fn render_template_editor(frame: &mut Frame, app: &App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .style(Style::default().fg(th::TEXT).bg(th::BASE))
                 .title("Template Fields"),
@@ -4759,6 +4833,7 @@ fn dashboard_stat_card(
     .block(
         Block::default()
             .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
             .border_style(neutral_border_style()),
     )
 }
@@ -4827,6 +4902,7 @@ fn render_ranked_bar_panel(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title(title),
         )
@@ -4874,6 +4950,7 @@ fn render_project_summary_panel(
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
                 .title("Project Summary"),
         )
