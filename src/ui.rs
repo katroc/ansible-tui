@@ -799,16 +799,28 @@ fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     } else {
         ((succeeded as f64 / completed as f64) * 100.0).round() as u16
     };
+    let available_playbooks = app
+        .playbooks
+        .iter()
+        .map(|path| display_path(app.active_project_root(), path))
+        .collect::<HashSet<_>>();
     let playbooks_with_runs = app
         .runs
         .iter()
-        .map(|run| run.playbook.clone())
+        .filter_map(|run| {
+            if available_playbooks.contains(&run.playbook) {
+                Some(run.playbook.clone())
+            } else {
+                None
+            }
+        })
         .collect::<HashSet<_>>()
         .len();
     let coverage_percent: u16 = if app.playbooks.is_empty() {
         0
     } else {
-        ((playbooks_with_runs as f64 / app.playbooks.len() as f64) * 100.0).round() as u16
+        (((playbooks_with_runs as f64 / app.playbooks.len() as f64) * 100.0).round() as u16)
+            .min(100)
     };
 
     let mut runs_by_playbook = BTreeMap::<String, u64>::new();
