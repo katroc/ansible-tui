@@ -1338,7 +1338,10 @@ fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::R
 
     let filtered_inventory_indices = app.filtered_inventory_indices();
     let items = if app.inventories.is_empty() {
-        vec![ListItem::new("No inventories found under ./inventory")]
+        vec![ListItem::new(Line::from(vec![
+            Span::raw("No inventories found. "),
+            Span::styled("Add files to ./inventory", Style::default().fg(th::SUBTEXT0)),
+        ]))]
     } else if filtered_inventory_indices.is_empty() {
         vec![ListItem::new("No inventories match current filter")]
     } else {
@@ -1434,8 +1437,9 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
     };
     let dirty_marker = if state.dirty { " [*]" } else { "" };
     let focus_ctx = app.content_focus_context();
+    let list_focused = matches!(focus_ctx, FocusContext::InventoryHostsList);
     let detail_focused = matches!(focus_ctx, FocusContext::InventoryHostDetails);
-    let list_border = if matches!(focus_ctx, FocusContext::InventoryHostsList) {
+    let list_border = if list_focused {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
         neutral_border_style()
@@ -1446,6 +1450,7 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(list_border)
+                .style(focus_bg(list_focused))
                 .title(format!("Hosts{dirty_marker}")),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
@@ -1551,6 +1556,7 @@ fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::R
                     .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                     .border_style(detail_border)
+                    .style(focus_bg(detail_focused))
                     .title(format!("Host: {host}")),
             )
             .row_highlight_style(if detail_focused {
@@ -1709,7 +1715,8 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
             .collect()
     };
     let focus_ctx = app.content_focus_context();
-    let tree_border = if matches!(focus_ctx, FocusContext::InventoryGroupsTree) {
+    let tree_focused = matches!(focus_ctx, FocusContext::InventoryGroupsTree);
+    let tree_border = if tree_focused {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
         neutral_border_style()
@@ -1721,6 +1728,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(tree_border)
+                .style(focus_bg(tree_focused))
                 .title(format!("Group Tree{dirty_marker}")),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
@@ -1768,7 +1776,8 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
             })
             .collect()
     };
-    let groups_border = if matches!(focus_ctx, FocusContext::InventoryGroupsGroups) {
+    let groups_focused = matches!(focus_ctx, FocusContext::InventoryGroupsGroups);
+    let groups_border = if groups_focused {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
         neutral_border_style()
@@ -1779,6 +1788,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(groups_border)
+                .style(focus_bg(groups_focused))
                 .title(format!("Groups (target: {target_label})")),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
@@ -1824,7 +1834,8 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
             })
             .collect()
     };
-    let hosts_border = if matches!(focus_ctx, FocusContext::InventoryGroupsHosts) {
+    let hosts_focused = matches!(focus_ctx, FocusContext::InventoryGroupsHosts);
+    let hosts_border = if hosts_focused {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
         neutral_border_style()
@@ -1835,6 +1846,7 @@ fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(hosts_border)
+                .style(focus_bg(hosts_focused))
                 .title("Hosts"),
         )
         .highlight_style(Style::default().fg(th::YELLOW))
@@ -1898,9 +1910,10 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let filtered_playbook_indices = app.filtered_playbook_indices();
     let items = if app.playbooks.is_empty() {
-        vec![ListItem::new(
-            "No playbooks found under ./playbooks or project root",
-        )]
+        vec![ListItem::new(Line::from(vec![
+            Span::raw("No playbooks found. "),
+            Span::styled("Add .yml files to ./playbooks", Style::default().fg(th::SUBTEXT0)),
+        ]))]
     } else if filtered_playbook_indices.is_empty() {
         vec![ListItem::new("No playbooks match current filter")]
     } else {
@@ -1915,12 +1928,14 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .collect::<Vec<_>>()
     };
     let focus_ctx = app.content_focus_context();
-    let playbooks_border_style = if matches!(focus_ctx, FocusContext::PlaybooksList) {
+    let playbooks_focused = matches!(focus_ctx, FocusContext::PlaybooksList);
+    let runs_focused = matches!(focus_ctx, FocusContext::PlaybooksRuns);
+    let playbooks_border_style = if playbooks_focused {
         Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
     } else {
         neutral_border_style()
     };
-    let runs_border_style = if matches!(focus_ctx, FocusContext::PlaybooksRuns) {
+    let runs_border_style = if runs_focused {
         Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
     } else {
         neutral_border_style()
@@ -1931,6 +1946,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(playbooks_border_style)
+                .style(focus_bg(playbooks_focused))
                 .title(filtered_list_title(
                     "Playbooks",
                     app.filter_query_for(FilterTarget::Playbooks),
@@ -1986,6 +2002,7 @@ fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(runs_border_style)
+                .style(focus_bg(runs_focused))
                 .title(filtered_list_title(
                     &format!("Runs For Selected Playbook ({})", app.active_project_name()),
                     app.filter_query_for(FilterTarget::PlaybookRuns),
@@ -2051,7 +2068,10 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let filtered_template_indices = app.filtered_template_indices();
     let template_items = if app.job_templates.is_empty() {
-        vec![ListItem::new("No templates found. Press n to create one.")]
+        vec![ListItem::new(Line::from(vec![
+            Span::raw("No templates yet. "),
+            Span::styled("Press n to create one", Style::default().fg(th::SUBTEXT0)),
+        ]))]
     } else if filtered_template_indices.is_empty() {
         vec![ListItem::new("No templates match current filter")]
     } else {
@@ -2075,16 +2095,18 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     };
 
     let focus_ctx = app.content_focus_context();
+    let templates_focused = matches!(focus_ctx, FocusContext::TemplatesList);
     let template_list = List::new(template_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(if matches!(focus_ctx, FocusContext::TemplatesList) {
+                .border_style(if templates_focused {
                     Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
                 } else {
                     neutral_border_style()
                 })
+                .style(focus_bg(templates_focused))
                 .title(filtered_list_title(
                     "Templates",
                     app.filter_query_for(FilterTarget::Templates),
@@ -2133,16 +2155,18 @@ fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             })
             .collect::<Vec<_>>()
     };
+    let runs_focused = matches!(focus_ctx, FocusContext::TemplatesRuns);
     let run_list = List::new(template_run_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(if matches!(focus_ctx, FocusContext::TemplatesRuns) {
+                .border_style(if runs_focused {
                     Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
                 } else {
                     neutral_border_style()
                 })
+                .style(focus_bg(runs_focused))
                 .title(filtered_list_title(
                     "Runs For Selected Template",
                     app.filter_query_for(FilterTarget::TemplateRuns),
@@ -2426,6 +2450,15 @@ fn neutral_border_style() -> Style {
         .add_modifier(Modifier::DIM)
 }
 
+/// Returns a subtle `SURFACE0` background tint for focused panels, or
+/// transparent for unfocused panels.
+fn focus_bg(focused: bool) -> Style {
+    if focused {
+        Style::default().bg(th::SURFACE0)
+    } else {
+        Style::default()
+    }
+}
 
 fn filtered_list_title(base: &str, query: &str, editing: bool) -> String {
     let trimmed = query.trim();
@@ -4822,19 +4855,20 @@ fn dashboard_stat_card(
     value_color: ratatui::style::Color,
 ) -> Paragraph<'static> {
     Paragraph::new(vec![
+        Line::styled(label.to_string(), Style::default().fg(th::SUBTEXT1)),
         Line::styled(
             value,
             Style::default()
                 .fg(value_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::styled(label.to_string(), Style::default().fg(th::SUBTEXT1)),
     ])
     .block(
         Block::default()
             .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-            .border_style(neutral_border_style()),
+            .border_type(BorderType::Rounded)
+            .border_style(neutral_border_style())
+            .style(Style::default().bg(th::SURFACE0)),
     )
 }
 
