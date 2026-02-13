@@ -108,6 +108,7 @@ In the Settings tab you can edit these global defaults:
 - `ANSIBLE_TUI_TAGS` -> `--tags`
 - `ANSIBLE_TUI_EXTRA_VARS` -> `--extra-vars`
 - `ANSIBLE_TUI_EXTRA_ARGS` -> additional CLI args appended before playbook path (not an ansible option)
+- `ANSIBLE_TUI_THEME` -> force UI palette (`dark` default, `light` optional)
 
 ## Per-playbook settings
 

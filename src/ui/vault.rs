@@ -1,27 +1,23 @@
 use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Paragraph, Wrap,
-};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::App;
 use crate::theme as th;
 
 use super::common::*;
-use super::{HINTS_VAULT_CREATE, HINTS_VAULT_EDIT, HINTS_VAULT_PASSWORD_CREATE,
-    HINTS_VAULT_PROMPT_CONFIRM, HINTS_VAULT_PROMPT_SIMPLE};
+use super::{
+    HINTS_VAULT_CREATE, HINTS_VAULT_EDIT, HINTS_VAULT_PASSWORD_CREATE, HINTS_VAULT_PROMPT_CONFIRM,
+    HINTS_VAULT_PROMPT_SIMPLE,
+};
 
 pub(super) fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(82, 74, frame.area());
     frame.render_widget(Clear, area);
 
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th::MAUVE))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Create New Encrypted Vault File");
+    let wrapper = themed_modal("Create New Encrypted Vault File");
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -35,7 +31,7 @@ pub(super) fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Min(10),
             Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -45,9 +41,9 @@ pub(super) fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| String::from("(unknown)"));
     frame.render_widget(
         Paragraph::new(format!(
-            "Project: {project_name} | Creates a new file only; does not load/decrypt existing vault files."
+            "Project: {project_name} · Creates a new file only; does not load/decrypt existing vault files."
         ))
-        .style(Style::default().fg(th::SUBTEXT1)),
+        .style(theme.text_muted()),
         chunks[0],
     );
 
@@ -65,18 +61,8 @@ pub(super) fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(path_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if path_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Vault File Path"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            .block(themed_input("Vault File Path", path_focused))
+            .style(theme.modal_bg()),
         chunks[1],
     );
 
@@ -98,18 +84,8 @@ pub(super) fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(content_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if content_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Vault YAML Content"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE))
+            .block(themed_input("Vault YAML Content", content_focused))
+            .style(theme.modal_bg())
             .wrap(Wrap { trim: false }),
         chunks[2],
     );
@@ -136,14 +112,11 @@ pub(super) fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| String::from("Vault auth: unset"));
     frame.render_widget(
         Paragraph::new(vault_auth)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(neutral_border_style())
-                    .title("Auth Source (from Project Secret Settings)"),
-            )
-            .style(Style::default().fg(th::SUBTEXT1).bg(th::BASE))
+            .block(themed_panel(
+                "Auth Source (from Project Secret Settings)",
+                false,
+            ))
+            .style(theme.modal_bg().fg(theme.fg_muted))
             .wrap(Wrap { trim: true }),
         chunks[3],
     );
@@ -155,15 +128,11 @@ pub(super) fn render_vault_create_prompt(frame: &mut Frame, app: &App) {
 }
 
 pub(super) fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(72, 44, frame.area());
     frame.render_widget(Clear, area);
 
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th::MAUVE))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Create Vault Password File");
+    let wrapper = themed_modal("Create Vault Password File");
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -177,7 +146,7 @@ pub(super) fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) 
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -187,9 +156,9 @@ pub(super) fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) 
         .unwrap_or_else(|| String::from("(unknown)"));
     frame.render_widget(
         Paragraph::new(format!(
-            "Project: {project_name} | Creates password file and sets vault source to file."
+            "Project: {project_name} · Creates password file and sets vault source to file."
         ))
-        .style(Style::default().fg(th::SUBTEXT1)),
+        .style(theme.text_muted()),
         chunks[0],
     );
 
@@ -207,18 +176,8 @@ pub(super) fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) 
     };
     frame.render_widget(
         Paragraph::new(path_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if path_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Password File Path"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            .block(themed_input("Password File Path", path_focused))
+            .style(theme.modal_bg()),
         chunks[1],
     );
 
@@ -234,18 +193,8 @@ pub(super) fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) 
     };
     frame.render_widget(
         Paragraph::new(password_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if password_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Vault Password"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            .block(themed_input("Vault Password", password_focused))
+            .style(theme.modal_bg()),
         chunks[2],
     );
 
@@ -261,18 +210,8 @@ pub(super) fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) 
     };
     frame.render_widget(
         Paragraph::new(confirm_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if confirm_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Confirm Password"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            .block(themed_input("Confirm Password", confirm_focused))
+            .style(theme.modal_bg()),
         chunks[3],
     );
 
@@ -284,15 +223,11 @@ pub(super) fn render_vault_password_create_prompt(frame: &mut Frame, app: &App) 
 }
 
 pub(super) fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(84, 78, frame.area());
     frame.render_widget(Clear, area);
 
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th::MAUVE))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Edit Encrypted Vault File");
+    let wrapper = themed_modal("Edit Encrypted Vault File");
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -306,7 +241,7 @@ pub(super) fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Min(10),
             Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -316,9 +251,9 @@ pub(super) fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| String::from("(unknown)"));
     frame.render_widget(
         Paragraph::new(format!(
-            "Project: {project_name} | Enter on path decrypts+loads; Ctrl+S re-encrypts and saves."
+            "Project: {project_name} · Enter on path decrypts+loads; Ctrl+S re-encrypts and saves."
         ))
-        .style(Style::default().fg(th::SUBTEXT1)),
+        .style(theme.text_muted()),
         chunks[0],
     );
 
@@ -336,18 +271,8 @@ pub(super) fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(path_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if path_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Vault File Path"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            .block(themed_input("Vault File Path", path_focused))
+            .style(theme.modal_bg()),
         chunks[1],
     );
 
@@ -369,18 +294,11 @@ pub(super) fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(content_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if content_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Decrypted Vault YAML Content"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE))
+            .block(themed_input(
+                "Decrypted Vault YAML Content",
+                content_focused,
+            ))
+            .style(theme.modal_bg())
             .wrap(Wrap { trim: false }),
         chunks[2],
     );
@@ -412,17 +330,17 @@ pub(super) fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
             vault_auth
         })
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(if app.vault_edit_loading {
-                    Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
+            themed_panel("Auth Source (from Project Secret Settings)", false).border_style(
+                if app.vault_edit_loading {
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     neutral_border_style()
-                })
-                .title("Auth Source (from Project Secret Settings)"),
+                },
+            ),
         )
-        .style(Style::default().fg(th::SUBTEXT1).bg(th::BASE))
+        .style(theme.modal_bg().fg(theme.fg_muted))
         .wrap(Wrap { trim: true }),
         chunks[3],
     );
@@ -434,16 +352,12 @@ pub(super) fn render_vault_edit_prompt(frame: &mut Frame, app: &App) {
 }
 
 pub(super) fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(68, 34, frame.area());
     frame.render_widget(Clear, area);
     let confirm_required = app.vault_runtime_prompt_confirm_required();
 
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th::MAUVE))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Vault Password (Prompt Mode)");
+    let wrapper = themed_modal("Vault Password (Prompt Mode)");
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -457,7 +371,7 @@ pub(super) fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
                 Constraint::Length(2),
                 Constraint::Length(3),
                 Constraint::Length(3),
-                Constraint::Length(2),
+                Constraint::Length(1),
             ])
             .split(inner)
     } else {
@@ -466,14 +380,14 @@ pub(super) fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
             .constraints([
                 Constraint::Length(2),
                 Constraint::Length(3),
-                Constraint::Length(2),
+                Constraint::Length(1),
             ])
             .split(inner)
     };
 
     frame.render_widget(
         Paragraph::new("Enter vault password. It will be reused for this project session.")
-            .style(Style::default().fg(th::SUBTEXT1)),
+            .style(theme.text_muted()),
         chunks[0],
     );
 
@@ -489,18 +403,8 @@ pub(super) fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(password_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if password_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Vault Password"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            .block(themed_input("Vault Password", password_focused))
+            .style(theme.modal_bg()),
         chunks[1],
     );
 
@@ -517,18 +421,8 @@ pub(super) fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
         };
         frame.render_widget(
             Paragraph::new(confirm_display)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                        .border_style(if confirm_focused {
-                            Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                        } else {
-                            neutral_border_style()
-                        })
-                        .title("Confirm Password"),
-                )
-                .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+                .block(themed_input("Confirm Password", confirm_focused))
+                .style(theme.modal_bg()),
             chunks[2],
         );
     }
@@ -547,4 +441,3 @@ pub(super) fn render_vault_runtime_prompt(frame: &mut Frame, app: &App) {
         },
     );
 }
-

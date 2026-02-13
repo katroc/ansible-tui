@@ -2,8 +2,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Table,
-    TableState,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Table, TableState,
 };
 use ratatui::Frame;
 
@@ -14,6 +13,7 @@ use super::common::*;
 use super::{HINTS_TEMPLATE_EDITOR, HINTS_TEMPLATE_EDITOR_TEXT};
 
 pub(super) fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(14), Constraint::Length(8)])
@@ -28,7 +28,7 @@ pub(super) fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layo
     let template_items = if app.job_templates.is_empty() {
         vec![ListItem::new(Line::from(vec![
             Span::raw("No templates yet. "),
-            Span::styled("Press n to create one", Style::default().fg(th::SUBTEXT0)),
+            Span::styled("Press n to create one", theme.text_dim()),
         ]))]
     } else if filtered_template_indices.is_empty() {
         vec![ListItem::new("No templates match current filter")]
@@ -43,10 +43,7 @@ pub(super) fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layo
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" "),
-                    Span::styled(
-                        format!("({})", template.playbook),
-                        Style::default().fg(th::SUBTEXT0),
-                    ),
+                    Span::styled(format!("({})", template.playbook), theme.text_dim()),
                 ]))
             })
             .collect::<Vec<_>>()
@@ -55,24 +52,16 @@ pub(super) fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layo
     let focus_ctx = app.content_focus_context();
     let templates_focused = matches!(focus_ctx, FocusContext::TemplatesList);
     let template_list = List::new(template_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(if templates_focused {
-                    Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                } else {
-                    neutral_border_style()
-                })
-                .style(focus_bg(templates_focused))
-                .title(filtered_list_title(
-                    "Templates",
-                    app.filter_query_for(FilterTarget::Templates),
-                    app.is_filter_editing_target(FilterTarget::Templates),
-                )),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel(
+            filtered_list_title(
+                "Templates",
+                app.filter_query_for(FilterTarget::Templates),
+                app.is_filter_editing_target(FilterTarget::Templates),
+            ),
+            templates_focused,
+        ))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let selected_template_pos = filtered_template_indices
         .iter()
         .position(|idx| *idx == app.template_idx);
@@ -115,24 +104,16 @@ pub(super) fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layo
     };
     let runs_focused = matches!(focus_ctx, FocusContext::TemplatesRuns);
     let run_list = List::new(template_run_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(if runs_focused {
-                    Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
-                } else {
-                    neutral_border_style()
-                })
-                .style(focus_bg(runs_focused))
-                .title(filtered_list_title(
-                    "Runs For Selected Template",
-                    app.filter_query_for(FilterTarget::TemplateRuns),
-                    app.is_filter_editing_target(FilterTarget::TemplateRuns),
-                )),
-        )
-        .highlight_style(Style::default().fg(th::GREEN))
-        .highlight_symbol(">> ");
+        .block(themed_panel(
+            filtered_list_title(
+                "Runs For Selected Template",
+                app.filter_query_for(FilterTarget::TemplateRuns),
+                app.is_filter_editing_target(FilterTarget::TemplateRuns),
+            ),
+            runs_focused,
+        ))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let selected_run_pos = template_run_indices
         .iter()
         .position(|idx| *idx == app.run_idx);
@@ -163,37 +144,21 @@ pub(super) fn render_templates(frame: &mut Frame, app: &App, area: ratatui::layo
     let (detail_cols, detail_spacing) = key_value_table_layout(chunks[1], 22);
     let table = Table::new(styled_key_value_rows(rows), detail_cols)
         .column_spacing(detail_spacing)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .style(Style::default().bg(th::BASE))
-                .title("Template Settings"),
-        );
+        .block(themed_panel("Template Settings", false));
     frame.render_widget(table, chunks[1]);
 }
 
 pub(super) fn render_template_editor(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(86, 84, frame.area());
     frame.render_widget(Clear, area);
 
-    let border_color = if app.template_editor_text_mode {
-        th::YELLOW
-    } else {
-        th::MAUVE
-    };
     let title = if app.template_editor_editing_id.is_some() {
         "Template Editor (Edit)"
     } else {
         "Template Editor (New)"
     };
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title(title);
+    let wrapper = themed_modal(title);
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -206,7 +171,7 @@ pub(super) fn render_template_editor(frame: &mut Frame, app: &App) {
             Constraint::Length(2),
             Constraint::Length(3),
             Constraint::Min(14),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -216,12 +181,9 @@ pub(super) fn render_template_editor(frame: &mut Frame, app: &App) {
         "Edit mode: OFF"
     };
     let mode_style = if app.template_editor_text_mode {
-        Style::default()
-            .fg(th::CRUST)
-            .bg(th::YELLOW)
-            .add_modifier(Modifier::BOLD)
+        theme.chrome_accent()
     } else {
-        Style::default().fg(th::SUBTEXT1)
+        theme.text_muted()
     };
     frame.render_widget(Paragraph::new(mode_label).style(mode_style), chunks[0]);
 
@@ -241,29 +203,24 @@ pub(super) fn render_template_editor(frame: &mut Frame, app: &App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+            .border_type(BorderType::Rounded)
             .border_style(neutral_border_style()),
     )
-    .style(Style::default().fg(th::TEXT).bg(th::BASE));
+    .style(theme.modal_bg());
     frame.render_widget(header, chunks[1]);
 
     let rows = template_editor_rows(app);
     let (detail_cols, detail_spacing) = key_value_table_layout(chunks[2], 34);
     let fields = Table::new(styled_key_value_rows(rows), detail_cols)
         .column_spacing(detail_spacing)
-        .row_highlight_style(
-            Style::default()
-                .fg(th::CRUST)
-                .bg(th::YELLOW)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ")
+        .row_highlight_style(theme.table_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
-                .style(Style::default().fg(th::TEXT).bg(th::BASE))
+                .style(theme.modal_bg())
                 .title("Template Fields"),
         );
     let mut fields_state = TableState::default().with_selected(Some(app.template_editor_field_idx));
@@ -547,7 +504,11 @@ pub(super) fn display_template_editor_text(app: &App, idx: usize, current: &str)
     }
 }
 
-pub(super) fn display_template_editor_inline_key_text(app: &App, idx: usize, current: Option<&str>) -> String {
+pub(super) fn display_template_editor_inline_key_text(
+    app: &App,
+    idx: usize,
+    current: Option<&str>,
+) -> String {
     if app.template_editor_text_mode && app.template_editor_field_idx == idx {
         let escaped = app
             .template_editor_text_buffer
@@ -562,4 +523,3 @@ pub(super) fn display_template_editor_inline_key_text(app: &App, idx: usize, cur
         summarize_inline_key(current)
     }
 }
-

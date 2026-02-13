@@ -13,9 +13,10 @@ use crate::app::{display_path, App, FilterTarget, FocusContext, InventorySubTab}
 use crate::theme as th;
 
 use super::common::*;
-use super::{HINTS_INVENTORY_CREATE, HINTS_INVENTORY_EDIT_MODE, HINTS_INVENTORY_EDITOR};
+use super::{HINTS_INVENTORY_CREATE, HINTS_INVENTORY_EDITOR, HINTS_INVENTORY_EDIT_MODE};
 
 pub(super) fn render_inventory(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(5)])
@@ -27,17 +28,17 @@ pub(super) fn render_inventory(frame: &mut Frame, app: &App, area: ratatui::layo
         Line::from(Span::styled(
             "2:Hosts",
             if is_yaml {
-                Style::default()
+                theme.text_muted()
             } else {
-                Style::default().fg(th::SURFACE1)
+                theme.text_dim()
             },
         )),
         Line::from(Span::styled(
             "3:Groups",
             if is_yaml {
-                Style::default()
+                theme.text_muted()
             } else {
-                Style::default().fg(th::SURFACE1)
+                theme.text_dim()
             },
         )),
     ];
@@ -48,9 +49,13 @@ pub(super) fn render_inventory(frame: &mut Frame, app: &App, area: ratatui::layo
     };
     let sub_tabs = Tabs::new(tab_titles)
         .select(selected_tab)
-        .highlight_style(Style::default().fg(th::MAUVE).add_modifier(Modifier::BOLD))
-        .style(Style::default().fg(th::SUBTEXT0))
-        .divider("|");
+        .highlight_style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(theme.text_muted())
+        .divider("·");
     frame.render_widget(sub_tabs, layout[0]);
 
     match app.inventory_sub_tab {
@@ -61,6 +66,7 @@ pub(super) fn render_inventory(frame: &mut Frame, app: &App, area: ratatui::layo
 }
 
 pub(super) fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
@@ -70,7 +76,7 @@ pub(super) fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui
     let items = if app.inventories.is_empty() {
         vec![ListItem::new(Line::from(vec![
             Span::raw("No inventories found. "),
-            Span::styled("Add files to ./inventory", Style::default().fg(th::SUBTEXT0)),
+            Span::styled("Add files to ./inventory", theme.text_dim()),
         ]))]
     } else if filtered_inventory_indices.is_empty() {
         vec![ListItem::new("No inventories match current filter")]
@@ -85,20 +91,18 @@ pub(super) fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui
             })
             .collect::<Vec<_>>()
     };
+    let list_focused = matches!(app.content_focus_context(), FocusContext::InventoryFiles);
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title(filtered_list_title(
-                    "Inventories",
-                    app.filter_query_for(FilterTarget::InventoryFiles),
-                    app.is_filter_editing_target(FilterTarget::InventoryFiles),
-                )),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel(
+            filtered_list_title(
+                "Inventories",
+                app.filter_query_for(FilterTarget::InventoryFiles),
+                app.is_filter_editing_target(FilterTarget::InventoryFiles),
+            ),
+            list_focused,
+        ))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut state = ListState::default().with_selected(
         filtered_inventory_indices
             .iter()
@@ -117,35 +121,23 @@ pub(super) fn render_inventory_files(frame: &mut Frame, app: &App, area: ratatui
         detail_cols,
     )
     .column_spacing(detail_spacing)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-            .border_style(neutral_border_style())
-            .style(Style::default().bg(th::BASE))
-            .title("Inventory Details"),
-    );
+    .block(themed_panel("Inventory Details", false));
     frame.render_widget(details, right[0]);
 
     let preview = Paragraph::new(inventory_preview_text(
         app,
         right[1].height.saturating_sub(2) as usize,
     ))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-            .border_style(neutral_border_style())
-            .title("File Preview"),
-    )
+    .block(themed_panel("File Preview", false))
     .wrap(Wrap { trim: false });
     frame.render_widget(preview, right[1]);
 }
 
 pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let Some(ref state) = app.inventory_edit_state else {
         let msg = Paragraph::new("No YAML inventory loaded. Select a YAML file and press 2.")
-            .style(Style::default().fg(th::SUBTEXT0));
+            .style(theme.text_dim());
         frame.render_widget(msg, area);
         return;
     };
@@ -169,22 +161,10 @@ pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui
     let focus_ctx = app.content_focus_context();
     let list_focused = matches!(focus_ctx, FocusContext::InventoryHostsList);
     let detail_focused = matches!(focus_ctx, FocusContext::InventoryHostDetails);
-    let list_border = if list_focused {
-        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-    } else {
-        neutral_border_style()
-    };
     let host_list = List::new(list_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(list_border)
-                .style(focus_bg(list_focused))
-                .title(format!("Hosts{dirty_marker}")),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel(format!("Hosts{dirty_marker}"), list_focused))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut list_state = ListState::default().with_selected(if state.hosts.is_empty() {
         None
     } else {
@@ -193,12 +173,6 @@ pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui
     frame.render_stateful_widget(host_list, cols[0], &mut list_state);
 
     // Host detail (right panel)
-    let detail_border = if detail_focused {
-        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-    } else {
-        neutral_border_style()
-    };
-
     if let Some(host) = state.hosts.get(app.hosts_subtab_idx) {
         let vars = state.host_vars.get(host);
         let mut rows: Vec<Row> = Vec::new();
@@ -233,10 +207,8 @@ pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui
                 Cell::from(format!("{}|", app.hosts_subtab_edit_buffer))
             } else if value.is_empty() {
                 Cell::from(Line::from(Span::styled(
-                    host_field_placeholder(*key),
-                    Style::default()
-                        .fg(th::SUBTEXT0)
-                        .add_modifier(Modifier::ITALIC),
+                    host_field_placeholder(key),
+                    theme.text_dim().add_modifier(Modifier::ITALIC),
                 )))
             } else {
                 Cell::from(value.clone())
@@ -247,7 +219,7 @@ pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui
         if let Some(v) = vars {
             if !v.custom_vars.is_empty() {
                 rows.push(Row::new(vec![
-                    Cell::from("--- Custom ---").style(Style::default().fg(th::SUBTEXT0)),
+                    Cell::from("--- Custom ---").style(theme.text_dim()),
                     Cell::from(""),
                 ]));
             }
@@ -261,9 +233,7 @@ pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui
                 } else if value.is_empty() {
                     Cell::from(Line::from(Span::styled(
                         "e.g. value",
-                        Style::default()
-                            .fg(th::SUBTEXT0)
-                            .add_modifier(Modifier::ITALIC),
+                        theme.text_dim().add_modifier(Modifier::ITALIC),
                     )))
                 } else {
                     Cell::from(value.clone())
@@ -274,23 +244,13 @@ pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui
 
         let detail_table = Table::new(rows, [Constraint::Length(20), Constraint::Min(10)])
             .header(
-                Row::new(vec!["Property", "Value"]).style(
-                    Style::default()
-                        .fg(th::SUBTEXT1)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Row::new(vec!["Property", "Value"])
+                    .style(theme.text_muted().add_modifier(Modifier::BOLD)),
             )
             .column_spacing(1)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(detail_border)
-                    .style(focus_bg(detail_focused))
-                    .title(format!("Host: {host}")),
-            )
+            .block(themed_panel(format!("Host: {host}"), detail_focused))
             .row_highlight_style(if detail_focused {
-                Style::default().fg(th::YELLOW)
+                theme.table_highlight()
             } else {
                 Style::default()
             });
@@ -311,14 +271,8 @@ pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui
         frame.render_stateful_widget(detail_table, cols[1], &mut table_state);
     } else {
         let empty = Paragraph::new("Select a host from the list")
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(detail_border)
-                    .title("Host Detail"),
-            )
-            .style(Style::default().fg(th::SUBTEXT0));
+            .block(themed_panel("Host Detail", detail_focused))
+            .style(theme.text_dim());
         frame.render_widget(empty, cols[1]);
     }
 
@@ -331,14 +285,7 @@ pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui
         } else {
             format!("{}|", app.hosts_subtab_add_host_buffer)
         };
-        let input = Paragraph::new(val).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
-                .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-                .title("New Host Name"),
-        );
+        let input = Paragraph::new(val).block(themed_modal("New Host Name"));
         frame.render_widget(input, prompt_area);
     }
 
@@ -350,14 +297,7 @@ pub(super) fn render_inventory_hosts(frame: &mut Frame, app: &App, area: ratatui
         } else {
             format!("{}|", app.hosts_subtab_add_var_buffer)
         };
-        let input = Paragraph::new(val).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
-                .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-                .title("New Variable Name"),
-        );
+        let input = Paragraph::new(val).block(themed_modal("New Variable Name"));
         frame.render_widget(input, prompt_area);
     }
 }
@@ -373,9 +313,10 @@ pub(super) fn host_field_placeholder(key: &str) -> &'static str {
 }
 
 pub(super) fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let Some(ref state) = app.inventory_edit_state else {
         let msg = Paragraph::new("No YAML inventory loaded. Select a YAML file and press 3.")
-            .style(Style::default().fg(th::SUBTEXT0));
+            .style(theme.text_dim());
         frame.render_widget(msg, area);
         return;
     };
@@ -446,23 +387,14 @@ pub(super) fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatu
     };
     let focus_ctx = app.content_focus_context();
     let tree_focused = matches!(focus_ctx, FocusContext::InventoryGroupsTree);
-    let tree_border = if tree_focused {
-        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-    } else {
-        neutral_border_style()
-    };
     let dirty_marker = if state.dirty { " [*]" } else { "" };
     let tree = List::new(tree_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(tree_border)
-                .style(focus_bg(tree_focused))
-                .title(format!("Group Tree{dirty_marker}")),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel(
+            format!("Group Tree{dirty_marker}"),
+            tree_focused,
+        ))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut tree_state = ListState::default().with_selected(if tree_nodes.is_empty() {
         None
     } else {
@@ -493,36 +425,29 @@ pub(super) fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatu
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             "[x]",
-                            Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(theme.success)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(format!(" {group}")),
                     ]))
                 } else {
                     ListItem::new(Line::from(vec![
-                        Span::styled("[ ]", Style::default().fg(th::SURFACE1)),
-                        Span::styled(format!(" {group}"), Style::default().fg(th::SUBTEXT0)),
+                        Span::styled("[ ]", theme.text_dim()),
+                        Span::styled(format!(" {group}"), theme.text_muted()),
                     ]))
                 }
             })
             .collect()
     };
     let groups_focused = matches!(focus_ctx, FocusContext::InventoryGroupsGroups);
-    let groups_border = if groups_focused {
-        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-    } else {
-        neutral_border_style()
-    };
     let groups_list = List::new(group_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(groups_border)
-                .style(focus_bg(groups_focused))
-                .title(format!("Groups (target: {target_label})")),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel(
+            format!("Groups (target: {target_label})"),
+            groups_focused,
+        ))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut groups_state = ListState::default().with_selected(if candidate_groups.is_empty() {
         None
     } else {
@@ -551,36 +476,26 @@ pub(super) fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatu
                     ListItem::new(Line::from(vec![
                         Span::styled(
                             "[x]",
-                            Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(theme.success)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::raw(format!(" {host}")),
                     ]))
                 } else {
                     ListItem::new(Line::from(vec![
-                        Span::styled("[ ]", Style::default().fg(th::SURFACE1)),
-                        Span::styled(format!(" {host}"), Style::default().fg(th::SUBTEXT0)),
+                        Span::styled("[ ]", theme.text_dim()),
+                        Span::styled(format!(" {host}"), theme.text_muted()),
                     ]))
                 }
             })
             .collect()
     };
     let hosts_focused = matches!(focus_ctx, FocusContext::InventoryGroupsHosts);
-    let hosts_border = if hosts_focused {
-        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-    } else {
-        neutral_border_style()
-    };
     let hosts_list = List::new(host_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(hosts_border)
-                .style(focus_bg(hosts_focused))
-                .title("Hosts"),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel("Hosts", hosts_focused))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut hosts_state = ListState::default().with_selected(if state.hosts.is_empty() {
         None
     } else {
@@ -597,14 +512,7 @@ pub(super) fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatu
         } else {
             format!("{}|", app.hosts_subtab_add_var_buffer)
         };
-        let input = Paragraph::new(val).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
-                .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-                .title("New Group Name"),
-        );
+        let input = Paragraph::new(val).block(themed_modal("New Group Name"));
         frame.render_widget(input, prompt_area);
     }
 
@@ -616,14 +524,7 @@ pub(super) fn render_inventory_groups(frame: &mut Frame, app: &App, area: ratatu
         } else {
             format!("{}|", app.hosts_subtab_add_host_buffer)
         };
-        let input = Paragraph::new(val).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD))
-                .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-                .title("New Host Name"),
-        );
+        let input = Paragraph::new(val).block(themed_modal("New Host Name"));
         frame.render_widget(input, prompt_area);
     }
 }
@@ -670,6 +571,7 @@ pub(super) fn inventory_detail_rows(app: &App) -> Vec<(String, String)> {
 }
 
 pub(super) fn inventory_preview_text(app: &App, max_lines: usize) -> Text<'static> {
+    let theme = th::current();
     let Some(path) = app.inventories.get(app.inventory_idx) else {
         return Text::from("No inventory selected.");
     };
@@ -691,7 +593,7 @@ pub(super) fn inventory_preview_text(app: &App, max_lines: usize) -> Text<'stati
         .take(cap)
         .map(|line| {
             if line.trim_start().starts_with('#') {
-                Line::styled((*line).to_string(), Style::default().fg(th::SUBTEXT0))
+                Line::styled((*line).to_string(), theme.text_dim())
             } else {
                 Line::raw((*line).to_string())
             }
@@ -701,22 +603,18 @@ pub(super) fn inventory_preview_text(app: &App, max_lines: usize) -> Text<'stati
     if all_lines.len() > cap {
         lines.push(Line::styled(
             format!("... {} more lines", all_lines.len() - cap),
-            Style::default().fg(th::SUBTEXT0),
+            theme.text_dim(),
         ));
     }
     Text::from(lines)
 }
 
 pub(super) fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(54, 26, frame.area());
     frame.render_widget(Clear, area);
 
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th::MAUVE))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Create Inventory");
+    let wrapper = themed_modal("Create Inventory");
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -732,8 +630,8 @@ pub(super) fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
         ])
         .split(inner);
 
-    let intro = Paragraph::new("Create under ./inventory (.ini, .yml, .yaml).")
-        .style(Style::default().fg(th::SUBTEXT1));
+    let intro =
+        Paragraph::new("Create under ./inventory (.ini, .yml, .yaml).").style(theme.text_muted());
     frame.render_widget(intro, chunks[0]);
 
     let input_value = if app.inventory_create_buffer.is_empty() {
@@ -742,14 +640,8 @@ pub(super) fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
         format!("{}|", app.inventory_create_buffer)
     };
     let input = Paragraph::new(input_value)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th::YELLOW))
-                .title("Filename"),
-        )
-        .style(Style::default().fg(th::TEXT).bg(th::BASE));
+        .block(themed_input("Filename", true))
+        .style(theme.modal_bg());
     frame.render_widget(input, chunks[1]);
 
     let hint =
@@ -758,15 +650,11 @@ pub(super) fn render_inventory_create_prompt(frame: &mut Frame, app: &App) {
 }
 
 pub(super) fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(56, 30, frame.area());
     frame.render_widget(Clear, area);
 
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th::MAUVE))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Edit Inventory Mode");
+    let wrapper = themed_modal("Edit Inventory Mode");
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -778,7 +666,7 @@ pub(super) fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(2),
             Constraint::Length(5),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -787,8 +675,7 @@ pub(super) fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
         .get(app.inventory_idx)
         .map(|path| display_path(app.active_project_root(), path))
         .unwrap_or_else(|| String::from("(none)"));
-    let intro =
-        Paragraph::new(format!("Inventory: {selected}")).style(Style::default().fg(th::SUBTEXT1));
+    let intro = Paragraph::new(format!("Inventory: {selected}")).style(theme.text_muted());
     frame.render_widget(intro, chunks[0]);
 
     let items = vec![
@@ -796,15 +683,9 @@ pub(super) fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
         ListItem::new("Built-in Text Editor (raw YAML/INI)"),
     ];
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Choose Mode"),
-        )
-        .highlight_style(Style::default().fg(th::CRUST).bg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel("Choose Mode", true))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut state = ListState::default().with_selected(Some(app.inventory_edit_mode_idx));
     frame.render_stateful_widget(list, chunks[1], &mut state);
 
@@ -814,25 +695,16 @@ pub(super) fn render_inventory_edit_mode_prompt(frame: &mut Frame, app: &App) {
 }
 
 pub(super) fn render_inventory_editor(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(84, 82, frame.area());
     frame.render_widget(Clear, area);
 
-    let border_color = if app.inventory_editor_dirty {
-        th::YELLOW
-    } else {
-        th::MAUVE
-    };
     let title = if app.inventory_editor_dirty {
         "Inventory Editor (unsaved)"
     } else {
         "Inventory Editor"
     };
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title(title);
+    let wrapper = themed_modal(title);
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -844,7 +716,7 @@ pub(super) fn render_inventory_editor(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(2),
             Constraint::Min(8),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -860,7 +732,7 @@ pub(super) fn render_inventory_editor(frame: &mut Frame, app: &App) {
                 .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style()),
         )
-        .style(Style::default().fg(th::TEXT).bg(th::BASE));
+        .style(theme.modal_bg());
     frame.render_widget(file_info, chunks[0]);
 
     let body = if app.inventory_editor_buffer.is_empty() {
@@ -869,13 +741,7 @@ pub(super) fn render_inventory_editor(frame: &mut Frame, app: &App) {
         Text::from(format!("{}|", app.inventory_editor_buffer))
     };
     let editor = Paragraph::new(body)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Content"),
-        )
+        .block(themed_panel("Content", false))
         .wrap(Wrap { trim: false });
     frame.render_widget(editor, chunks[1]);
 
@@ -883,4 +749,3 @@ pub(super) fn render_inventory_editor(frame: &mut Frame, app: &App) {
         Paragraph::new(hint_line_from_bindings(&HINTS_INVENTORY_EDITOR, 6)).style(hint_bar_style());
     frame.render_widget(hint, chunks[2]);
 }
-

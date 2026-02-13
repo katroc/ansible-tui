@@ -1,26 +1,60 @@
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Row};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Row};
 
 use crate::app::{App, FocusContext};
 use crate::theme as th;
 
 use super::HintBinding;
 
-pub(super) fn neutral_border_style() -> Style {
-    Style::default()
-        .fg(th::OVERLAY0)
-        .add_modifier(Modifier::DIM)
+pub(super) const HIGHLIGHT_SYMBOL: &str = "▸ ";
+
+pub(super) fn focus_border_style(focused: bool) -> Style {
+    if focused {
+        th::current().panel_border_focused()
+    } else {
+        neutral_border_style()
+    }
 }
 
-/// Returns a subtle `SURFACE0` background tint for focused panels, or
-/// transparent for unfocused panels.
+pub(super) fn themed_panel(title: impl Into<String>, focused: bool) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(focus_border_style(focused))
+        .style(focus_bg(focused))
+        .title(title.into())
+}
+
+pub(super) fn themed_modal(title: impl Into<String>) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(th::current().modal_border())
+        .style(th::current().modal_bg())
+        .title(title.into())
+}
+
+pub(super) fn themed_input(title: impl Into<String>, focused: bool) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(focus_border_style(focused))
+        .title(title.into())
+}
+
+pub(super) fn neutral_border_style() -> Style {
+    th::current().panel_border()
+}
+
+/// Returns themed panel background style.
 pub(super) fn focus_bg(focused: bool) -> Style {
+    let theme = th::current();
     if focused {
-        Style::default().bg(th::SURFACE0)
+        theme.panel_style_focused()
     } else {
-        Style::default()
+        theme.panel_style()
     }
 }
 
@@ -62,8 +96,10 @@ pub(super) fn focus_context_label(context: FocusContext) -> &'static str {
 }
 
 pub(super) fn status_line_style(app: &App, runtime_required: bool) -> Style {
+    let theme = th::current();
+    let base = theme.chrome();
     if app.runtime_prompt_open && !app.runtime_bootstrapping && runtime_required {
-        return Style::default().fg(th::CRUST).bg(th::RED);
+        return base.fg(theme.warning).add_modifier(Modifier::BOLD);
     }
     let lowered = app.status_line.to_lowercase();
     if lowered.starts_with("error:")
@@ -71,7 +107,7 @@ pub(super) fn status_line_style(app: &App, runtime_required: bool) -> Style {
         || lowered.contains("failed:")
         || lowered.contains("failed ")
     {
-        return Style::default().fg(th::TEXT).bg(th::SURFACE0);
+        return base.fg(theme.error).add_modifier(Modifier::BOLD);
     }
     if lowered.contains("saved")
         || lowered.contains("updated")
@@ -79,25 +115,39 @@ pub(super) fn status_line_style(app: &App, runtime_required: bool) -> Style {
         || lowered.contains("started")
         || lowered.contains("succeeded")
     {
-        return Style::default().fg(th::GREEN).bg(th::MANTLE);
+        return base.fg(theme.success);
     }
-    Style::default().fg(th::TEXT).bg(th::MANTLE)
+    if lowered.contains("active project")
+        || lowered.contains("runtime")
+        || lowered.contains("copied")
+        || lowered.contains("selected")
+    {
+        return theme.status_info().bg(theme.chrome_bg);
+    }
+    if lowered.contains("loading") || lowered.contains("bootstrap") {
+        return base.fg(theme.warning);
+    }
+    base
 }
 
 pub(super) fn key_value_value_style(value: &str) -> Style {
+    let theme = th::current();
     let lowered = value.trim().to_ascii_lowercase();
     if lowered == "true" {
-        return Style::default().fg(th::GREEN);
+        return Style::default().fg(theme.success);
     }
     if lowered == "false" {
-        return Style::default().fg(th::SUBTEXT0);
+        return Style::default().fg(theme.fg_dim);
     }
     if lowered == "unset" || lowered == "none" || lowered == "(none)" {
         return Style::default()
-            .fg(th::SUBTEXT0)
+            .fg(theme.fg_dim)
             .add_modifier(Modifier::ITALIC);
     }
-    Style::default().fg(th::TEXT)
+    if value.contains('/') || value.contains("\\") {
+        return theme.text_link();
+    }
+    theme.text()
 }
 
 pub(super) fn styled_key_value_rows(rows: Vec<(String, String)>) -> Vec<Row<'static>> {
@@ -106,7 +156,7 @@ pub(super) fn styled_key_value_rows(rows: Vec<(String, String)>) -> Vec<Row<'sta
             Row::new(vec![
                 Cell::from(Line::from(Span::styled(
                     property,
-                    Style::default().fg(th::SUBTEXT1),
+                    th::current().text_muted(),
                 ))),
                 Cell::from(Line::from(Span::styled(
                     value.clone(),
@@ -149,53 +199,54 @@ pub(super) fn key_value_table_layout(
 }
 
 pub(super) fn hint_bar_style() -> Style {
-    Style::default().fg(th::HINT_TEXT).bg(th::HINT_BG)
+    th::current().hint_bar()
 }
 
 pub(super) fn hint_line_from_bindings(bindings: &[HintBinding], max_items: usize) -> Line<'static> {
     Line::from(hint_spans_from_bindings(bindings, max_items))
 }
 
-pub(super) fn hint_spans_from_bindings(bindings: &[HintBinding], max_items: usize) -> Vec<Span<'static>> {
+pub(super) fn hint_spans_from_bindings(
+    bindings: &[HintBinding],
+    max_items: usize,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (idx, hint) in bindings.iter().take(max_items).enumerate() {
         if idx > 0 {
-            spans.push(Span::styled("  |  ", Style::default().fg(th::SUBTEXT1)));
+            spans.push(Span::styled("  ·  ", th::current().hint_sep()));
         }
-        spans.push(Span::styled(
-            hint.key.to_string(),
-            Style::default()
-                .fg(th::HINT_KEY)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(hint.key.to_string(), th::current().hint_key()));
         spans.push(Span::styled(
             format!(" {}", hint.desc),
-            Style::default().fg(th::HINT_TEXT),
+            th::current().hint_desc(),
         ));
     }
     spans
 }
 
 pub(super) fn log_line_style(line: &str) -> Style {
+    let theme = th::current();
     if line.starts_with("TASK [") {
-        return Style::default().fg(th::MAUVE).add_modifier(Modifier::BOLD);
+        return theme.text_emphasis();
     }
     if line.starts_with("PLAY [") || line.starts_with("PLAY RECAP") {
-        return Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD);
+        return Style::default()
+            .fg(theme.warning)
+            .add_modifier(Modifier::BOLD);
     }
     if line.starts_with("$ ") {
-        return Style::default().fg(th::SUBTEXT1);
+        return theme.text_muted();
     }
     if line.starts_with("ok:") || (line.contains("failed=0") && line.contains("changed=0")) {
-        return Style::default().fg(th::GREEN);
+        return Style::default().fg(theme.success);
     }
     if line.starts_with("changed:")
         || (line.contains("changed=") && has_nonzero_metric(line, "changed="))
     {
-        return Style::default().fg(th::YELLOW);
+        return Style::default().fg(theme.warning);
     }
     if line.starts_with("skipping:") {
-        return Style::default().fg(th::SUBTEXT0);
+        return theme.text_dim();
     }
     if line.contains("[stderr]")
         || line.contains("FAILED!")
@@ -203,9 +254,9 @@ pub(super) fn log_line_style(line: &str) -> Style {
         || has_nonzero_metric(line, "failed=")
         || has_nonzero_metric(line, "unreachable=")
     {
-        return Style::default().fg(th::RED).add_modifier(Modifier::BOLD);
+        return theme.status_error();
     }
-    Style::default().fg(th::TEXT)
+    theme.text()
 }
 
 pub(super) fn has_nonzero_metric(line: &str, key: &str) -> bool {
@@ -263,4 +314,3 @@ pub(super) fn summarize_inline_key(value: Option<&str>) -> String {
         _ => String::from("unset"),
     }
 }
-

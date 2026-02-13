@@ -3,10 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    BarChart, Block, BorderType, Borders, Gauge, Paragraph, Sparkline,
-    Wrap,
-};
+use ratatui::widgets::{BarChart, Gauge, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 
 use crate::app::{display_path, App, RunStatus};
@@ -15,6 +12,7 @@ use crate::theme as th;
 use super::common::*;
 
 pub(super) fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let running = app
         .runs
         .iter()
@@ -125,22 +123,30 @@ pub(super) fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layo
         ])
         .split(root[0]);
     frame.render_widget(
-        dashboard_stat_card("Inventories", app.inventories.len().to_string(), th::YELLOW),
+        dashboard_stat_card(
+            "Inventories",
+            app.inventories.len().to_string(),
+            theme.accent,
+        ),
         summary[0],
     );
     frame.render_widget(
-        dashboard_stat_card("Playbooks", app.playbooks.len().to_string(), th::MAUVE),
+        dashboard_stat_card("Playbooks", app.playbooks.len().to_string(), theme.accent),
         summary[1],
     );
     frame.render_widget(
-        dashboard_stat_card("Total Runs", total_runs.to_string(), th::GREEN),
+        dashboard_stat_card("Total Runs", total_runs.to_string(), theme.accent),
         summary[2],
     );
     frame.render_widget(
         dashboard_stat_card(
             "Failing Runs",
             failed.to_string(),
-            if failed > 0 { th::RED } else { th::GREEN },
+            if failed > 0 {
+                theme.error
+            } else {
+                theme.success
+            },
         ),
         summary[3],
     );
@@ -154,59 +160,51 @@ pub(super) fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layo
         ])
         .split(root[1]);
     let runtime_gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Runtime Health"),
-        )
+        .block(themed_panel("Runtime Health", false))
         .label(if runtime_ready {
             Span::styled(
                 "ready",
-                Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(
                 "missing",
-                Style::default().fg(th::RED).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
             )
         })
-        .gauge_style(Style::default().fg(if runtime_ready { th::GREEN } else { th::RED }))
+        .gauge_style(Style::default().fg(if runtime_ready {
+            theme.success
+        } else {
+            theme.error
+        }))
         .use_unicode(true)
         .percent(runtime_percent);
     frame.render_widget(runtime_gauge, gauges[0]);
 
     let success_gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Success Rate"),
-        )
+        .block(themed_panel("Success Rate", false))
         .label(Span::styled(
             format!("{success_percent}%"),
-            Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.success)
+                .add_modifier(Modifier::BOLD),
         ))
-        .gauge_style(Style::default().fg(th::GREEN))
+        .gauge_style(Style::default().fg(theme.success))
         .use_unicode(true)
         .percent(success_percent);
     frame.render_widget(success_gauge, gauges[1]);
 
     let coverage_gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Playbook Coverage"),
-        )
+        .block(themed_panel("Playbook Coverage", false))
         .label(Span::styled(
             format!("{coverage_percent}%"),
-            Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD),
+            theme.text_emphasis(),
         ))
-        .gauge_style(Style::default().fg(th::YELLOW))
+        .gauge_style(Style::default().fg(theme.accent))
         .use_unicode(true)
         .percent(coverage_percent);
     frame.render_widget(coverage_gauge, gauges[2]);
@@ -222,18 +220,12 @@ pub(super) fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layo
 
     let status_max = (running.max(succeeded).max(failed) as u64).max(1);
     let status_chart = BarChart::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Job Status Breakdown"),
-        )
+        .block(themed_panel("Job Status Breakdown", false))
         .bar_width(8)
         .bar_gap(2)
-        .value_style(Style::default().fg(th::TEXT).add_modifier(Modifier::BOLD))
-        .label_style(Style::default().fg(th::SUBTEXT1))
-        .bar_style(Style::default().fg(th::MAUVE))
+        .value_style(theme.text().add_modifier(Modifier::BOLD))
+        .label_style(theme.text_muted())
+        .bar_style(Style::default().fg(theme.accent))
         .data(&[
             ("run", running as u64),
             ("ok", succeeded as u64),
@@ -247,28 +239,16 @@ pub(super) fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layo
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(bottom[1]);
     let outcomes = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Run Outcomes (40)"),
-        )
-        .style(Style::default().fg(th::GREEN))
+        .block(themed_panel("Run Outcomes (40)", false))
+        .style(Style::default().fg(theme.accent))
         .max(100)
         .data(outcome_points);
     frame.render_widget(outcomes, trends[0]);
 
     let run_volume_max = daily_points.iter().copied().max().unwrap_or(1).max(1);
     let volume = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Run Volume (14d)"),
-        )
-        .style(Style::default().fg(th::YELLOW))
+        .block(themed_panel("Run Volume (14d)", false))
+        .style(Style::default().fg(theme.accent))
         .max(run_volume_max)
         .data(daily_points);
     frame.render_widget(volume, trends[1]);
@@ -287,7 +267,6 @@ pub(super) fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layo
         "Top Playbooks",
         &top_playbooks,
         playbook_max.max(1),
-        th::GREEN,
     );
     render_ranked_bar_panel(
         frame,
@@ -295,7 +274,6 @@ pub(super) fn render_dashboard(frame: &mut Frame, app: &App, area: ratatui::layo
         "Top Inventories",
         &top_inventories,
         inventory_max.max(1),
-        th::MAUVE,
     );
     render_project_summary_panel(frame, right[2], app, running, succeeded, failed, total_runs);
 }
@@ -305,8 +283,9 @@ pub(super) fn dashboard_stat_card(
     value: String,
     value_color: ratatui::style::Color,
 ) -> Paragraph<'static> {
+    let theme = th::current();
     Paragraph::new(vec![
-        Line::styled(label.to_string(), Style::default().fg(th::SUBTEXT1)),
+        Line::styled(label.to_string(), theme.text_muted()),
         Line::styled(
             value,
             Style::default()
@@ -314,16 +293,13 @@ pub(super) fn dashboard_stat_card(
                 .add_modifier(Modifier::BOLD),
         ),
     ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(neutral_border_style())
-            .style(Style::default().bg(th::SURFACE0)),
-    )
+    .block(themed_panel("", false))
 }
 
-pub(super) fn top_ranked_items(counts: &BTreeMap<String, u64>, max_items: usize) -> (Vec<(String, u64)>, u64) {
+pub(super) fn top_ranked_items(
+    counts: &BTreeMap<String, u64>,
+    max_items: usize,
+) -> (Vec<(String, u64)>, u64) {
     let mut items = counts
         .iter()
         .map(|(name, count)| (name.clone(), *count))
@@ -345,21 +321,18 @@ pub(super) fn render_ranked_bar_panel(
     title: &str,
     items: &[(String, u64)],
     max_value: u64,
-    bar_color: ratatui::style::Color,
 ) {
+    let theme = th::current();
     let bar_width = area.width.saturating_sub(8) as usize;
     let mut lines = Vec::new();
 
     if items.is_empty() {
-        lines.push(Line::styled(
-            "No run data yet.",
-            Style::default().fg(th::SUBTEXT0),
-        ));
+        lines.push(Line::styled("No run data yet.", theme.text_dim()));
     } else {
         for (name, count) in items {
             lines.push(Line::styled(
                 last_path_segment(name).to_string(),
-                Style::default().fg(th::SUBTEXT1),
+                theme.text_muted(),
             ));
 
             let ratio = if max_value == 0 {
@@ -376,21 +349,15 @@ pub(super) fn render_ranked_bar_panel(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{:>3} ", count),
-                    Style::default().fg(th::TEXT).add_modifier(Modifier::BOLD),
+                    theme.text().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(bar, Style::default().fg(bar_color)),
+                Span::styled(bar, Style::default().fg(theme.accent)),
             ]));
         }
     }
 
     let panel = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title(title),
-        )
+        .block(themed_panel(title, false))
         .wrap(Wrap { trim: false });
     frame.render_widget(panel, area);
 }
@@ -404,42 +371,31 @@ pub(super) fn render_project_summary_panel(
     failed: usize,
     total_runs: usize,
 ) {
+    let theme = th::current();
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled(
-            "Project: ",
-            Style::default()
-                .fg(th::SUBTEXT1)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(app.active_project_name(), Style::default().fg(th::TEXT)),
+        Span::styled("Project: ", theme.text_muted().add_modifier(Modifier::BOLD)),
+        Span::styled(app.active_project_name(), theme.text()),
     ]));
     lines.push(Line::styled(
         format!("Total runs: {total_runs}"),
-        Style::default().fg(th::SUBTEXT1),
+        theme.text_muted(),
     ));
     lines.push(Line::styled(
         format!("Succeeded: {succeeded}"),
-        Style::default().fg(th::GREEN),
+        Style::default().fg(theme.success),
     ));
     lines.push(Line::styled(
         format!("Failed: {failed}"),
-        Style::default().fg(th::RED),
+        Style::default().fg(theme.error),
     ));
     lines.push(Line::styled(
         format!("Running: {running}"),
-        Style::default().fg(th::YELLOW),
+        Style::default().fg(theme.warning),
     ));
 
     let panel = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Project Summary"),
-        )
+        .block(themed_panel("Project Summary", false))
         .wrap(Wrap { trim: false });
     frame.render_widget(panel, area);
 }
-

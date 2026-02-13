@@ -1,8 +1,9 @@
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Constraint, Direction, Layout, Margin};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Table, TableState, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Table, TableState,
+    Wrap,
 };
 use ratatui::Frame;
 
@@ -14,20 +15,16 @@ use super::common::*;
 use super::HINTS_RUNTIME_PROMPT;
 
 pub(super) fn render_settings(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(8)])
         .split(area);
 
     let mode_line = if app.global_settings_text_mode {
-        Paragraph::new("Global settings edit mode: ON").style(
-            Style::default()
-                .fg(th::CRUST)
-                .bg(th::YELLOW)
-                .add_modifier(Modifier::BOLD),
-        )
+        Paragraph::new("Global settings edit mode: ON").style(theme.chrome_accent())
     } else {
-        Paragraph::new("Global settings edit mode: OFF").style(Style::default().fg(th::SUBTEXT1))
+        Paragraph::new("Global settings edit mode: OFF").style(theme.text_muted())
     };
     frame.render_widget(mode_line, chunks[0]);
 
@@ -37,21 +34,15 @@ pub(super) fn render_settings(frame: &mut Frame, app: &App, area: ratatui::layou
         detail_cols,
     )
     .column_spacing(detail_spacing)
-    .row_highlight_style(
-        Style::default()
-            .fg(th::CRUST)
-            .bg(th::YELLOW)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol(">> ")
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-            .border_style(neutral_border_style())
-            .style(Style::default().bg(th::BASE))
-            .title("Global Settings"),
-    );
+    .row_highlight_style(theme.table_highlight())
+    .highlight_symbol(HIGHLIGHT_SYMBOL)
+    .block(themed_panel(
+        "Global Settings",
+        matches!(
+            app.content_focus_context(),
+            crate::app::FocusContext::Settings
+        ),
+    ));
     let mut state = TableState::default().with_selected(Some(app.global_settings_field_idx));
     frame.render_stateful_widget(table, chunks[1], &mut state);
 }
@@ -167,8 +158,16 @@ pub(super) fn display_global_settings_text(app: &App, idx: usize, current: &str)
 }
 
 pub(super) fn render_runtime_prompt(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(88, 78, frame.area());
     frame.render_widget(Clear, area);
+
+    frame.render_widget(themed_modal("Runtime Setup"), area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -179,21 +178,15 @@ pub(super) fn render_runtime_prompt(frame: &mut Frame, app: &App) {
             Constraint::Length(1),
             Constraint::Min(4),
         ])
-        .split(area);
+        .split(inner);
 
     let runtime_required = !playbook_bin_available(&app.run_options.ansible_bin);
     let alert_style = if app.runtime_bootstrapping {
-        Style::default().fg(th::CRUST).bg(th::YELLOW)
+        theme.status_warning().add_modifier(Modifier::BOLD)
     } else if runtime_required {
-        Style::default()
-            .fg(th::CRUST)
-            .bg(th::RED)
-            .add_modifier(Modifier::BOLD)
+        theme.status_error()
     } else {
-        Style::default()
-            .fg(th::CRUST)
-            .bg(th::GREEN)
-            .add_modifier(Modifier::BOLD)
+        theme.status_success().add_modifier(Modifier::BOLD)
     };
     let alert_text = if app.runtime_bootstrapping {
         "Runtime bootstrap in progress. Please wait."
@@ -208,26 +201,23 @@ pub(super) fn render_runtime_prompt(frame: &mut Frame, app: &App) {
     frame.render_widget(alert, chunks[0]);
 
     let title = if app.runtime_bootstrapping {
-        Span::styled(
-            " Runtime Setup (bootstrapping) ",
-            Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD),
-        )
+        Span::styled(" Runtime Setup (bootstrapping) ", theme.status_warning())
     } else if runtime_required {
-        Span::styled(
-            " Runtime Setup Required ",
-            Style::default().fg(th::RED).add_modifier(Modifier::BOLD),
-        )
+        Span::styled(" Runtime Setup Required ", theme.status_error())
     } else {
-        Span::styled(
-            " Runtime Selector ",
-            Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD),
-        )
+        Span::styled(" Runtime Selector ", theme.status_success())
     };
     let header = Paragraph::new(
         "Select an existing Ansible runtime below, or press b to install a managed runtime in ./.ansible-tui/runtime.",
     )
-        .block(Block::default().borders(Borders::ALL)
-                .border_type(BorderType::Rounded).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(neutral_border_style())
+                .style(theme.modal_bg())
+                .title(title),
+        )
         .wrap(Wrap { trim: true });
     frame.render_widget(header, chunks[1]);
 
@@ -249,15 +239,9 @@ pub(super) fn render_runtime_prompt(frame: &mut Frame, app: &App) {
             .collect::<Vec<_>>()
     };
     let candidates = List::new(candidate_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Candidates"),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel("Candidates", true))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut state = ListState::default().with_selected(if app.runtime_candidates.is_empty() {
         None
     } else {
@@ -283,14 +267,7 @@ pub(super) fn render_runtime_prompt(frame: &mut Frame, app: &App) {
         Text::from(lines)
     };
     let logs = Paragraph::new(runtime_logs)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Setup Logs"),
-        )
+        .block(themed_panel("Setup Logs", false))
         .wrap(Wrap { trim: false });
     frame.render_widget(logs, chunks[4]);
 }
-

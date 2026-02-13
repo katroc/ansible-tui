@@ -3,15 +3,10 @@ use std::collections::HashSet;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, Paragraph, Tabs,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Tabs};
 use ratatui::Frame;
 
-use crate::app::{
-    App, FocusContext, InventorySubTab,
-    View,
-};
+use crate::app::{App, FocusContext, InventorySubTab, View};
 use crate::run::playbook_bin_available;
 use crate::theme as th;
 
@@ -713,18 +708,19 @@ const HINTS_LIST_FILTER_EDIT: [HintBinding; 4] = [
 ];
 
 pub fn render(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     frame.render_widget(
-        Block::default().style(Style::default().bg(th::BASE)),
+        Block::default().style(Style::default().bg(theme.bg)),
         frame.area(),
     );
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(8),
             Constraint::Length(1),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(frame.area());
 
@@ -795,23 +791,20 @@ fn render_body(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_tabs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let titles = View::all()
         .iter()
         .map(|v| Line::from(Span::raw(v.title())))
         .collect::<Vec<_>>();
 
     let tabs = Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .style(Style::default().bg(th::MANTLE).fg(th::SUBTEXT1))
-                .title("Ansible TUI"),
-        )
         .select(app.view_idx)
-        .highlight_style(Style::default().fg(th::MAUVE).add_modifier(Modifier::BOLD))
-        .style(Style::default().fg(th::SUBTEXT0));
+        .highlight_style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(theme.chrome_bg).fg(theme.fg_muted));
 
     frame.render_widget(tabs, area);
 }
@@ -840,6 +833,7 @@ fn render_help(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_help_overlay(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let model = active_help_model(app);
     let hints = active_hint_bindings(app);
     let focus_label = focus_context_label(app.content_focus_context());
@@ -852,26 +846,21 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(2),
             Constraint::Min(6),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(area);
 
     let header = Paragraph::new(format!(
-        "Context: {}  |  Focus: {}",
+        "Context: {}  ·  Focus: {}",
         model.title, focus_label
     ))
-    .style(
-        Style::default()
-            .fg(th::TEXT)
-            .bg(th::SURFACE1)
-            .add_modifier(Modifier::BOLD),
-    )
+    .style(theme.chrome().add_modifier(Modifier::BOLD))
     .block(
         Block::default()
             .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(th::FOCUS_BORDER))
-            .style(Style::default().bg(th::MANTLE))
+            .border_type(BorderType::Rounded)
+            .border_style(theme.modal_border())
+            .style(theme.modal_bg())
             .title("Keyboard Help"),
     );
     frame.render_widget(header, layout[0]);
@@ -880,13 +869,8 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
         .iter()
         .map(|hint| {
             Line::from(vec![
-                Span::styled(
-                    format!("{:<18}", hint.key),
-                    Style::default()
-                        .fg(th::HINT_KEY)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(hint.desc, Style::default().fg(th::TEXT)),
+                Span::styled(format!("{:<18}", hint.key), theme.hint_key()),
+                Span::styled(hint.desc, theme.text()),
             ])
         })
         .collect::<Vec<_>>();
@@ -899,9 +883,9 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
     let body = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+            .border_type(BorderType::Rounded)
             .border_style(neutral_border_style())
-            .style(Style::default().bg(th::BASE)),
+            .style(theme.panel_style()),
     );
     frame.render_widget(body, layout[1]);
 
@@ -910,13 +894,14 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
 }
 
 fn compact_help_line(app: &App) -> Line<'static> {
+    let theme = th::current();
     let hints = active_hint_bindings(app);
     let mut spans = vec![
         Span::styled(
             format!("{} ", focus_context_label(app.content_focus_context())),
-            Style::default().fg(th::SUBTEXT1),
+            theme.hint_desc(),
         ),
-        Span::styled("| ", Style::default().fg(th::SUBTEXT1)),
+        Span::styled("· ", theme.hint_sep()),
     ];
     spans.extend(hint_spans_from_bindings(&hints, 5));
     Line::from(spans)
@@ -1143,7 +1128,6 @@ fn help_toggle_available(app: &App) -> bool {
         || app.hosts_subtab_add_var_open
         || (app.current_view() == View::Settings && app.global_settings_text_mode))
 }
-
 
 #[cfg(test)]
 mod tests {

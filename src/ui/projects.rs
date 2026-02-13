@@ -1,18 +1,17 @@
 use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Table, Wrap,
-};
+use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Table, Wrap};
 use ratatui::Frame;
 
-use crate::app::{display_path, App, FilterTarget, ProjectCreateMode};
+use crate::app::{display_path, App, FilterTarget, FocusContext, ProjectCreateMode};
 use crate::theme as th;
 
 use super::common::*;
 use super::{HINTS_PROJECT_CREATE, HINTS_PROJECT_SECRETS};
 
 pub(super) fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
@@ -37,20 +36,18 @@ pub(super) fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layou
             })
             .collect::<Vec<_>>()
     };
+    let list_focused = matches!(app.content_focus_context(), FocusContext::Projects);
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title(filtered_list_title(
-                    "Projects",
-                    app.filter_query_for(FilterTarget::Projects),
-                    app.is_filter_editing_target(FilterTarget::Projects),
-                )),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel(
+            filtered_list_title(
+                "Projects",
+                app.filter_query_for(FilterTarget::Projects),
+                app.is_filter_editing_target(FilterTarget::Projects),
+            ),
+            list_focused,
+        ))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut state = ListState::default().with_selected(
         filtered_project_indices
             .iter()
@@ -159,21 +156,11 @@ pub(super) fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layou
     let (detail_cols, detail_spacing) = key_value_table_layout(right[0], 20);
     let details = Table::new(styled_key_value_rows(rows), detail_cols)
         .column_spacing(detail_spacing)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .style(Style::default().bg(th::BASE))
-                .title("Project Details"),
-        );
+        .block(themed_panel("Project Details", false));
     frame.render_widget(details, right[0]);
 
     let log_lines = if app.project_sync_logs.is_empty() {
-        vec![Line::styled(
-            "No project sync logs yet.",
-            Style::default().fg(th::SUBTEXT0),
-        )]
+        vec![Line::styled("No project sync logs yet.", theme.text_dim())]
     } else {
         app.project_sync_logs
             .iter()
@@ -185,31 +172,25 @@ pub(super) fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layou
     };
     let logs = Paragraph::new(log_lines)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(if app.project_sync_running {
-                    Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                } else {
-                    neutral_border_style()
-                })
-                .title("Project Sync Logs"),
+            themed_panel("Project Sync Logs", false).border_style(if app.project_sync_running {
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                neutral_border_style()
+            }),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(logs, right[1]);
 }
 
 pub(super) fn render_project_create_prompt(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let is_git = app.project_create_mode == ProjectCreateMode::Git;
     let area = centered_rect(72, if is_git { 62 } else { 56 }, frame.area());
     frame.render_widget(Clear, area);
 
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th::MAUVE))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title(app.project_create_mode.title());
+    let wrapper = themed_modal(app.project_create_mode.title());
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -247,10 +228,7 @@ pub(super) fn render_project_create_prompt(frame: &mut Frame, app: &App) {
         ProjectCreateMode::ExistingFs => "Registers an existing local project path.",
         ProjectCreateMode::Git => "Clones a git repository and registers it as a project.",
     };
-    frame.render_widget(
-        Paragraph::new(intro).style(Style::default().fg(th::SUBTEXT1)),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(intro).style(theme.text_muted()), chunks[0]);
 
     let field_rows = match app.project_create_mode {
         ProjectCreateMode::New => vec![
@@ -295,19 +273,10 @@ pub(super) fn render_project_create_prompt(frame: &mut Frame, app: &App) {
         } else {
             value.clone()
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-            .border_style(if focused {
-                Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-            } else {
-                neutral_border_style()
-            })
-            .title(*label);
         frame.render_widget(
             Paragraph::new(display)
-                .block(block)
-                .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+                .block(themed_input(*label, focused))
+                .style(theme.modal_bg()),
             chunks[idx + 1],
         );
     }
@@ -319,15 +288,11 @@ pub(super) fn render_project_create_prompt(frame: &mut Frame, app: &App) {
 }
 
 pub(super) fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(78, 72, frame.area());
     frame.render_widget(Clear, area);
 
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th::MAUVE))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Project Secret Settings");
+    let wrapper = themed_modal("Project Secret Settings");
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -343,7 +308,7 @@ pub(super) fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -352,9 +317,9 @@ pub(super) fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| String::from("(unknown)"));
     frame.render_widget(
         Paragraph::new(format!(
-            "Project: {project_name} | Vault refs default from project and can be overridden in templates."
+            "Project: {project_name} · Vault refs default from project and can be overridden in templates."
         ))
-        .style(Style::default().fg(th::SUBTEXT1)),
+        .style(theme.text_muted()),
         chunks[0],
     );
 
@@ -372,18 +337,8 @@ pub(super) fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(file_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if file_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("SSH Key File Path"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            .block(themed_input("SSH Key File Path", file_focused))
+            .style(theme.modal_bg()),
         chunks[1],
     );
 
@@ -405,18 +360,8 @@ pub(super) fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(inline_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if inline_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Inline SSH Private Key"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE))
+            .block(themed_input("Inline SSH Private Key", inline_focused))
+            .style(theme.modal_bg())
             .wrap(Wrap { trim: false }),
         chunks[2],
     );
@@ -432,18 +377,8 @@ pub(super) fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
         } else {
             source_value
         })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(if source_focused {
-                    Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                } else {
-                    neutral_border_style()
-                })
-                .title("Vault Source Type"),
-        )
-        .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+        .block(themed_input("Vault Source Type", source_focused))
+        .style(theme.modal_bg()),
         chunks[3],
     );
 
@@ -461,18 +396,8 @@ pub(super) fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(vault_file_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if vault_file_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Vault Password File"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            .block(themed_input("Vault Password File", vault_file_focused))
+            .style(theme.modal_bg()),
         chunks[4],
     );
 
@@ -490,18 +415,8 @@ pub(super) fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(vault_id_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(if vault_id_focused {
-                        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-                    } else {
-                        neutral_border_style()
-                    })
-                    .title("Vault ID Label"),
-            )
-            .style(Style::default().fg(th::TEXT).bg(th::BASE)),
+            .block(themed_input("Vault ID Label", vault_id_focused))
+            .style(theme.modal_bg()),
         chunks[5],
     );
 
@@ -510,4 +425,3 @@ pub(super) fn render_project_ssh_prompt(frame: &mut Frame, app: &App) {
         chunks[6],
     );
 }
-

@@ -2,8 +2,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Table,
-    TableState, Wrap,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Table, TableState,
+    Wrap,
 };
 use ratatui::Frame;
 
@@ -15,6 +15,7 @@ use super::common::*;
 use super::{HINTS_SETTINGS_EDITOR, HINTS_SETTINGS_EDITOR_TEXT};
 
 pub(super) fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(14), Constraint::Length(8)])
@@ -28,7 +29,7 @@ pub(super) fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layo
     let items = if app.playbooks.is_empty() {
         vec![ListItem::new(Line::from(vec![
             Span::raw("No playbooks found. "),
-            Span::styled("Add .yml files to ./playbooks", Style::default().fg(th::SUBTEXT0)),
+            Span::styled("Add .yml files to ./playbooks", theme.text_dim()),
         ]))]
     } else if filtered_playbook_indices.is_empty() {
         vec![ListItem::new("No playbooks match current filter")]
@@ -46,31 +47,17 @@ pub(super) fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layo
     let focus_ctx = app.content_focus_context();
     let playbooks_focused = matches!(focus_ctx, FocusContext::PlaybooksList);
     let runs_focused = matches!(focus_ctx, FocusContext::PlaybooksRuns);
-    let playbooks_border_style = if playbooks_focused {
-        Style::default().fg(th::YELLOW).add_modifier(Modifier::BOLD)
-    } else {
-        neutral_border_style()
-    };
-    let runs_border_style = if runs_focused {
-        Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
-    } else {
-        neutral_border_style()
-    };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(playbooks_border_style)
-                .style(focus_bg(playbooks_focused))
-                .title(filtered_list_title(
-                    "Playbooks",
-                    app.filter_query_for(FilterTarget::Playbooks),
-                    app.is_filter_editing_target(FilterTarget::Playbooks),
-                )),
-        )
-        .highlight_style(Style::default().fg(th::YELLOW))
-        .highlight_symbol(">> ");
+        .block(themed_panel(
+            filtered_list_title(
+                "Playbooks",
+                app.filter_query_for(FilterTarget::Playbooks),
+                app.is_filter_editing_target(FilterTarget::Playbooks),
+            ),
+            playbooks_focused,
+        ))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let mut state = ListState::default().with_selected(
         filtered_playbook_indices
             .iter()
@@ -113,20 +100,16 @@ pub(super) fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layo
             .collect::<Vec<_>>()
     };
     let runs = List::new(run_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(runs_border_style)
-                .style(focus_bg(runs_focused))
-                .title(filtered_list_title(
-                    &format!("Runs For Selected Playbook ({})", app.active_project_name()),
-                    app.filter_query_for(FilterTarget::PlaybookRuns),
-                    app.is_filter_editing_target(FilterTarget::PlaybookRuns),
-                )),
-        )
-        .highlight_style(Style::default().fg(th::GREEN))
-        .highlight_symbol(">> ");
+        .block(themed_panel(
+            filtered_list_title(
+                &format!("Runs For Selected Playbook ({})", app.active_project_name()),
+                app.filter_query_for(FilterTarget::PlaybookRuns),
+                app.is_filter_editing_target(FilterTarget::PlaybookRuns),
+            ),
+            runs_focused,
+        ))
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
     let selected_run_pos = run_indices.iter().position(|idx| *idx == app.run_idx);
     let mut runs_state = ListState::default().with_selected(selected_run_pos);
     frame.render_stateful_widget(runs, top[1], &mut runs_state);
@@ -146,32 +129,20 @@ pub(super) fn render_playbooks(frame: &mut Frame, app: &App, area: ratatui::layo
         let (detail_cols, detail_spacing) = key_value_table_layout(chunks[1], 22);
         let table = Table::new(rows, detail_cols)
             .column_spacing(detail_spacing)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                    .border_style(neutral_border_style())
-                    .style(Style::default().bg(th::BASE))
-                    .title("Playbook Settings"),
-            );
+            .block(themed_panel("Playbook Settings", false));
         frame.render_widget(table, chunks[1]);
     } else {
         let paragraph = Paragraph::new(vec![
             Line::raw("No playbook selected"),
             Line::raw("Press t in Playbooks tab to create/edit settings"),
         ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(neutral_border_style())
-                .title("Playbook Settings"),
-        );
+        .block(themed_panel("Playbook Settings", false));
         frame.render_widget(paragraph, chunks[1]);
     }
 }
 
 pub(super) fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
     let empty_message = if app.current_view() == View::Templates {
         "No run selected for this template yet."
     } else {
@@ -192,17 +163,14 @@ pub(super) fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::R
                     run.status.as_str()
                 ),
                 Style::default()
-                    .fg(th::SUBTEXT1)
+                    .fg(theme.fg_muted)
                     .add_modifier(Modifier::BOLD),
             )];
             lines.push(Line::raw(""));
 
             let log_slots = viewport_height.saturating_sub(lines.len());
             if run.logs.is_empty() {
-                lines.push(Line::styled(
-                    "No logs yet for this run.",
-                    Style::default().fg(th::SUBTEXT0),
-                ));
+                lines.push(Line::styled("No logs yet for this run.", theme.text_dim()));
             } else if log_slots > 0 {
                 if app.log_select_mode {
                     let cursor = app.log_cursor.min(run.logs.len() - 1);
@@ -219,10 +187,16 @@ pub(super) fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::R
                     for (idx, line) in run.logs.iter().enumerate().take(end).skip(start) {
                         let mut style = log_line_style(line);
                         if idx >= sel_start && idx <= sel_end {
-                            style = style.bg(th::SURFACE1).add_modifier(Modifier::BOLD);
+                            style = style
+                                .bg(theme.selection_bg)
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD);
                         }
                         if idx == cursor {
-                            style = style.bg(th::MANTLE).add_modifier(Modifier::REVERSED);
+                            style = style
+                                .bg(theme.accent_soft)
+                                .fg(theme.selection_fg)
+                                .add_modifier(Modifier::BOLD);
                         }
                         lines.push(Line::styled(format!("{:>4} {}", idx + 1, line), style));
                     }
@@ -238,59 +212,30 @@ pub(super) fn render_logs(frame: &mut Frame, app: &App, area: ratatui::layout::R
         .unwrap_or_else(|| Text::from(empty_message));
 
     let focus_ctx = app.content_focus_context();
-    let (title, border_style) = if app.current_view() == View::Templates {
+    let (title, focused) = if app.current_view() == View::Templates {
         (
             "Template Run Logs",
-            if matches!(focus_ctx, FocusContext::TemplatesLogSelect) {
-                Style::default()
-                    .fg(th::FOCUS_BORDER)
-                    .add_modifier(Modifier::BOLD)
-            } else if matches!(focus_ctx, FocusContext::TemplatesRuns) {
-                Style::default().fg(th::GREEN).add_modifier(Modifier::BOLD)
-            } else {
-                neutral_border_style()
-            },
+            matches!(focus_ctx, FocusContext::TemplatesLogSelect),
         )
     } else {
         (
             "Live Logs (Selected Run)",
-            if matches!(focus_ctx, FocusContext::PlaybooksLogSelect) {
-                Style::default()
-                    .fg(th::FOCUS_BORDER)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                neutral_border_style()
-            },
+            matches!(focus_ctx, FocusContext::PlaybooksLogSelect),
         )
     };
 
     let paragraph = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(border_style)
-                .title(title),
-        )
+        .block(themed_panel(title, focused))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
 pub(super) fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
+    let theme = th::current();
     let area = centered_rect(76, 72, frame.area());
     frame.render_widget(Clear, area);
 
-    let border_color = if app.settings_editor_text_mode {
-        th::YELLOW
-    } else {
-        th::MAUVE
-    };
-    let wrapper = Block::default()
-        .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .style(Style::default().fg(th::TEXT).bg(th::MANTLE))
-        .title("Playbook Settings");
+    let wrapper = themed_modal("Playbook Settings");
     frame.render_widget(wrapper, area);
 
     let inner = area.inner(Margin {
@@ -303,7 +248,7 @@ pub(super) fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
             Constraint::Length(2),
             Constraint::Length(3),
             Constraint::Min(12),
-            Constraint::Length(2),
+            Constraint::Length(1),
         ])
         .split(inner);
 
@@ -313,12 +258,9 @@ pub(super) fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
         "Edit mode: OFF"
     };
     let mode_style = if app.settings_editor_text_mode {
-        Style::default()
-            .fg(th::CRUST)
-            .bg(th::YELLOW)
-            .add_modifier(Modifier::BOLD)
+        theme.chrome_accent()
     } else {
-        Style::default().fg(th::SUBTEXT1)
+        theme.text_muted()
     };
     frame.render_widget(Paragraph::new(mode_label).style(mode_style), chunks[0]);
 
@@ -332,7 +274,7 @@ pub(super) fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
                 .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style()),
         )
-        .style(Style::default().fg(th::TEXT).bg(th::BASE));
+        .style(theme.modal_bg());
     frame.render_widget(header, chunks[1]);
 
     let settings = app.selected_playbook_settings().unwrap_or_default();
@@ -340,19 +282,14 @@ pub(super) fn render_playbook_settings_editor(frame: &mut Frame, app: &App) {
     let (detail_cols, detail_spacing) = key_value_table_layout(chunks[2], 30);
     let fields = Table::new(styled_key_value_rows(rows), detail_cols)
         .column_spacing(detail_spacing)
-        .row_highlight_style(
-            Style::default()
-                .fg(th::CRUST)
-                .bg(th::YELLOW)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ")
+        .row_highlight_style(theme.table_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(neutral_border_style())
-                .style(Style::default().fg(th::TEXT).bg(th::BASE))
+                .style(theme.modal_bg())
                 .title("Fields"),
         );
     let mut fields_state = TableState::default().with_selected(Some(app.settings_editor_field_idx));
@@ -507,7 +444,11 @@ pub(super) fn display_setting_text(app: &App, idx: usize, current: &str) -> Stri
     }
 }
 
-pub(super) fn display_setting_inline_key_text(app: &App, idx: usize, current: Option<&str>) -> String {
+pub(super) fn display_setting_inline_key_text(
+    app: &App,
+    idx: usize,
+    current: Option<&str>,
+) -> String {
     if app.settings_editor_text_mode && app.settings_editor_field_idx == idx {
         let escaped = app
             .settings_editor_text_buffer
@@ -522,4 +463,3 @@ pub(super) fn display_setting_inline_key_text(app: &App, idx: usize, current: Op
         summarize_inline_key(current)
     }
 }
-
