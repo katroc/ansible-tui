@@ -7,7 +7,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, View};
+use crate::app::{App, View, GLOBAL_SETTINGS_THEME_FIELD_IDX};
 use crate::run::playbook_bin_available;
 use crate::theme as th;
 
@@ -21,14 +21,21 @@ pub(super) fn render_settings(frame: &mut Frame, app: &App, area: ratatui::layou
         .constraints([Constraint::Length(1), Constraint::Min(8)])
         .split(area);
 
-    let mode_line = if app.global_settings_text_mode {
+    let mode_line = if app.global_theme_picker_mode {
+        Paragraph::new("Theme picker mode: ON").style(theme.chrome_accent())
+    } else if app.global_settings_text_mode {
         Paragraph::new("Global settings edit mode: ON").style(theme.chrome_accent())
     } else {
         Paragraph::new("Global settings edit mode: OFF").style(theme.text_muted())
     };
     frame.render_widget(mode_line, chunks[0]);
 
-    let (detail_cols, detail_spacing) = key_value_table_layout(chunks[1], 30);
+    let body_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(chunks[1]);
+
+    let (detail_cols, detail_spacing) = key_value_table_layout(body_chunks[0], 30);
     let table = Table::new(
         styled_key_value_rows(global_settings_rows(app)),
         detail_cols,
@@ -44,7 +51,9 @@ pub(super) fn render_settings(frame: &mut Frame, app: &App, area: ratatui::layou
         ),
     ));
     let mut state = TableState::default().with_selected(Some(app.global_settings_field_idx));
-    frame.render_stateful_widget(table, chunks[1], &mut state);
+    frame.render_stateful_widget(table, body_chunks[0], &mut state);
+
+    render_theme_selector(frame, app, body_chunks[1]);
 }
 
 pub(super) fn global_settings_rows(app: &App) -> Vec<(String, String)> {
@@ -139,7 +148,44 @@ pub(super) fn global_settings_rows(app: &App) -> Vec<(String, String)> {
             String::from("secret_enforcement_mode"),
             app.secret_enforcement_mode.as_str().to_string(),
         ),
+        (
+            String::from("theme"),
+            th::active_theme_name().display_name().to_string(),
+        ),
     ]
+}
+
+fn render_theme_selector(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let theme = th::current();
+    let active_theme = th::active_theme_name();
+    let items = th::ThemeName::all()
+        .iter()
+        .map(|theme_name| ListItem::new(theme_name.display_name()))
+        .collect::<Vec<_>>();
+    let selected = if app.global_theme_picker_mode {
+        Some(
+            app.global_theme_picker_idx
+                .min(th::ThemeName::all().len().saturating_sub(1)),
+        )
+    } else {
+        th::ThemeName::all()
+            .iter()
+            .position(|theme_name| *theme_name == active_theme)
+    };
+    let mut state = ListState::default().with_selected(selected);
+    let list = List::new(items)
+        .block(themed_panel(
+            "Themes",
+            matches!(
+                app.content_focus_context(),
+                crate::app::FocusContext::Settings
+            ) && (app.global_settings_field_idx == GLOBAL_SETTINGS_THEME_FIELD_IDX
+                || app.global_theme_picker_mode),
+        ))
+        .style(theme.text_muted())
+        .highlight_style(theme.list_highlight())
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 pub(super) fn display_global_settings_text(app: &App, idx: usize, current: &str) -> String {

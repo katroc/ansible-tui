@@ -11,7 +11,7 @@ Foundation-first Rust TUI for Ansible operations.
 ## Current baseline
 
 - Modular TUI shell with views: Dashboard, Inventory, Playbooks, Settings
-- Catppuccin Mocha theme across panels, status, and prompts
+- 18 built-in named themes (Catppuccin, Dracula, TokyoNight, Gruvbox, Nord, OneDark, Ayu, Solarized, Monokai, Kanagawa, Everforest, Nightfox, Rose Pine, Material Ocean, Palenight, Tomorrow Night)
 - Project discovery for inventories and playbooks
 - Async action/event loop
 - Real `ansible-playbook` execution with live `stdout`/`stderr` streaming
@@ -57,6 +57,7 @@ Foundation-first Rust TUI for Ansible operations.
 - `t`: open/close playbook settings editor (in Playbooks tab)
 - `e`: edit selected text field (or press `Enter`) in Playbook/Global settings editors
 - `Left/Right` or `h/l` (Settings tab): adjust selected boolean/numeric setting
+- `Enter` on `theme` (Settings tab): open theme picker, then use `j/k` or `Up/Down` to preview/apply and `Enter`/`Esc` to close
 - `Space`: toggle selected boolean in Playbook/Global settings editors
 - `Backspace`: delete while editing a text field
 - `?`: toggle keyboard help overlay for the current context (`Esc` or `?` closes)
@@ -91,6 +92,7 @@ In the Settings tab you can edit these global defaults:
 - ansible.cfg default: `private_key_file`
 - ansible.cfg default: `pipelining`
 - app config: `secret_enforcement_mode` (`strict` or `compat`)
+- app config: `theme` (select from built-in named themes)
 
 ## Project discovery rules
 
@@ -108,7 +110,7 @@ In the Settings tab you can edit these global defaults:
 - `ANSIBLE_TUI_TAGS` -> `--tags`
 - `ANSIBLE_TUI_EXTRA_VARS` -> `--extra-vars`
 - `ANSIBLE_TUI_EXTRA_ARGS` -> additional CLI args appended before playbook path (not an ansible option)
-- `ANSIBLE_TUI_THEME` -> force UI palette (`dark` default, `light` optional)
+- `ANSIBLE_TUI_THEME` -> force UI palette (`catppuccin-mocha` default; also supports legacy `dark`/`light` aliases)
 
 ## Per-playbook settings
 

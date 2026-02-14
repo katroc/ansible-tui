@@ -37,6 +37,7 @@ use crate::run_store::{
     load_runs, migrate_unstable_hash_history, save_run, take_legacy_environment_migration_notice,
 };
 use crate::secrets::{SecretEnforcementMode, VaultSourceType};
+use crate::theme::{self, ThemeName};
 use crate::ui_session::{load_ui_session_state, save_ui_session_state, UiSessionState};
 
 const MAX_LOG_LINES: usize = 1_000;
@@ -44,7 +45,8 @@ const MAX_RUNTIME_LOG_LINES: usize = 120;
 const AUTO_DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 const PLAYBOOK_SETTINGS_FIELD_COUNT: usize = 12;
 const PLAYBOOK_SETTINGS_TEXT_FIELD_START: usize = 6;
-const GLOBAL_SETTINGS_FIELD_COUNT: usize = 13;
+pub const GLOBAL_SETTINGS_THEME_FIELD_IDX: usize = 13;
+const GLOBAL_SETTINGS_FIELD_COUNT: usize = GLOBAL_SETTINGS_THEME_FIELD_IDX + 1;
 const TEMPLATE_EDITOR_FIELD_COUNT: usize = 19;
 const PROJECT_SECRET_FIELD_COUNT: usize = 5;
 const MAX_PROJECT_SYNC_LOG_LINES: usize = 400;
@@ -439,6 +441,8 @@ pub struct App {
     pub global_settings_field_idx: usize,
     pub global_settings_text_mode: bool,
     pub global_settings_text_buffer: String,
+    pub global_theme_picker_mode: bool,
+    pub global_theme_picker_idx: usize,
     pub secret_enforcement_mode: SecretEnforcementMode,
     pub list_filters: ListFilters,
     pub filter_edit_mode: bool,
@@ -478,6 +482,7 @@ impl App {
         let mut run_options = RunOptions::from_env();
         let mut secret_enforcement_mode = SecretEnforcementMode::Strict;
         let mut status_line = String::from("Ready. Press r to run selected template.");
+        theme::apply_env_theme_preference();
         match load_app_config(&cwd) {
             Ok(config) => Self::apply_loaded_global_config(
                 &mut run_options,
@@ -592,6 +597,11 @@ impl App {
             global_settings_field_idx: 0,
             global_settings_text_mode: false,
             global_settings_text_buffer: String::new(),
+            global_theme_picker_mode: false,
+            global_theme_picker_idx: ThemeName::all()
+                .iter()
+                .position(|theme_name| *theme_name == theme::active_theme_name())
+                .unwrap_or(0),
             secret_enforcement_mode,
             list_filters: ListFilters::default(),
             filter_edit_mode: false,
@@ -710,44 +720,65 @@ impl App {
         secret_enforcement_mode: &mut SecretEnforcementMode,
         config: AppConfig,
     ) {
+        let AppConfig {
+            ansible_bin,
+            theme: config_theme,
+            check,
+            diff,
+            become_enabled,
+            verbosity,
+            forks,
+            timeout,
+            limit,
+            tags,
+            extra_vars,
+            extra_args,
+            secret_enforcement_mode: config_secret_enforcement_mode,
+        } = config;
+
         if std::env::var("ANSIBLE_TUI_PLAYBOOK_BIN").is_err() {
-            if let Some(bin) = config.ansible_bin {
+            if let Some(bin) = ansible_bin {
                 run_options.ansible_bin = bin;
             }
         }
-        if let Some(check) = config.check {
+        if let Some(check) = check {
             run_options.check = check;
         }
-        if let Some(diff) = config.diff {
+        if let Some(diff) = diff {
             run_options.diff = diff;
         }
-        if let Some(become_enabled) = config.become_enabled {
+        if let Some(become_enabled) = become_enabled {
             run_options.become_enabled = become_enabled;
         }
         if std::env::var("ANSIBLE_TUI_VERBOSITY").is_err() {
-            if let Some(verbosity) = config.verbosity {
+            if let Some(verbosity) = verbosity {
                 run_options.verbosity = verbosity.min(4);
             }
         }
         if std::env::var("ANSIBLE_TUI_FORKS").is_err() {
-            run_options.forks = config.forks;
+            run_options.forks = forks;
         }
         if std::env::var("ANSIBLE_TUI_TIMEOUT").is_err() {
-            run_options.timeout = config.timeout;
+            run_options.timeout = timeout;
         }
         if std::env::var("ANSIBLE_TUI_LIMIT").is_err() {
-            run_options.limit = config.limit;
+            run_options.limit = limit;
         }
         if std::env::var("ANSIBLE_TUI_TAGS").is_err() {
-            run_options.tags = config.tags;
+            run_options.tags = tags;
         }
         if std::env::var("ANSIBLE_TUI_EXTRA_VARS").is_err() {
-            run_options.extra_vars = config.extra_vars;
+            run_options.extra_vars = extra_vars;
         }
         if std::env::var("ANSIBLE_TUI_EXTRA_ARGS").is_err() {
-            run_options.extra_args = config.extra_args;
+            run_options.extra_args = extra_args;
         }
-        if let Some(mode) = config.secret_enforcement_mode {
+        if std::env::var("ANSIBLE_TUI_THEME").is_err() {
+            if let Some(theme_name) = config_theme.as_deref().and_then(ThemeName::from_str) {
+                theme::set_theme(theme_name);
+            }
+        }
+        if let Some(mode) = config_secret_enforcement_mode {
             *secret_enforcement_mode = mode;
         }
     }
@@ -1127,6 +1158,8 @@ impl App {
                     } else {
                         self.inventory_sub_tab = InventorySubTab::Files;
                     }
+                } else if self.current_view() == View::Settings && self.global_theme_picker_mode {
+                    self.close_global_theme_picker();
                 } else if self.current_view() == View::Settings && self.global_settings_text_mode {
                     self.cancel_global_settings_text_edit();
                 } else if self.log_select_mode
@@ -1394,7 +1427,8 @@ impl App {
             && !self.inventory_edit_mode_open
             && !self.runtime_prompt_open
             && !self.filter_edit_mode
-            && !(self.current_view() == View::Settings && self.global_settings_text_mode)
+            && !(self.current_view() == View::Settings
+                && (self.global_settings_text_mode || self.global_theme_picker_mode))
     }
 
     fn handle_next_view_action(&mut self) {
@@ -1422,6 +1456,9 @@ impl App {
     }
 
     fn handle_settings_increase_action(&mut self) {
+        if self.current_view() == View::Settings && self.global_theme_picker_mode {
+            return;
+        }
         if self.vault_runtime_prompt_open {
             self.vault_runtime_prompt_field_idx = min(
                 self.vault_runtime_prompt_field_idx + 1,
@@ -1457,6 +1494,9 @@ impl App {
     }
 
     fn handle_settings_decrease_action(&mut self) {
+        if self.current_view() == View::Settings && self.global_theme_picker_mode {
+            return;
+        }
         if self.vault_runtime_prompt_open {
             self.vault_runtime_prompt_field_idx =
                 self.vault_runtime_prompt_field_idx.saturating_sub(1);
@@ -1529,7 +1569,9 @@ impl App {
                 _ => {}
             }
         } else if self.current_view() == View::Settings {
-            if !self.global_settings_text_mode {
+            if self.global_theme_picker_mode {
+                self.adjust_global_theme_picker(-1);
+            } else if !self.global_settings_text_mode {
                 self.global_settings_field_idx = self.global_settings_field_idx.saturating_sub(1);
             }
         } else if self.log_select_mode {
@@ -1598,7 +1640,9 @@ impl App {
                 _ => {}
             }
         } else if self.current_view() == View::Settings {
-            if !self.global_settings_text_mode {
+            if self.global_theme_picker_mode {
+                self.adjust_global_theme_picker(1);
+            } else if !self.global_settings_text_mode {
                 self.global_settings_field_idx = min(
                     self.global_settings_field_idx + 1,
                     GLOBAL_SETTINGS_FIELD_COUNT - 1,
@@ -2063,6 +2107,16 @@ impl App {
     }
 
     fn handle_settings_view_char(&mut self, ch: char, tx: &UnboundedSender<Action>) {
+        if self.global_theme_picker_mode {
+            match ch {
+                'j' => self.adjust_global_theme_picker(1),
+                'k' => self.adjust_global_theme_picker(-1),
+                'e' => self.close_global_theme_picker(),
+                _ => {}
+            }
+            return;
+        }
+
         match ch {
             'j' => {
                 self.global_settings_field_idx = min(
@@ -2490,8 +2544,16 @@ impl App {
     }
 
     fn confirm_global_settings_editor(&mut self) {
+        if self.global_theme_picker_mode {
+            self.close_global_theme_picker();
+            return;
+        }
         if self.global_settings_text_mode {
             self.commit_global_settings_text_edit();
+            return;
+        }
+        if self.global_settings_field_idx == GLOBAL_SETTINGS_THEME_FIELD_IDX {
+            self.begin_global_theme_picker();
             return;
         }
         if self.global_settings_field_is_text() {
@@ -2506,7 +2568,10 @@ impl App {
     }
 
     fn begin_global_settings_text_edit(&mut self) {
-        if self.runtime_prompt_open || !self.global_settings_field_is_text() {
+        if self.runtime_prompt_open
+            || self.global_theme_picker_mode
+            || !self.global_settings_field_is_text()
+        {
             return;
         }
         self.global_settings_text_buffer = self.current_global_settings_text_value();
@@ -2584,8 +2649,66 @@ impl App {
         }
     }
 
+    fn begin_global_theme_picker(&mut self) {
+        if self.current_view() != View::Settings
+            || self.global_settings_field_idx != GLOBAL_SETTINGS_THEME_FIELD_IDX
+            || self.global_settings_text_mode
+        {
+            return;
+        }
+        self.global_theme_picker_mode = true;
+        self.global_theme_picker_idx = ThemeName::all()
+            .iter()
+            .position(|theme_name| *theme_name == theme::active_theme_name())
+            .unwrap_or(0);
+        self.status_line = String::from("Theme picker: j/k choose, Enter apply, Esc close");
+    }
+
+    fn close_global_theme_picker(&mut self) {
+        if !self.global_theme_picker_mode {
+            return;
+        }
+        self.global_theme_picker_mode = false;
+        self.status_line = format!(
+            "Theme selected: {}",
+            theme::active_theme_name().display_name()
+        );
+    }
+
+    fn adjust_global_theme_picker(&mut self, delta: i8) {
+        if !self.global_theme_picker_mode || delta == 0 {
+            return;
+        }
+
+        let themes = ThemeName::all();
+        if themes.is_empty() {
+            return;
+        }
+
+        let current_index = self
+            .global_theme_picker_idx
+            .min(themes.len().saturating_sub(1));
+        let next_index = if delta > 0 {
+            (current_index + 1) % themes.len()
+        } else if current_index == 0 {
+            themes.len() - 1
+        } else {
+            current_index - 1
+        };
+
+        let next = themes[next_index];
+        self.global_theme_picker_idx = next_index;
+        theme::set_theme(next);
+        self.needs_full_redraw = true;
+        self.status_line = format!("Theme set to {}", next.display_name());
+        self.persist_global_settings();
+    }
+
     fn toggle_global_settings_boolean_field(&mut self) {
-        if self.runtime_prompt_open || self.global_settings_text_mode {
+        if self.runtime_prompt_open
+            || self.global_settings_text_mode
+            || self.global_theme_picker_mode
+        {
             return;
         }
         match self.global_settings_field_idx {
@@ -2599,6 +2722,10 @@ impl App {
     }
 
     fn adjust_global_settings_field(&mut self, delta: i8) {
+        if self.global_theme_picker_mode {
+            self.adjust_global_theme_picker(delta);
+            return;
+        }
         if self.current_view() != View::Settings
             || self.runtime_prompt_open
             || self.global_settings_text_mode
@@ -6137,6 +6264,7 @@ impl App {
 
         let config = AppConfig {
             ansible_bin: Some(self.run_options.ansible_bin.clone()),
+            theme: Some(theme::active_theme_name().as_str().to_string()),
             check: Some(self.run_options.check),
             diff: Some(self.run_options.diff),
             become_enabled: Some(self.run_options.become_enabled),
@@ -8554,6 +8682,72 @@ all:
         app.update(Action::CharInput('j'), &tx);
 
         assert_eq!(app.global_settings_field_idx, 1);
+    }
+
+    #[test]
+    fn theme_picker_opens_and_navigates_with_jk() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("theme_picker_jk");
+        app.view_idx = 5;
+        app.runtime_prompt_open = false;
+        app.global_settings_field_idx = GLOBAL_SETTINGS_THEME_FIELD_IDX;
+
+        app.update(Action::SelectRuntimeCandidate, &tx);
+        assert!(app.global_theme_picker_mode);
+        let initial_idx = app.global_theme_picker_idx;
+
+        app.update(Action::CharInput('j'), &tx);
+        assert!(app.global_theme_picker_mode);
+        assert_ne!(app.global_theme_picker_idx, initial_idx);
+    }
+
+    #[test]
+    fn theme_picker_closes_on_escape() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("theme_picker_esc");
+        app.view_idx = 5;
+        app.runtime_prompt_open = false;
+        app.global_settings_field_idx = GLOBAL_SETTINGS_THEME_FIELD_IDX;
+
+        app.update(Action::SelectRuntimeCandidate, &tx);
+        assert!(app.global_theme_picker_mode);
+
+        app.update(Action::CloseRuntimePrompt, &tx);
+        assert!(!app.global_theme_picker_mode);
+    }
+
+    #[test]
+    fn theme_picker_ignores_hl_shortcuts() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("theme_picker_no_hl");
+        app.view_idx = 5;
+        app.runtime_prompt_open = false;
+        app.global_settings_field_idx = GLOBAL_SETTINGS_THEME_FIELD_IDX;
+
+        app.update(Action::SelectRuntimeCandidate, &tx);
+        let initial_idx = app.global_theme_picker_idx;
+
+        app.update(Action::CharInput('l'), &tx);
+        app.update(Action::CharInput('h'), &tx);
+
+        assert_eq!(app.global_theme_picker_idx, initial_idx);
+    }
+
+    #[test]
+    fn theme_picker_ignores_settings_increase_decrease() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("theme_picker_no_lr");
+        app.view_idx = 5;
+        app.runtime_prompt_open = false;
+        app.global_settings_field_idx = GLOBAL_SETTINGS_THEME_FIELD_IDX;
+
+        app.update(Action::SelectRuntimeCandidate, &tx);
+        let initial_idx = app.global_theme_picker_idx;
+
+        app.update(Action::SettingsIncrease, &tx);
+        app.update(Action::SettingsDecrease, &tx);
+
+        assert_eq!(app.global_theme_picker_idx, initial_idx);
     }
 
     #[test]

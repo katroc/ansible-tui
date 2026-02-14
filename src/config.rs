@@ -10,6 +10,7 @@ use crate::secrets::SecretEnforcementMode;
 #[derive(Debug, Clone, Default)]
 pub struct AppConfig {
     pub ansible_bin: Option<String>,
+    pub theme: Option<String>,
     pub check: Option<bool>,
     pub diff: Option<bool>,
     pub become_enabled: Option<bool>,
@@ -44,6 +45,7 @@ pub fn load_app_config(cwd: &Path) -> io::Result<AppConfig> {
         let (key, value) = row.map_err(sqlite_to_io)?;
         match key.as_str() {
             "ansible_bin" => config.ansible_bin = parse_opt_string(&value),
+            "theme" => config.theme = parse_opt_string(&value),
             "check" => config.check = parse_opt_bool(&value),
             "diff" => config.diff = parse_opt_bool(&value),
             "become_enabled" => config.become_enabled = parse_opt_bool(&value),
@@ -78,6 +80,9 @@ pub fn save_app_config(cwd: &Path, config: &AppConfig) -> io::Result<()> {
         insert
             .execute(params!["ansible_bin", v])
             .map_err(sqlite_to_io)?;
+    }
+    if let Some(ref v) = config.theme {
+        insert.execute(params!["theme", v]).map_err(sqlite_to_io)?;
     }
     if let Some(v) = config.check {
         insert
@@ -230,6 +235,7 @@ mod tests {
         let cwd = temp_cwd("round_trip");
         let config = AppConfig {
             ansible_bin: Some(String::from("/usr/bin/ansible-playbook")),
+            theme: Some(String::from("dracula")),
             check: Some(true),
             diff: Some(false),
             become_enabled: None,
@@ -245,6 +251,7 @@ mod tests {
         save_app_config(&cwd, &config).expect("save");
         let loaded = load_app_config(&cwd).expect("load");
         assert_eq!(loaded.ansible_bin, config.ansible_bin);
+        assert_eq!(loaded.theme, config.theme);
         assert_eq!(loaded.check, config.check);
         assert_eq!(loaded.diff, config.diff);
         assert_eq!(loaded.become_enabled, None);

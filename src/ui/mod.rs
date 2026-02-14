@@ -281,7 +281,7 @@ const HINTS_SETTINGS_EDITOR: [HintBinding; 5] = [
     },
     HintBinding {
         key: "Enter/e",
-        desc: "edit text field",
+        desc: "edit field / open theme picker",
     },
     HintBinding {
         key: "Space",
@@ -688,6 +688,20 @@ const HINTS_SETTINGS_TEXT: [HintBinding; 6] = [
         desc: "switch view",
     },
 ];
+const HINTS_SETTINGS_THEME: [HintBinding; 3] = [
+    HintBinding {
+        key: "j/k, Up/Down",
+        desc: "navigate themes",
+    },
+    HintBinding {
+        key: "Enter",
+        desc: "apply and close",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "close picker",
+    },
+];
 const HINTS_LIST_FILTER_EDIT: [HintBinding; 4] = [
     HintBinding {
         key: "Type",
@@ -985,6 +999,12 @@ fn active_help_model(app: &App) -> HelpModel {
         return HelpModel {
             title: "Global Settings Text Edit",
             hints: &HINTS_SETTINGS_TEXT,
+        };
+    }
+    if app.current_view() == View::Settings && app.global_theme_picker_mode {
+        return HelpModel {
+            title: "Theme Picker",
+            hints: &HINTS_SETTINGS_THEME,
         };
     }
     if app.settings_editor_open {
