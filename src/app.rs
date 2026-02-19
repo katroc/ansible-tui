@@ -37,6 +37,7 @@ use crate::run_store::{
     load_runs, migrate_unstable_hash_history, save_run, take_legacy_environment_migration_notice,
 };
 use crate::secrets::{SecretEnforcementMode, VaultSourceType};
+use crate::task_preview::{spawn_task_preview, PlayPreview, TaskPreviewRequest};
 use crate::theme::{self, ThemeName};
 use crate::ui_session::{load_ui_session_state, save_ui_session_state, UiSessionState};
 
@@ -51,6 +52,7 @@ const TEMPLATE_EDITOR_FIELD_COUNT: usize = 19;
 const PROJECT_SECRET_FIELD_COUNT: usize = 5;
 const MAX_PROJECT_SYNC_LOG_LINES: usize = 400;
 const RUN_LOG_PERSIST_EVERY: usize = 25;
+const MAX_TASK_PREVIEW_LOG_LINES: usize = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -149,6 +151,10 @@ enum PendingVaultPromptAction {
         request: RunRequest,
         status_line: String,
     },
+    TaskPreview {
+        request: TaskPreviewRequest,
+        status_line: String,
+    },
 }
 
 impl PendingVaultPromptAction {
@@ -156,7 +162,14 @@ impl PendingVaultPromptAction {
         match self {
             PendingVaultPromptAction::Create { project_root, .. }
             | PendingVaultPromptAction::EditLoad { project_root, .. }
-            | PendingVaultPromptAction::EditSave { project_root, .. } => project_root,
+            | PendingVaultPromptAction::EditSave { project_root, .. }
+            | PendingVaultPromptAction::TaskPreview {
+                request:
+                    TaskPreviewRequest {
+                        cwd: project_root, ..
+                    },
+                ..
+            } => project_root,
             PendingVaultPromptAction::Run { request, .. } => &request.cwd,
         }
     }
@@ -214,6 +227,7 @@ pub enum FocusContext {
     PlaybooksList,
     PlaybooksRuns,
     PlaybooksLogSelect,
+    TaskPreview,
     TemplatesList,
     TemplatesRuns,
     TemplatesLogSelect,
@@ -361,6 +375,14 @@ pub struct App {
     pub log_select_mode: bool,
     pub log_cursor: usize,
     pub log_anchor: Option<usize>,
+    pub task_preview_open: bool,
+    pub task_preview_loading: bool,
+    pub task_preview_plays: Vec<PlayPreview>,
+    pub task_preview_error: Option<String>,
+    pub task_preview_scroll: usize,
+    pub task_preview_tag_filter: Option<String>,
+    pub task_preview_logs: Vec<String>,
+    pub task_preview_playbook: Option<String>,
     pub inventory_create_open: bool,
     pub inventory_create_buffer: String,
     pub inventory_editor_open: bool,
@@ -419,6 +441,7 @@ pub struct App {
     pending_vault_prompt_project_root: Option<PathBuf>,
     vault_temp_password_files: Vec<PathBuf>,
     vault_temp_password_files_by_run: BTreeMap<u64, Vec<PathBuf>>,
+    task_preview_temp_password_file: Option<PathBuf>,
     pub vault_password_create_open: bool,
     pub vault_password_create_field_idx: usize,
     pub vault_password_create_buffer_path: String,
@@ -517,6 +540,14 @@ impl App {
             log_select_mode: false,
             log_cursor: 0,
             log_anchor: None,
+            task_preview_open: false,
+            task_preview_loading: false,
+            task_preview_plays: Vec::new(),
+            task_preview_error: None,
+            task_preview_scroll: 0,
+            task_preview_tag_filter: None,
+            task_preview_logs: Vec::new(),
+            task_preview_playbook: None,
             inventory_create_open: false,
             inventory_create_buffer: String::new(),
             inventory_editor_open: false,
@@ -575,6 +606,7 @@ impl App {
             pending_vault_prompt_project_root: None,
             vault_temp_password_files: Vec::new(),
             vault_temp_password_files_by_run: BTreeMap::new(),
+            task_preview_temp_password_file: None,
             vault_password_create_open: false,
             vault_password_create_field_idx: 0,
             vault_password_create_buffer_path: String::new(),
@@ -649,6 +681,9 @@ impl App {
     fn compute_focus_context(&self) -> FocusContext {
         if self.runtime_prompt_open {
             return FocusContext::RuntimePrompt;
+        }
+        if self.task_preview_open {
+            return FocusContext::TaskPreview;
         }
         if self.settings_editor_open
             || self.template_editor_open
@@ -945,6 +980,14 @@ impl App {
         self.log_select_mode = false;
         self.log_anchor = None;
         self.log_cursor = 0;
+        self.task_preview_open = false;
+        self.task_preview_loading = false;
+        self.task_preview_plays.clear();
+        self.task_preview_error = None;
+        self.task_preview_scroll = 0;
+        self.task_preview_tag_filter = None;
+        self.task_preview_logs.clear();
+        self.task_preview_playbook = None;
         self.pending_project_delete = None;
         self.pending_inventory_delete = None;
         self.pending_template_delete = None;
@@ -979,6 +1022,7 @@ impl App {
         self.clear_vault_prompt_password_cache();
         self.pending_vault_prompt_project_root = None;
         self.cleanup_vault_temp_password_files();
+        self.cleanup_task_preview_temp_password_file();
         self.vault_password_create_open = false;
         self.vault_password_create_field_idx = 0;
         self.vault_password_create_buffer_path.clear();
@@ -1040,6 +1084,8 @@ impl App {
                     | Action::RunStarted { .. }
                     | Action::RunLog { .. }
                     | Action::RunFinished { .. }
+                    | Action::TaskPreviewLog(_)
+                    | Action::TaskPreviewFinished { .. }
                     | Action::Error(_)
             )
         {
@@ -1140,6 +1186,8 @@ impl App {
                     self.close_inventory_editor(false);
                 } else if self.inventory_edit_mode_open {
                     self.close_inventory_edit_mode_prompt();
+                } else if self.task_preview_open {
+                    self.close_task_preview();
                 } else if self.current_view() == View::Inventory
                     && matches!(
                         self.inventory_sub_tab,
@@ -1324,6 +1372,7 @@ impl App {
             Action::RefreshProject => self.refresh_project(),
             Action::StartRun => self.start_run(tx),
             Action::StartTemplateRun => self.start_template_run(tx),
+            Action::PreviewTasks => self.start_task_preview(tx),
             Action::SaveTemplate => self.save_template_from_editor(),
             Action::DeleteTemplate => self.delete_selected_template(),
             Action::RunStarted {
@@ -1409,6 +1458,18 @@ impl App {
                     self.persist_run(run_id);
                 }
             }
+            Action::TaskPreviewLog(line) => self.record_task_preview_log(line),
+            Action::TaskPreviewFinished {
+                success,
+                plays,
+                message,
+            } => {
+                self.task_preview_loading = false;
+                self.task_preview_plays = plays;
+                self.task_preview_error = if success { None } else { Some(message.clone()) };
+                self.status_line = message;
+                self.cleanup_task_preview_temp_password_file();
+            }
             Action::Error(err) => self.status_line = format!("Error: {err}"),
         }
     }
@@ -1427,6 +1488,7 @@ impl App {
             && !self.inventory_edit_mode_open
             && !self.runtime_prompt_open
             && !self.filter_edit_mode
+            && !self.task_preview_open
             && !(self.current_view() == View::Settings
                 && (self.global_settings_text_mode || self.global_theme_picker_mode))
     }
@@ -1456,6 +1518,9 @@ impl App {
     }
 
     fn handle_settings_increase_action(&mut self) {
+        if self.task_preview_open {
+            return;
+        }
         if self.current_view() == View::Settings && self.global_theme_picker_mode {
             return;
         }
@@ -1494,6 +1559,9 @@ impl App {
     }
 
     fn handle_settings_decrease_action(&mut self) {
+        if self.task_preview_open {
+            return;
+        }
         if self.current_view() == View::Settings && self.global_theme_picker_mode {
             return;
         }
@@ -1529,6 +1597,10 @@ impl App {
     }
 
     fn handle_move_up_action(&mut self) {
+        if self.task_preview_open {
+            self.adjust_task_preview_scroll(-1);
+            return;
+        }
         if self.vault_runtime_prompt_open {
             self.vault_runtime_prompt_field_idx =
                 self.vault_runtime_prompt_field_idx.saturating_sub(1);
@@ -1582,6 +1654,10 @@ impl App {
     }
 
     fn handle_move_down_action(&mut self) {
+        if self.task_preview_open {
+            self.adjust_task_preview_scroll(1);
+            return;
+        }
         if self.vault_runtime_prompt_open {
             self.vault_runtime_prompt_field_idx = min(
                 self.vault_runtime_prompt_field_idx + 1,
@@ -1785,7 +1861,11 @@ impl App {
             | FocusContext::InventoryGroupsHosts => self.handle_inventory_context_char(ch, tx),
             FocusContext::PlaybooksList
             | FocusContext::PlaybooksRuns
-            | FocusContext::PlaybooksLogSelect => self.handle_playbooks_context_char(ch),
+            | FocusContext::PlaybooksLogSelect => self.handle_playbooks_context_char(ch, tx),
+            FocusContext::TaskPreview => {
+                self.handle_task_preview_char(ch);
+                true
+            }
             FocusContext::TemplatesList
             | FocusContext::TemplatesRuns
             | FocusContext::TemplatesLogSelect => self.handle_templates_context_char(ch, tx),
@@ -2041,7 +2121,7 @@ impl App {
         }
     }
 
-    fn handle_playbooks_context_char(&mut self, ch: char) -> bool {
+    fn handle_playbooks_context_char(&mut self, ch: char, tx: &UnboundedSender<Action>) -> bool {
         if self.current_view() != View::Playbooks {
             return false;
         }
@@ -2064,7 +2144,19 @@ impl App {
                 self.sync_run_selection_to_selected_playbook();
                 true
             }
+            'w' => {
+                let _ = tx.send(Action::PreviewTasks);
+                true
+            }
             _ => false,
+        }
+    }
+
+    fn handle_task_preview_char(&mut self, ch: char) {
+        match ch {
+            'j' => self.adjust_task_preview_scroll(1),
+            'k' => self.adjust_task_preview_scroll(-1),
+            _ => {}
         }
     }
 
@@ -3991,6 +4083,17 @@ impl App {
                 self.status_line = status_line;
                 spawn_ansible_run(request, tx.clone());
             }
+            PendingVaultPromptAction::TaskPreview {
+                mut request,
+                status_line,
+            } => {
+                self.cleanup_task_preview_temp_password_file();
+                self.task_preview_temp_password_file = Some(password_file.clone());
+                request.vault_source_type = Some(VaultSourceType::File);
+                request.vault_password_file = Some(password_file_value);
+                self.status_line = status_line;
+                spawn_task_preview(request, tx.clone());
+            }
         }
 
         Ok(())
@@ -4091,6 +4194,12 @@ impl App {
             for path in paths {
                 let _ = fs::remove_file(path);
             }
+        }
+    }
+
+    fn cleanup_task_preview_temp_password_file(&mut self) {
+        if let Some(path) = self.task_preview_temp_password_file.take() {
+            let _ = fs::remove_file(path);
         }
     }
 
@@ -4684,6 +4793,140 @@ impl App {
 
         self.status_line = status_line;
         spawn_ansible_run(request, tx.clone());
+    }
+
+    fn dispatch_task_preview_request(
+        &mut self,
+        request: TaskPreviewRequest,
+        status_line: String,
+        tx: &UnboundedSender<Action>,
+    ) {
+        if matches!(request.vault_source_type, Some(VaultSourceType::Prompt)) {
+            let action = PendingVaultPromptAction::TaskPreview {
+                request,
+                status_line,
+            };
+            if self.try_execute_cached_vault_prompt_action(action.clone(), tx) {
+                return;
+            }
+            self.open_vault_runtime_prompt(
+                action,
+                String::from(
+                    "Vault password required for task preview (prompt mode): Enter confirm | Ctrl+S continue",
+                ),
+            );
+            return;
+        }
+
+        self.status_line = status_line;
+        spawn_task_preview(request, tx.clone());
+    }
+
+    fn start_task_preview(&mut self, tx: &UnboundedSender<Action>) {
+        if self.current_view() != View::Playbooks {
+            self.status_line = String::from("Task preview is available in Playbooks tab");
+            return;
+        }
+        if self.task_preview_loading {
+            self.status_line = String::from("Task preview is already loading");
+            return;
+        }
+        if self.runtime_bootstrapping {
+            self.status_line = String::from("Runtime bootstrap in progress...");
+            return;
+        }
+        if !playbook_bin_available(&self.run_options.ansible_bin) {
+            self.status_line = format!(
+                "{} not found. Press u to pick runtime or b to bootstrap managed runtime",
+                self.run_options.ansible_bin
+            );
+            self.open_runtime_prompt();
+            return;
+        }
+        if self.playbooks.is_empty() {
+            self.status_line =
+                String::from("No playbooks found. Add *.yml under ./playbooks or project root.");
+            return;
+        }
+        if self.inventories.is_empty() {
+            self.status_line =
+                String::from("No inventories found. Add inventory files under ./inventory.");
+            return;
+        }
+
+        let Some(playbook_path) = self.playbooks.get(self.playbook_idx) else {
+            self.status_line = String::from("No playbook selected.");
+            return;
+        };
+        let Some(inventory_path) = self.selected_inventory_path_for_current_playbook() else {
+            self.status_line = String::from("No inventory selected.");
+            return;
+        };
+
+        let project_root = self.active_project_root().to_path_buf();
+        let playbook = display_path(&project_root, playbook_path);
+        let inventory = display_path(&project_root, &inventory_path);
+
+        self.task_preview_open = true;
+        self.task_preview_loading = true;
+        self.task_preview_plays.clear();
+        self.task_preview_error = None;
+        self.task_preview_scroll = 0;
+        self.task_preview_tag_filter = None;
+        self.task_preview_logs.clear();
+        self.task_preview_playbook = Some(playbook.clone());
+
+        let (vault_source_type, vault_password_file, vault_id_label) =
+            self.active_project_vault_settings();
+        self.dispatch_task_preview_request(
+            TaskPreviewRequest {
+                cwd: project_root,
+                ansible_bin: self.run_options.ansible_bin.clone(),
+                playbook: playbook.clone(),
+                inventory,
+                vault_source_type,
+                vault_password_file,
+                vault_id_label,
+            },
+            format!("Loading task preview for {playbook}"),
+            tx,
+        );
+    }
+
+    fn close_task_preview(&mut self) {
+        if !self.task_preview_open {
+            return;
+        }
+        self.task_preview_open = false;
+        self.task_preview_loading = false;
+        self.status_line = String::from("Task preview closed");
+    }
+
+    fn adjust_task_preview_scroll(&mut self, delta: isize) {
+        if !self.task_preview_open || delta == 0 {
+            return;
+        }
+        if delta.is_negative() {
+            self.task_preview_scroll = self
+                .task_preview_scroll
+                .saturating_sub(delta.unsigned_abs());
+        } else {
+            self.task_preview_scroll = self.task_preview_scroll.saturating_add(delta as usize);
+        }
+    }
+
+    fn record_task_preview_log(&mut self, line: String) {
+        if line.trim().is_empty() {
+            return;
+        }
+        self.task_preview_logs.push(line);
+        if self.task_preview_logs.len() > MAX_TASK_PREVIEW_LOG_LINES {
+            let over = self
+                .task_preview_logs
+                .len()
+                .saturating_sub(MAX_TASK_PREVIEW_LOG_LINES);
+            self.task_preview_logs.drain(0..over);
+        }
     }
 
     fn start_run(&mut self, tx: &UnboundedSender<Action>) {
@@ -6178,6 +6421,7 @@ impl App {
     fn request_quit(&mut self) {
         self.persist_ui_session_state_for_active_project();
         self.persist_all_runs();
+        self.cleanup_task_preview_temp_password_file();
         self.should_quit = true;
     }
 
@@ -8748,6 +8992,29 @@ all:
         app.update(Action::SettingsDecrease, &tx);
 
         assert_eq!(app.global_theme_picker_idx, initial_idx);
+    }
+
+    #[test]
+    fn task_preview_focus_context_when_open() {
+        let mut app = make_test_app("task_preview_focus");
+        app.view_idx = 3;
+        app.runtime_prompt_open = false;
+        app.task_preview_open = true;
+
+        assert_eq!(app.content_focus_context(), FocusContext::TaskPreview);
+    }
+
+    #[test]
+    fn task_preview_closes_on_escape() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = make_test_app("task_preview_close_esc");
+        app.view_idx = 3;
+        app.runtime_prompt_open = false;
+        app.task_preview_open = true;
+
+        app.update(Action::CloseRuntimePrompt, &tx);
+
+        assert!(!app.task_preview_open);
     }
 
     #[test]

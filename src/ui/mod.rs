@@ -16,6 +16,7 @@ mod inventory;
 mod playbooks;
 mod projects;
 mod settings_view;
+mod task_preview;
 mod templates;
 mod vault;
 
@@ -25,6 +26,7 @@ use inventory::*;
 use playbooks::*;
 use projects::*;
 use settings_view::*;
+use task_preview::*;
 use templates::*;
 use vault::*;
 
@@ -504,7 +506,7 @@ const HINTS_INVENTORY_GROUPS: [HintBinding; 7] = [
         desc: "back to inventory files",
     },
 ];
-const HINTS_PLAYBOOKS: [HintBinding; 8] = [
+const HINTS_PLAYBOOKS: [HintBinding; 9] = [
     HintBinding {
         key: "<-/->, h/l, Enter",
         desc: "focus playbooks/runs",
@@ -520,6 +522,10 @@ const HINTS_PLAYBOOKS: [HintBinding; 8] = [
     HintBinding {
         key: "r",
         desc: "run selected playbook",
+    },
+    HintBinding {
+        key: "w",
+        desc: "task preview modal",
     },
     HintBinding {
         key: "t",
@@ -538,7 +544,7 @@ const HINTS_PLAYBOOKS: [HintBinding; 8] = [
         desc: "filter focused list",
     },
 ];
-const HINTS_PLAYBOOKS_LOG_SELECT: [HintBinding; 8] = [
+const HINTS_PLAYBOOKS_LOG_SELECT: [HintBinding; 9] = [
     HintBinding {
         key: "j/k, Up/Down",
         desc: "move log cursor",
@@ -568,8 +574,22 @@ const HINTS_PLAYBOOKS_LOG_SELECT: [HintBinding; 8] = [
         desc: "run selected playbook",
     },
     HintBinding {
+        key: "w",
+        desc: "task preview modal",
+    },
+    HintBinding {
         key: "/",
         desc: "filter focused list",
+    },
+];
+const HINTS_TASK_PREVIEW: [HintBinding; 2] = [
+    HintBinding {
+        key: "j/k, Up/Down",
+        desc: "scroll preview",
+    },
+    HintBinding {
+        key: "Esc",
+        desc: "close preview",
     },
 ];
 const HINTS_TEMPLATES: [HintBinding; 8] = [
@@ -742,6 +762,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_body(frame, app, layout[1]);
     render_help(frame, app, layout[2]);
     render_status(frame, app, layout[3]);
+    if app.task_preview_open {
+        render_task_preview(frame, app);
+    }
     if app.settings_editor_open {
         render_playbook_settings_editor(frame, app);
     }
@@ -995,6 +1018,12 @@ fn active_help_model(app: &App) -> HelpModel {
             hints: &HINTS_LIST_FILTER_EDIT,
         };
     }
+    if app.task_preview_open {
+        return HelpModel {
+            title: "Task Preview",
+            hints: &HINTS_TASK_PREVIEW,
+        };
+    }
     if app.current_view() == View::Settings && app.global_settings_text_mode {
         return HelpModel {
             title: "Global Settings Text Edit",
@@ -1064,6 +1093,10 @@ fn active_help_model(app: &App) -> HelpModel {
         FocusContext::PlaybooksLogSelect => HelpModel {
             title: "Playbooks (Log Select)",
             hints: &HINTS_PLAYBOOKS_LOG_SELECT,
+        },
+        FocusContext::TaskPreview => HelpModel {
+            title: "Task Preview",
+            hints: &HINTS_TASK_PREVIEW,
         },
         FocusContext::TemplatesList | FocusContext::TemplatesRuns => HelpModel {
             title: "Templates",

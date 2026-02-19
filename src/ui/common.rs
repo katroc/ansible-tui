@@ -88,6 +88,7 @@ pub(super) fn focus_context_label(context: FocusContext) -> &'static str {
         FocusContext::PlaybooksList => "playbooks list",
         FocusContext::PlaybooksRuns => "playbook runs",
         FocusContext::PlaybooksLogSelect => "playbook logs",
+        FocusContext::TaskPreview => "task preview",
         FocusContext::TemplatesList => "templates list",
         FocusContext::TemplatesRuns => "template runs",
         FocusContext::TemplatesLogSelect => "template logs",

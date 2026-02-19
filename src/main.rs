@@ -10,6 +10,7 @@ mod projects;
 mod run;
 mod run_store;
 mod secrets;
+mod task_preview;
 mod theme;
 mod ui;
 mod ui_session;

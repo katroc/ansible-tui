@@ -53,6 +53,7 @@ Foundation-first Rust TUI for Ansible operations.
 - `Shift+J`/`Shift+K` (Playbooks tab): alternate run selection shortcuts
 - `i`/`I` (Playbooks tab): cycle inventory target for selected playbook
 - `r`: start run from Playbooks context with selected playbook + inventory
+- `w` (Playbooks tab): open task preview modal (`ansible-playbook --list-tasks --list-tags`) for selected playbook/inventory
 - `Ctrl+S`: save inventory editor/builder, project SSH key prompt, or playbook text-edit field
 - `t`: open/close playbook settings editor (in Playbooks tab)
 - `e`: edit selected text field (or press `Enter`) in Playbook/Global settings editors

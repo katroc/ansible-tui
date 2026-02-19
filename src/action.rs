@@ -1,3 +1,5 @@
+use crate::task_preview::PlayPreview;
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -71,6 +73,13 @@ pub enum Action {
         run_id: u64,
         success: bool,
         exit_code: Option<i32>,
+    },
+    PreviewTasks,
+    TaskPreviewLog(String),
+    TaskPreviewFinished {
+        success: bool,
+        plays: Vec<PlayPreview>,
+        message: String,
     },
     Error(String),
 }
